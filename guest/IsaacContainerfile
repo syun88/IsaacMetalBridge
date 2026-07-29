@@ -1,0 +1,71 @@
+ARG ISAAC_IMAGE=nvcr.io/nvidia/isaac-sim:6.0.1
+
+FROM ubuntu:24.04 AS bridge-build
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        g++ \
+        glslang-tools \
+        libvulkan-dev \
+        linux-libc-dev \
+        xxd \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY protocol/include/imb_protocol.h /src/protocol/imb_protocol.h
+COPY guest/src/imb_wire.hpp /src/guest/imb_wire.hpp
+COPY guest/vulkan_icd/imb_vulkan_icd.cpp /src/vulkan/imb_vulkan_icd.cpp
+COPY guest/vulkan_icd/imb_vulkan_probe.cpp /src/vulkan/imb_vulkan_probe.cpp
+COPY guest/vulkan_icd/imb_icd.json /src/vulkan/imb_icd.json
+COPY guest/vulkan_icd/add_u32.comp /src/vulkan/add_u32.comp
+COPY guest/vulkan_icd/triangle.vert /src/vulkan/triangle.vert
+COPY guest/vulkan_icd/triangle.frag /src/vulkan/triangle.frag
+COPY guest/cuda_shim/imb_cuda_shim.cpp /src/cuda/imb_cuda_shim.cpp
+
+RUN glslangValidator -V /src/vulkan/add_u32.comp -o /src/vulkan/add_u32.spv \
+    && xxd -i -n imb_add_u32_spv /src/vulkan/add_u32.spv > /src/vulkan/add_u32_spv.h \
+    && glslangValidator -V /src/vulkan/triangle.vert -o /src/vulkan/triangle.vert.spv \
+    && xxd -i -n imb_triangle_vert_spv /src/vulkan/triangle.vert.spv > /src/vulkan/triangle_vert_spv.h \
+    && glslangValidator -V /src/vulkan/triangle.frag -o /src/vulkan/triangle.frag.spv \
+    && xxd -i -n imb_triangle_frag_spv /src/vulkan/triangle.frag.spv > /src/vulkan/triangle_frag_spv.h \
+    && mkdir -p /out \
+    && c++ -std=c++20 -O2 -Wall -Wextra -Wpedantic \
+        -fPIC -fvisibility=hidden -shared \
+        -I/src/protocol -I/src/guest -I/src/vulkan \
+        /src/vulkan/imb_vulkan_icd.cpp \
+        -o /out/libimb_vulkan_icd.so \
+    && c++ -std=c++20 -O2 -Wall -Wextra -Wpedantic \
+        /src/vulkan/imb_vulkan_probe.cpp \
+        -lvulkan \
+        -o /out/imb-vulkan-probe \
+    && c++ -std=c++20 -O2 -Wall -Wextra -Wpedantic \
+        -fPIC -fvisibility=hidden -shared \
+        /src/cuda/imb_cuda_shim.cpp \
+        -Wl,-soname,libcuda.so.1 \
+        -o /out/libcuda.so.1 \
+    && ln -s libcuda.so.1 /out/libcuda.so
+
+FROM scratch AS bridge-output
+COPY --from=bridge-build /out/ /out/
+
+FROM ${ISAAC_IMAGE} AS isaac-runtime
+
+USER root
+COPY --from=bridge-build /out/libimb_vulkan_icd.so /usr/local/lib/libimb_vulkan_icd.so
+COPY --from=bridge-build /out/imb-vulkan-probe /usr/local/bin/imb-vulkan-probe
+COPY --from=bridge-build /out/libcuda.so.1 /usr/local/lib/libcuda.so.1
+COPY --from=bridge-build /src/vulkan/imb_icd.json /usr/local/share/vulkan/icd.d/imb_icd.json
+COPY --from=bridge-build /src/vulkan/add_u32.spv /usr/local/share/imb/add_u32.spv
+COPY --from=bridge-build /src/vulkan/triangle.vert.spv /usr/local/share/imb/triangle.vert.spv
+COPY --from=bridge-build /src/vulkan/triangle.frag.spv /usr/local/share/imb/triangle.frag.spv
+COPY guest/kit_input_extension/isaacmetalbridge.input /opt/imb/exts/isaacmetalbridge.input
+RUN chmod 0755 /usr/local/lib/libimb_vulkan_icd.so /usr/local/lib/libcuda.so.1 /usr/local/bin/imb-vulkan-probe \
+    && chmod 0644 /usr/local/share/vulkan/icd.d/imb_icd.json /usr/local/share/imb/*.spv \
+    && chmod -R a+rX /opt/imb/exts/isaacmetalbridge.input \
+    && ln -s libcuda.so.1 /usr/local/lib/libcuda.so \
+    && ldconfig
+
+USER isaac-sim
+ENV VK_DRIVER_FILES=/usr/local/share/vulkan/icd.d/imb_icd.json
+ENV IMB_VULKAN_NVIDIA_COMPAT=1
+WORKDIR /isaac-sim

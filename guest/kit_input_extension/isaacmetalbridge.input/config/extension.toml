@@ -1,0 +1,19 @@
+[core]
+reloadable = false
+order = 100
+
+[package]
+version = "0.1.0"
+category = "Input"
+title = "IsaacMetalBridge Viewer Input"
+description = "Forwards native macOS viewer input into the real Isaac Kit input provider."
+authors = ["IsaacMetalBridge contributors"]
+toggleable = false
+
+[dependencies]
+"omni.appwindow" = {}
+"omni.kit.commands" = {}
+"omni.usd" = {}
+
+[[python.module]]
+name = "isaacmetalbridge.input"

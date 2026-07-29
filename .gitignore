@@ -1,0 +1,39 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Project build products
+/build/
+/host/.build/
+/host/.swiftpm/
+/host/ContainerAdapter/.build/
+/host/ContainerAdapter/.swiftpm/
+/guest/build/
+*.dSYM/
+
+# Editors and tooling
+.idea/
+.vscode/
+compile_commands.json
+
+# Logs and runtime data
+*.log
+*.pid
+/runtime/
+/tmp/
+
+# Isaac Sim and NVIDIA artifacts must remain outside Git
+/isaac-sim/
+/isaacsim/
+/assets/
+/cache/
+/.cache/
+/.nv/
+*.oci
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.img
+*.dmg

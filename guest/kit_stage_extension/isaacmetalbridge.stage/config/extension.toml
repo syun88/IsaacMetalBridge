@@ -1,0 +1,17 @@
+[core]
+reloadable = false
+order = -1000
+
+[package]
+version = "0.1.0"
+category = "Simulation"
+title = "IsaacMetalBridge Startup Stage"
+description = "Opens an explicitly selected USD before Isaac Sim renderer startup."
+authors = ["IsaacMetalBridge contributors"]
+toggleable = false
+
+[dependencies]
+"omni.usd" = {}
+
+[[python.module]]
+name = "isaacmetalbridge.stage"

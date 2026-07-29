@@ -1,0 +1,49 @@
+FROM alpine:3.22 AS build
+
+RUN apk add --no-cache g++ linux-headers vulkan-headers vulkan-loader-dev glslang xxd
+
+WORKDIR /src
+COPY protocol/include/imb_protocol.h /src/protocol/imb_protocol.h
+COPY guest/src/imb_wire.hpp /src/guest/imb_wire.hpp
+COPY guest/src/main.cpp /src/guest/main.cpp
+COPY guest/vulkan_icd/imb_vulkan_icd.cpp /src/vulkan/imb_vulkan_icd.cpp
+COPY guest/vulkan_icd/imb_vulkan_probe.cpp /src/vulkan/imb_vulkan_probe.cpp
+COPY guest/vulkan_icd/imb_icd.json /src/vulkan/imb_icd.json
+COPY guest/vulkan_icd/add_u32.comp /src/vulkan/add_u32.comp
+COPY guest/vulkan_icd/triangle.vert /src/vulkan/triangle.vert
+COPY guest/vulkan_icd/triangle.frag /src/vulkan/triangle.frag
+
+RUN glslangValidator -V /src/vulkan/add_u32.comp -o /src/vulkan/add_u32.spv \
+    && xxd -i -n imb_add_u32_spv /src/vulkan/add_u32.spv > /src/vulkan/add_u32_spv.h \
+    && glslangValidator -V /src/vulkan/triangle.vert -o /src/vulkan/triangle.vert.spv \
+    && xxd -i -n imb_triangle_vert_spv /src/vulkan/triangle.vert.spv > /src/vulkan/triangle_vert_spv.h \
+    && glslangValidator -V /src/vulkan/triangle.frag -o /src/vulkan/triangle.frag.spv \
+    && xxd -i -n imb_triangle_frag_spv /src/vulkan/triangle.frag.spv > /src/vulkan/triangle_frag_spv.h \
+    && mkdir -p /out \
+    && c++ -std=c++20 -O2 -Wall -Wextra -Wpedantic \
+        -I/src/protocol -I/src/guest \
+        /src/guest/main.cpp \
+        -o /out/imb-guest-probe \
+    && c++ -std=c++20 -O2 -Wall -Wextra -Wpedantic \
+        -fPIC -fvisibility=hidden -shared \
+        -I/src/protocol -I/src/guest -I/src/vulkan \
+        /src/vulkan/imb_vulkan_icd.cpp \
+        -o /out/libimb_vulkan_icd.so \
+    && c++ -std=c++20 -O2 -Wall -Wextra -Wpedantic \
+        /src/vulkan/imb_vulkan_probe.cpp \
+        -lvulkan \
+        -o /out/imb-vulkan-probe
+
+FROM alpine:3.22
+
+RUN apk add --no-cache libstdc++ vulkan-loader
+COPY --from=build /out/imb-guest-probe /usr/local/bin/imb-guest-probe
+COPY --from=build /out/imb-vulkan-probe /usr/local/bin/imb-vulkan-probe
+COPY --from=build /out/libimb_vulkan_icd.so /usr/local/lib/libimb_vulkan_icd.so
+COPY --from=build /src/vulkan/imb_icd.json /usr/local/share/vulkan/icd.d/imb_icd.json
+COPY --from=build /src/vulkan/add_u32.spv /usr/local/share/imb/add_u32.spv
+COPY --from=build /src/vulkan/triangle.vert.spv /usr/local/share/imb/triangle.vert.spv
+COPY --from=build /src/vulkan/triangle.frag.spv /usr/local/share/imb/triangle.frag.spv
+
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/imb-guest-probe"]
