@@ -47,6 +47,10 @@ public final class SPIRVCrossCompiler: @unchecked Sendable {
             "--msl-argument-buffer-tier", "1",
             "--msl-runtime-array-rich-descriptor",
             "--msl-replace-recursive-inputs",
+            // Vulkan texel buffers must remain native Metal texture_buffer
+            // arguments. The default 4096-wide texture2d emulation has an
+            // incompatible argument type for MTLBuffer.makeTexture views.
+            "--msl-texture-buffer-native",
         ]
         for descriptorSet in 0..<32 {
             arguments += ["--msl-device-argument-buffer", String(descriptorSet)]

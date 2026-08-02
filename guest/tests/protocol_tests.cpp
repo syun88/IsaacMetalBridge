@@ -24,7 +24,7 @@ int main() {
     static_assert(sizeof(imb_primitive_acceleration_structure_geometry_payload) == 72);
     static_assert(sizeof(imb_build_instance_acceleration_structure_payload) == 16);
     static_assert(sizeof(imb_acceleration_structure_instance_payload) == 80);
-    static_assert(sizeof(imb_trace_rays_command_payload) == 32);
+    static_assert(sizeof(imb_trace_rays_command_payload) == 168);
     static_assert(sizeof(imb_add_u32_command_payload) == 16);
     static_assert(sizeof(imb_draw_triangle_command_payload) == 16);
     static_assert(sizeof(imb_draw_indexed_ui_command_payload) == 56);
@@ -32,7 +32,7 @@ int main() {
     static_assert(sizeof(imb_write_resource_payload) == 16);
     static_assert(sizeof(imb_read_resource_payload) == 16);
 
-    require(IMB_PROTOCOL_VERSION_MAJOR == 1 && IMB_PROTOCOL_VERSION_MINOR == 10, "unexpected protocol version");
+    require(IMB_PROTOCOL_VERSION_MAJOR == 1 && IMB_PROTOCOL_VERSION_MINOR == 13, "unexpected protocol version");
     require((IMB_CAP_METAL_COMPUTE & IMB_CAP_RESOURCE_IO) == 0, "capability bits overlap");
     require((IMB_CAP_METAL_IMAGE & IMB_CAP_METAL_RASTER) == 0, "raster capability bits overlap");
     require((IMB_CAP_METAL_RASTER & IMB_CAP_METAL_UI_RASTER) == 0, "UI raster capability bits overlap");

@@ -30,6 +30,10 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     private var fences: Set<UInt64> = []
     private var computePipelines: Set<UInt64> = []
     private var accelerationStructures: Set<UInt64> = []
+    private(set) var lastRayCamera: RayCamera?
+    private(set) var lastRaySphereLight: RaySphereLight?
+    private(set) var lastRayDistantLight: RayDistantLight?
+    private(set) var lastRayDomeLight: RayDomeLight?
 
     var supportsSPIRVCompute: Bool { true }
     var supportsAccelerationStructures: Bool { true }
@@ -282,6 +286,10 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         height: UInt32,
         missRGBA8: UInt32,
         hitRGBA8: UInt32,
+        camera: RayCamera?,
+        sphereLight: RaySphereLight?,
+        distantLight: RayDistantLight?,
+        domeLight: RayDomeLight?,
         fenceID: UInt64
     ) throws {
         guard var image = images[imageID],
@@ -303,6 +311,10 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             UInt8((hitRGBA8 >> 16) & 0xff), UInt8((hitRGBA8 >> 24) & 0xff),
         ]))
         images[imageID] = image
+        lastRayCamera = camera
+        lastRaySphereLight = sphereLight
+        lastRayDistantLight = distantLight
+        lastRayDomeLight = domeLight
         fences.insert(fenceID)
     }
 
@@ -503,7 +515,7 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     command.appendLittleEndian(UInt16(0))
     command.appendLittleEndian(UInt32(0))
     command.appendLittleEndian(UInt32(4))
-    command.appendLittleEndian(UInt32(1))
+    command.appendLittleEndian(UInt32(3))
     command.appendLittleEndian(UInt32(1))
     command.appendLittleEndian(UInt32(1))
     command.appendLittleEndian(UInt32(4))
@@ -662,7 +674,8 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
 }
 
 @Test func rayDispatchCommandUsesImageAndTopLevelAccelerationStructure() throws {
-    let session = BridgeSession(metal: testMetalWithRayTracing, backend: TestGPUBackend())
+    let backend = TestGPUBackend()
+    let session = BridgeSession(metal: testMetalWithRayTracing, backend: backend)
     negotiate(session)
 
     var imageCreate = Data()
@@ -692,6 +705,80 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     command.appendLittleEndian(UInt32(16))
     command.appendLittleEndian(UInt32(0xff00_0000))
     command.appendLittleEndian(UInt32(0xff00_ff00))
+    command.appendLittleEndian(UInt32(15))
+    command.appendLittleEndian(UInt32(0))
+    let expectedCamera = RayCamera(
+        position: SIMD3<Float>(7, 8, 9),
+        forward: SIMD3<Float>(-1, 0, 0),
+        up: SIMD3<Float>(0, 0, 1),
+        verticalFOVRadians: 0.9,
+        nearDistance: 0.1,
+        farDistance: 1_000
+    )
+    for value in [
+        expectedCamera.position.x,
+        expectedCamera.position.y,
+        expectedCamera.position.z,
+        expectedCamera.forward.x,
+        expectedCamera.forward.y,
+        expectedCamera.forward.z,
+        expectedCamera.up.x,
+        expectedCamera.up.y,
+        expectedCamera.up.z,
+        expectedCamera.verticalFOVRadians,
+        expectedCamera.nearDistance,
+        expectedCamera.farDistance,
+    ] {
+        command.appendLittleEndian(value.bitPattern)
+    }
+    let expectedSphereLight = RaySphereLight(
+        position: SIMD3<Float>(2, 3, 4),
+        color: SIMD3<Float>(1, 0.75, 0.5),
+        intensity: 12_500,
+        radius: 0.75
+    )
+    for value in [
+        expectedSphereLight.position.x,
+        expectedSphereLight.position.y,
+        expectedSphereLight.position.z,
+        expectedSphereLight.color.x,
+        expectedSphereLight.color.y,
+        expectedSphereLight.color.z,
+        expectedSphereLight.intensity,
+        expectedSphereLight.radius,
+    ] {
+        command.appendLittleEndian(value.bitPattern)
+    }
+    let expectedDistantLight = RayDistantLight(
+        direction: SIMD3<Float>(0.2, -0.4, -0.9),
+        color: SIMD3<Float>(1, 0.93, 0.82),
+        intensity: 2_500,
+        angleDegrees: 1
+    )
+    for value in [
+        expectedDistantLight.direction.x,
+        expectedDistantLight.direction.y,
+        expectedDistantLight.direction.z,
+        expectedDistantLight.color.x,
+        expectedDistantLight.color.y,
+        expectedDistantLight.color.z,
+        expectedDistantLight.intensity,
+        expectedDistantLight.angleDegrees,
+    ] {
+        command.appendLittleEndian(value.bitPattern)
+    }
+    let expectedDomeLight = RayDomeLight(
+        color: SIMD3<Float>(0.28, 0.36, 0.5),
+        intensity: 400
+    )
+    for value in [
+        expectedDomeLight.color.x,
+        expectedDomeLight.color.y,
+        expectedDomeLight.color.z,
+        expectedDomeLight.intensity,
+    ] {
+        command.appendLittleEndian(value.bitPattern)
+    }
     let submitted = session.handle(request(
         .submitCommand,
         id: 4,
@@ -699,6 +786,10 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
         payload: command
     )).response
     #expect(submitted.header.messageType == MessageType.submitCommand.rawValue)
+    #expect(backend.lastRayCamera == expectedCamera)
+    #expect(backend.lastRaySphereLight == expectedSphereLight)
+    #expect(backend.lastRayDistantLight == expectedDistantLight)
+    #expect(backend.lastRayDomeLight == expectedDomeLight)
 
     let busyAcceleration = session.handle(request(
         .destroyResource,

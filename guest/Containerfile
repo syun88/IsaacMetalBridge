@@ -10,11 +10,14 @@ COPY guest/vulkan_icd/imb_vulkan_icd.cpp /src/vulkan/imb_vulkan_icd.cpp
 COPY guest/vulkan_icd/imb_vulkan_probe.cpp /src/vulkan/imb_vulkan_probe.cpp
 COPY guest/vulkan_icd/imb_icd.json /src/vulkan/imb_icd.json
 COPY guest/vulkan_icd/add_u32.comp /src/vulkan/add_u32.comp
+COPY guest/vulkan_icd/texel_add.comp /src/vulkan/texel_add.comp
 COPY guest/vulkan_icd/triangle.vert /src/vulkan/triangle.vert
 COPY guest/vulkan_icd/triangle.frag /src/vulkan/triangle.frag
 
 RUN glslangValidator -V /src/vulkan/add_u32.comp -o /src/vulkan/add_u32.spv \
     && xxd -i -n imb_add_u32_spv /src/vulkan/add_u32.spv > /src/vulkan/add_u32_spv.h \
+    && glslangValidator -V /src/vulkan/texel_add.comp -o /src/vulkan/texel_add.spv \
+    && xxd -i -n imb_texel_add_spv /src/vulkan/texel_add.spv > /src/vulkan/texel_add_spv.h \
     && glslangValidator -V /src/vulkan/triangle.vert -o /src/vulkan/triangle.vert.spv \
     && xxd -i -n imb_triangle_vert_spv /src/vulkan/triangle.vert.spv > /src/vulkan/triangle_vert_spv.h \
     && glslangValidator -V /src/vulkan/triangle.frag -o /src/vulkan/triangle.frag.spv \
@@ -42,6 +45,7 @@ COPY --from=build /out/imb-vulkan-probe /usr/local/bin/imb-vulkan-probe
 COPY --from=build /out/libimb_vulkan_icd.so /usr/local/lib/libimb_vulkan_icd.so
 COPY --from=build /src/vulkan/imb_icd.json /usr/local/share/vulkan/icd.d/imb_icd.json
 COPY --from=build /src/vulkan/add_u32.spv /usr/local/share/imb/add_u32.spv
+COPY --from=build /src/vulkan/texel_add.spv /usr/local/share/imb/texel_add.spv
 COPY --from=build /src/vulkan/triangle.vert.spv /usr/local/share/imb/triangle.vert.spv
 COPY --from=build /src/vulkan/triangle.frag.spv /usr/local/share/imb/triangle.frag.spv
 

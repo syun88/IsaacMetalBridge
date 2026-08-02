@@ -32,7 +32,11 @@ if ! container image inspect "${source_image}" >/dev/null 2>&1; then
     exit 1
 fi
 
-if [[ ! -x "${adapter}" ]]; then
+if [[ ! -x "${adapter}" \
+    || -n "$(find "${repo_root}/host/Sources" "${repo_root}/host/ContainerAdapter/Sources" \
+        -type f -newer "${adapter}" -print -quit 2>/dev/null)" \
+    || "${repo_root}/host/Package.swift" -nt "${adapter}" \
+    || "${repo_root}/host/ContainerAdapter/Package.swift" -nt "${adapter}" ]]; then
     "${script_dir}/build-container-adapter.sh"
 fi
 
@@ -88,7 +92,7 @@ fi
 
 if ! grep -F 'VULKAN_ICD discovered="IsaacMetalBridge (' "${guest_log}" >/dev/null \
     || ! grep -F 'VULKAN_COMPUTE input=[1,2,3,4] addend=5 output=[6,7,8,9] backend=Metal fence=signaled' "${guest_log}" >/dev/null \
-    || ! grep -F 'VULKAN_TEXEL_BUFFER format=R32_UINT output=[8,9,10,11] backend=Metal fence=signaled' "${guest_log}" >/dev/null \
+    || ! grep -F 'VULKAN_TEXEL_BUFFER format=R32_UINT output=[8,9,10,11] whole_size_tail=passed explicit_tail=passed backend=Metal fence=signaled' "${guest_log}" >/dev/null \
     || ! grep -F 'executed Metal compute pipeline=' "${guest_log}" >/dev/null \
     || ! grep -F 'VULKAN_RASTER triangle=64x64 format=RGBA8' "${guest_log}" >/dev/null; then
     echo "test-isaac-vulkan-injection: injected ICD did not complete Metal compute, texel-buffer, and raster" >&2

@@ -24,7 +24,7 @@ flowchart TB
   end
   IS --> KIT --> GC --> GP
   AC --> VM
-  GP <-->|"IMB 1.7 over host-dialed vsock (verified)"| HB
+  GP <-->|"IMB 1.13 over host-dialed vsock (verified)"| HB
   HB --> MB --> GPU
   MB -->|"atomic real Kit UI frames"| VW
 ```
@@ -56,7 +56,7 @@ flowchart LR
   Q --> DEC["Host decoder"]
   DEC --> CAP["Capability manager"]
   DEC --> RM["Resource manager"]
-  DEC --> METAL["Metal command encoder (compute + narrow raster verified)"]
+  DEC --> METAL["Metal command encoder (generic compute + sparse image + bounded raster/ray verified)"]
   METAL --> CQ["MTLCommandQueue"]
 ```
 
@@ -66,7 +66,7 @@ flowchart LR
 flowchart LR
   G["Linux AF_VSOCK listener / probe"] --> CP["Control plane"]
   CP -->|"HELLO, capabilities, resources, errors"| FR["IMB framing"]
-  DP["Data plane"] -->|"buffers + RGBA8/BGRA8 + Kit UI draws verified"| FR
+  DP["Data plane"] -->|"buffers + images + sparse tiles + compute descriptors + Kit UI draws"| FR
   FR <-->|"local pipes and Apple host-dialed vsock verified"| H["Swift host session"]
 ```
 
@@ -76,9 +76,10 @@ Apple's audited API supports the host dialing a guest vsock port. `imb-container
 
 ```mermaid
 flowchart LR
-  VKL["Guest Vulkan loader / real Kit"] --> ICD["IMB Vulkan startup ICD + exact compute/raster paths"]
+  VKL["Guest Vulkan loader / real Kit"] --> ICD["IMB Vulkan startup ICD + supported Metal execution paths"]
   ICD --> CAPS["Truthful Vulkan capability filter"]
-  ICD --> SPV["Exact ADD_U32 SPIR-V recognition"]
+  ICD --> SPV["SPIR-V translation + buffer/image/texel dispatch"]
+  ICD --> SPR["Sparse image tile requirements + mappings"]
   ICD --> UI["Exact tested Kit UI pipeline recognition"]
   ICD --> P["IMB protocol"]
   P --> MSL["MSL/shader library"]
@@ -115,7 +116,7 @@ stateDiagram-v2
   Destroyed --> [*]: SHUTDOWN/disconnect
 ```
 
-Resource and fence IDs are host-issued. Disconnect destroys session-owned state. Protocol 1.7 buffer resources are real shared `MTLBuffer` objects; RGBA8/BGRA8 images are real shared `MTLTexture` objects; translated compute pipeline resources are real `MTLComputePipelineState` objects; primitive/instance acceleration resources own real Metal acceleration structures; and compute, raster, UI, and ray fences correspond to real committed Metal command buffers. The host can atomically capture completed Kit UI targets for the native viewer. General descriptor/dispatch transport, additional texture formats, and general RTX/Hydra shader semantics remain unimplemented.
+Resource and fence IDs are host-issued. Disconnect destroys session-owned state. Protocol 1.13 buffer resources are real shared `MTLBuffer` objects; linear and sparse images are real `MTLTexture` objects, with sparse images owning Metal heaps and tile mappings; translated compute pipelines are real `MTLComputePipelineState` objects; primitive/instance acceleration resources own real Metal acceleration structures; and compute, raster, UI, sparse-map, and ray fences correspond to committed Metal command buffers. Generic compute bindings carry buffers, images, formatted texel-buffer views, and push constants. Ray submissions can carry a validated live Kit camera and first USD SphereLight, DistantLight, and DomeLight records. A separate atomic scene-state v11 sideband adds each visible USD Mesh's real points, triangulated indices, normalized authored corner normals, optional corner UVs plus bounded RGBA8 base-color/roughness/metallic/emission/normal pixels, direct material constants, bounds, flags, and transform so the guest can build deterministic per-Mesh Metal BLASes; v3-v10 parsing and v3/v4 bounds matching remain backward compatible. Traversal enables native scenegraph instance proxies. The extension converts `omni.timeline` seconds to stage time codes and asks OpenUSD to evaluate camera, transforms, Mesh attributes, lights, proxy transforms, and PointInstancer prototype indices, positions, quaternion orientations, scales, IDs, masks, prototype-root transforms, and instancer transforms at that current time. Each visible prototype Mesh is emitted with a synthetic stable path and composed matrix. Changed payloads advance the sequence and rebuild the fallback TLAS; a content hash excluding path and world transform lets transform-only occurrences reuse the same Metal BLAS/material resources. The guest resolves standard `UsdTransform2d` chains and bakes scale-rotate-translate into corner UVs before this unchanged v11 transport. Vertex format 6 appends tangent and bitangent vectors derived from real triangle positions and transformed UV derivatives. The host transforms three normals, barycentrically interpolates normals/UVs, transforms and orthogonalizes the TBN basis, and retains two float4 direct-material records per TLAS instance. Parameter images use a 48-byte `MBM1 v1` descriptor with four host image IDs; `MBM1 v2` is 56 bytes and adds the normal image. The host validates the descriptor before binding up to 16 unique textures. The real Simple Grid texture is loaded directly by the host from the launcher's asset cache. The host can atomically capture completed Kit UI targets for the native viewer. Unsupported broader descriptor/material graphs, authored tangents/normal strength, different UV sources within one material, nested instancing and per-instance primvar overrides, animated material inputs, robust skinning/deformation, and general RTX/Hydra shader semantics remain incomplete.
 
 ## 8. Rendering flow
 
@@ -123,9 +124,15 @@ Resource and fence IDs are host-issued. Disconnect destroys session-owned state.
 flowchart LR
   KIT["Real Isaac Kit"] --> UI["Recognized UI draw stream"]
   KIT --> KHR["KHR scene BLAS and trace records"]
+  KIT --> CAM["Active camera + USD Sphere/Distant/Dome light state"]
+  KIT --> USD["Visible USD Mesh points + indices + transforms"]
+  USD --> MATCH["Build deterministic per-Mesh Metal BLAS"]
   KHR --> AS["Real Metal primitive and instance AS"]
-  AS --> RAY["Metal intersection dispatch"]
+  MATCH --> AS
+  CAM --> RAY["Metal intersection dispatch"]
+  AS --> RAY
   RAY --> VP["Kit 1280x720 viewport ring"]
+  VP --> SENSOR["Active-camera RGB resample + JSON"]
   VP --> UI
   UI --> MET["Metal indexed UI raster"]
   MET --> CAP["Atomic PPM frame capture"]
@@ -137,4 +144,4 @@ flowchart LR
 
 ## Component boundaries
 
-Guest: the verified probe/listener, Vulkan ICD, CUDA startup shim, and Kit input extension today; NVML remains future work. Transport: bounded framing and verified vsock for GPU work plus a per-run read-only bind-mounted input-record file, with bulk-transfer mechanisms still future work. Host: decoder, capability manager, real buffer/image/pipeline/acceleration-structure resource manager, frame capture, and interactive native viewer. Metal: shared buffers, RGBA8/BGRA8 textures, translated compute pipeline creation, primitive/instance acceleration structures, bounded ray dispatch, one fixed raster pipeline, and the exact tested Kit UI pipeline. General translated dispatch, live Kit camera/scene transforms, translated hit/miss semantics, materials, lighting, and RTX sensors remain future work.
+Guest: the verified probe/listener, Vulkan ICD, CUDA startup shim, timer compatibility shim, and Kit input/stage extensions today; NVML remains future work. Transport: bounded framing and verified vsock for GPU work plus per-run bind-mounted stage/input/scene-state/sensor files, with bulk-transfer mechanisms still future work. Host: decoder, capability manager, real buffer/linear-and-sparse-image/pipeline/acceleration-structure resource manager, real Simple Grid and scene-state material textures/constants, frame capture, and interactive native viewer. Metal: shared buffers, linear and sparse textures, translated compute dispatch, deterministic authored-Mesh, native-instance-proxy, and current-time PointInstancer-expanded primitive acceleration structures plus the refreshable fallback instance structure, per-triangle authored-normal and UV barycentric interpolation with geometric fallback, derived tangent-space basis, file base/roughness/metallic/emission/normal sampling, bounded diffuse-specular shading plus direct or mapped emission, primary and hard-shadow TLAS rays using the live Kit camera and USD SphereLight/DistantLight/DomeLight state, one fixed raster pipeline, and the tested Kit UI pipeline. The completed camera image can be resampled into the one-shot RGB contract without adding a second RTX Render Graph. Broader material networks, authored tangents/normal strength, nested instancing and per-instance primvar overrides, animated material inputs, robust skinning/deformation, broader raster/descriptor semantics, soft/area-light shadows and remaining light schemas, and native RTX annotator/sensor arrays remain future work.

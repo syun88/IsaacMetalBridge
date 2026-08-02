@@ -1,6 +1,10 @@
 [core]
 reloadable = false
-order = -1000
+# omni.kit.mainwindow uses order -500. Starting this extension before it pulls
+# viewport.window into the graph before DockSpace exists, which leaves the
+# default Viewport as a detached maximized root in headless Full. Keep the USD
+# opener early enough for RTX initialization, but after MainWindow creation.
+order = 0
 
 [package]
 version = "0.1.0"
@@ -12,6 +16,8 @@ toggleable = false
 
 [dependencies]
 "omni.usd" = {}
+"omni.timeline" = {}
+"omni.kit.viewport.utility" = {}
 
 [[python.module]]
 name = "isaacmetalbridge.stage"

@@ -1,6 +1,9 @@
 #usda 1.0
 (
     defaultPrim = "World"
+    startTimeCode = 0
+    endTimeCode = 48
+    timeCodesPerSecond = 24
     metersPerUnit = 1
     upAxis = "Z"
     customLayerData = {
@@ -14,21 +17,140 @@
     }
 )
 
+class Xform "_MarkerPrototype"
+{
+    def Mesh "MarkerMesh"
+    {
+        uniform token subdivisionScheme = "none"
+        point3f[] points = [
+            (-0.45, -0.45, 0.0),
+            ( 0.45, -0.45, 0.0),
+            ( 0.45,  0.45, 0.0),
+            (-0.45,  0.45, 0.0),
+            ( 0.0,   0.0,  1.1)
+        ]
+        int[] faceVertexCounts = [4, 3, 3, 3, 3]
+        int[] faceVertexIndices = [
+            0, 3, 2, 1,
+            0, 1, 4,
+            1, 2, 4,
+            2, 3, 4,
+            3, 0, 4
+        ]
+        rel material:binding = </World/Looks/MarkerMaterial>
+        float3[] extent = [(-0.45, -0.45, 0.0), (0.45, 0.45, 1.1)]
+    }
+}
+
 def Xform "World"
 {
+    def Scope "Looks"
+    {
+        def Material "CubeMaterial"
+        {
+            token outputs:surface.connect = </World/Looks/CubeMaterial/PreviewSurface.outputs:surface>
+
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor.connect = </World/Looks/CubeMaterial/ConnectedColor.outputs:rgb>
+                color3f inputs:emissiveColor = (0.06, 0.015, 0.0)
+                float inputs:metallic = 0.0
+                float inputs:metallic.connect = </World/Looks/CubeMaterial/ConnectedColor.outputs:g>
+                normal3f inputs:normal.connect = </World/Looks/CubeMaterial/ConnectedNormal.outputs:rgb>
+                float inputs:roughness = 0.32
+                float inputs:roughness.connect = </World/Looks/CubeMaterial/ConnectedColor.outputs:r>
+                token outputs:surface
+            }
+
+            def Shader "ConnectedColor"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @cube-albedo.png@
+                color4f inputs:fallback = (0.82, 0.18, 0.06, 1.0)
+                token inputs:sourceColorSpace = "sRGB"
+                float2 inputs:st.connect = </World/Looks/CubeMaterial/UVTransform.outputs:result>
+                token inputs:wrapS = "repeat"
+                token inputs:wrapT = "repeat"
+                float outputs:g
+                float outputs:r
+                float3 outputs:rgb
+            }
+
+            def Shader "ConnectedNormal"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @cube-normal.png@
+                color4f inputs:fallback = (0.5, 0.5, 1.0, 1.0)
+                token inputs:sourceColorSpace = "raw"
+                float2 inputs:st.connect = </World/Looks/CubeMaterial/UVTransform.outputs:result>
+                token inputs:wrapS = "repeat"
+                token inputs:wrapT = "repeat"
+                float3 outputs:rgb
+            }
+
+            def Shader "PrimvarReader"
+            {
+                uniform token info:id = "UsdPrimvarReader_float2"
+                token inputs:varname = "st"
+                float2 outputs:result
+            }
+
+            def Shader "UVTransform"
+            {
+                uniform token info:id = "UsdTransform2d"
+                float2 inputs:in.connect = </World/Looks/CubeMaterial/PrimvarReader.outputs:result>
+                float inputs:rotation = 27.0
+                float2 inputs:scale = (1.35, 0.8)
+                float2 inputs:translation = (0.17, -0.11)
+                float2 outputs:result
+            }
+        }
+
+        def Material "GroundMaterial"
+        {
+            token outputs:surface.connect = </World/Looks/GroundMaterial/PreviewSurface.outputs:surface>
+
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.26, 0.29, 0.34)
+                float inputs:metallic = 0.0
+                float inputs:roughness = 0.82
+                token outputs:surface
+            }
+        }
+
+        def Material "MarkerMaterial"
+        {
+            token outputs:surface.connect = </World/Looks/MarkerMaterial/PreviewSurface.outputs:surface>
+
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.12, 0.72, 0.26)
+                float inputs:metallic = 0.05
+                float inputs:roughness = 0.48
+                token outputs:surface
+            }
+        }
+    }
+
     def Mesh "Cube"
     {
         uniform token subdivisionScheme = "none"
         point3f[] points = [
-            (-0.75, -0.75, 0.0),
-            ( 0.75, -0.75, 0.0),
-            ( 0.75,  0.75, 0.0),
-            (-0.75,  0.75, 0.0),
-            (-0.75, -0.75, 1.5),
-            ( 0.75, -0.75, 1.5),
-            ( 0.75,  0.75, 1.5),
-            (-0.75,  0.75, 1.5)
+            (-0.75, -0.75, 0.0), (0.75, -0.75, 0.0),
+            (0.75, 0.75, 0.0), (-0.75, 0.75, 0.0),
+            (-0.75, -0.75, 1.5), (0.75, -0.75, 1.5),
+            (0.75, 0.75, 1.5), (-0.75, 0.75, 1.5)
         ]
+        double3 xformOp:translate.timeSamples = {
+            0: (0.0, 0.0, 0.0),
+            24: (0.45, 0.0, 0.6),
+            48: (0.0, 0.0, 0.0)
+        }
+        uniform token[] xformOpOrder = ["xformOp:translate"]
         int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
         int[] faceVertexIndices = [
             0, 3, 2, 1,
@@ -38,8 +160,29 @@ def Xform "World"
             2, 3, 7, 6,
             3, 0, 4, 7
         ]
+        normal3f[] normals = [
+            ( 0,  0, -1), ( 0,  0, -1), ( 0,  0, -1), ( 0,  0, -1),
+            ( 0,  0,  1), ( 0,  0,  1), ( 0,  0,  1), ( 0,  0,  1),
+            ( 0, -1,  0), ( 0, -1,  0), ( 0, -1,  0), ( 0, -1,  0),
+            ( 1,  0,  0), ( 1,  0,  0), ( 1,  0,  0), ( 1,  0,  0),
+            ( 0,  1,  0), ( 0,  1,  0), ( 0,  1,  0), ( 0,  1,  0),
+            (-1,  0,  0), (-1,  0,  0), (-1,  0,  0), (-1,  0,  0)
+        ] (
+            interpolation = "faceVarying"
+        )
+        texCoord2f[] primvars:st = [
+            (0, 0), (1, 0), (1, 1), (0, 1),
+            (0, 0), (1, 0), (1, 1), (0, 1),
+            (0, 0), (1, 0), (1, 1), (0, 1),
+            (0, 0), (1, 0), (1, 1), (0, 1),
+            (0, 0), (1, 0), (1, 1), (0, 1),
+            (0, 0), (1, 0), (1, 1), (0, 1)
+        ] (
+            interpolation = "faceVarying"
+        )
         color3f[] primvars:displayColor = [(0.12, 0.48, 0.95)]
         uniform token primvars:displayColor:interpolation = "constant"
+        rel material:binding = </World/Looks/CubeMaterial>
         float3[] extent = [(-0.75, -0.75, 0.0), (0.75, 0.75, 1.5)]
     }
 
@@ -54,23 +197,86 @@ def Xform "World"
         ]
         int[] faceVertexCounts = [4]
         int[] faceVertexIndices = [0, 1, 2, 3]
+        normal3f[] normals = [(0, 0, 1)] (
+            interpolation = "uniform"
+        )
         color3f[] primvars:displayColor = [(0.3, 0.32, 0.35)]
         uniform token primvars:displayColor:interpolation = "constant"
+        rel material:binding = </World/Looks/GroundMaterial>
         float3[] extent = [(-5, -5, -0.02), (5, 5, -0.02)]
+    }
+
+    def Xform "MarkerA" (
+        instanceable = true
+        prepend references = </_MarkerPrototype>
+    )
+    {
+        double3 xformOp:translate.timeSamples = {
+            0: (-2.0, 0.0, 0.0),
+            24: (-2.0, 1.3, 0.0),
+            48: (-2.0, 0.0, 0.0)
+        }
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def Xform "MarkerB" (
+        instanceable = true
+        prepend references = </_MarkerPrototype>
+    )
+    {
+        double3 xformOp:translate = (2.0, 0.0, 0.0)
+        double3 xformOp:rotateXYZ = (0.0, 0.0, 35.0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+    }
+
+    def PointInstancer "PointMarkers"
+    {
+        int64[] ids = [200, 201, 202, 203]
+        int64[] invisibleIds = [203]
+        quatf[] orientationsf = [
+            (1.0, 0.0, 0.0, 0.0),
+            (0.9238795, 0.0, 0.0, 0.3826834),
+            (0.8660254, 0.0, 0.0, -0.5),
+            (1.0, 0.0, 0.0, 0.0)
+        ]
+        point3f[] positions.timeSamples = {
+            0: [
+                (-2.5, -2.0, 0.0), (0.0, -2.0, 0.0),
+                (2.5, -2.0, 0.0), (0.0, 2.5, 0.0)
+            ],
+            24: [
+                (-2.5, -1.1, 0.0), (0.0, -3.0, 0.0),
+                (2.5, -1.1, 0.0), (0.0, 2.5, 0.0)
+            ],
+            48: [
+                (-2.5, -2.0, 0.0), (0.0, -2.0, 0.0),
+                (2.5, -2.0, 0.0), (0.0, 2.5, 0.0)
+            ]
+        }
+        int[] protoIndices = [0, 0, 0, 0]
+        rel prototypes = </_MarkerPrototype>
+        float3[] scales = [
+            (0.65, 0.65, 0.65),
+            (0.85, 0.55, 0.85),
+            (0.55, 0.85, 0.55),
+            (1.0, 1.0, 1.0)
+        ]
+        double3 xformOp:translate = (0.0, 0.0, 0.02)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 
     def DistantLight "KeyLight"
     {
-        float intensity = 2500
-        float angle = 1
-        color3f color = (1.0, 0.93, 0.82)
+        float inputs:intensity = 2500
+        float inputs:angle = 1
+        color3f inputs:color = (1.0, 0.93, 0.82)
         double3 xformOp:rotateXYZ = (-40, 25, 25)
         uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
     }
 
     def DomeLight "FillLight"
     {
-        float intensity = 400
-        color3f color = (0.28, 0.36, 0.5)
+        float inputs:intensity = 400
+        color3f inputs:color = (0.28, 0.36, 0.5)
     }
 }

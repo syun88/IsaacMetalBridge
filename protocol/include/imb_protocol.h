@@ -10,7 +10,7 @@ extern "C" {
 
 #define IMB_PROTOCOL_MAGIC UINT32_C(0x31424d49) /* little-endian bytes: I M B 1 */
 #define IMB_PROTOCOL_VERSION_MAJOR UINT16_C(1)
-#define IMB_PROTOCOL_VERSION_MINOR UINT16_C(10)
+#define IMB_PROTOCOL_VERSION_MINOR UINT16_C(13)
 #define IMB_PROTOCOL_HEADER_SIZE UINT32_C(32)
 #define IMB_PROTOCOL_MAX_PAYLOAD UINT32_C(16777216)
 
@@ -123,6 +123,28 @@ enum imb_compute_binding_kind {
     IMB_COMPUTE_BINDING_TEXTURE_READ_WRITE = 4,
     IMB_COMPUTE_BINDING_TEXEL_BUFFER_READ = 5,
     IMB_COMPUTE_BINDING_TEXEL_BUFFER_READ_WRITE = 6
+};
+
+enum imb_trace_rays_options {
+    IMB_TRACE_RAYS_OPTION_NONE = 0,
+    IMB_TRACE_RAYS_OPTION_LIVE_CAMERA = 1u << 0,
+    IMB_TRACE_RAYS_OPTION_LIVE_SPHERE_LIGHT = 1u << 1,
+    IMB_TRACE_RAYS_OPTION_LIVE_DISTANT_LIGHT = 1u << 2,
+    IMB_TRACE_RAYS_OPTION_LIVE_DOME_LIGHT = 1u << 3
+};
+
+enum imb_acceleration_structure_vertex_format {
+    IMB_ACCELERATION_STRUCTURE_VERTEX_FORMAT_FLOAT3_POSITION = 1,
+    /* float3 position followed by float3 authored corner normal */
+    IMB_ACCELERATION_STRUCTURE_VERTEX_FORMAT_FLOAT3_POSITION_NORMAL = 2,
+    /* format 2 followed by float2 material UV */
+    IMB_ACCELERATION_STRUCTURE_VERTEX_FORMAT_FLOAT3_POSITION_NORMAL_UV = 3,
+    /* format 3 followed by float roughness and float metallic */
+    IMB_ACCELERATION_STRUCTURE_VERTEX_FORMAT_FLOAT3_POSITION_NORMAL_UV_MATERIAL = 4,
+    /* format 4 followed by float3 emission color and float intensity */
+    IMB_ACCELERATION_STRUCTURE_VERTEX_FORMAT_FLOAT3_POSITION_NORMAL_UV_MATERIAL_EMISSION = 5,
+    /* format 5 followed by float3 tangent and float3 bitangent */
+    IMB_ACCELERATION_STRUCTURE_VERTEX_FORMAT_FLOAT3_POSITION_NORMAL_UV_MATERIAL_EMISSION_TBN = 6
 };
 
 #pragma pack(push, 1)
@@ -318,6 +340,24 @@ typedef struct imb_trace_rays_command_payload {
     uint32_t height;
     uint32_t miss_rgba8;
     uint32_t hit_rgba8;
+    uint32_t options;
+    uint32_t reserved1;
+    float camera_position[3];
+    float camera_forward[3];
+    float camera_up[3];
+    float vertical_fov_radians;
+    float near_distance;
+    float far_distance;
+    float sphere_light_position[3];
+    float sphere_light_color[3];
+    float sphere_light_intensity;
+    float sphere_light_radius;
+    float distant_light_direction[3];
+    float distant_light_color[3];
+    float distant_light_intensity;
+    float distant_light_angle_degrees;
+    float dome_light_color[3];
+    float dome_light_intensity;
 } imb_trace_rays_command_payload;
 
 typedef struct imb_dispatch_compute_command_payload {
@@ -404,7 +444,7 @@ static_assert(sizeof(imb_submit_command_payload) == 8, "IMB command ABI changed"
 static_assert(sizeof(imb_add_u32_command_payload) == 16, "IMB ADD_U32 ABI changed");
 static_assert(sizeof(imb_draw_triangle_command_payload) == 16, "IMB DRAW_TRIANGLE ABI changed");
 static_assert(sizeof(imb_draw_indexed_ui_command_payload) == 56, "IMB DRAW_INDEXED_UI ABI changed");
-static_assert(sizeof(imb_trace_rays_command_payload) == 32, "IMB TRACE_RAYS ABI changed");
+static_assert(sizeof(imb_trace_rays_command_payload) == 168, "IMB TRACE_RAYS ABI changed");
 static_assert(sizeof(imb_dispatch_compute_command_payload) == 32, "IMB DISPATCH_COMPUTE ABI changed");
 static_assert(sizeof(imb_compute_binding_payload) == 48, "IMB compute binding ABI changed");
 static_assert(sizeof(imb_ui_draw_payload) == 40, "IMB UI draw ABI changed");

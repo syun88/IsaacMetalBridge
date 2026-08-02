@@ -4,6 +4,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "${script_dir}/.." && pwd -P)"
 adapter="${repo_root}/host/ContainerAdapter/.build/release/imb-container-host"
+spirv_cross="${IMB_SPIRV_CROSS:-${repo_root}/build/tools/spirv-cross}"
 image="imb-guest:dev"
 container_id="imb-vulkan-probe-$$"
 vsock_port="19002"
@@ -27,8 +28,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [[ ! -x "${adapter}" ]]; then
+if [[ ! -x "${adapter}" \
+    || -n "$(find "${repo_root}/host/Sources" "${repo_root}/host/ContainerAdapter/Sources" \
+        -type f -newer "${adapter}" -print -quit 2>/dev/null)" \
+    || "${repo_root}/host/Package.swift" -nt "${adapter}" \
+    || "${repo_root}/host/ContainerAdapter/Package.swift" -nt "${adapter}" ]]; then
     "${script_dir}/build-container-adapter.sh"
+fi
+if [[ ! -x "${spirv_cross}" ]]; then
+    IMB_SPIRV_CROSS_OUTPUT="${spirv_cross}" "${script_dir}/build-spirv-cross.sh"
 fi
 
 if [[ "${IMB_SKIP_GUEST_BUILD:-0}" != "1" ]]; then
@@ -49,7 +57,10 @@ container run \
     --gid "$(id -g)" \
     --volume "${artifact_dir}:/output" \
     --env "IMB_VSOCK_PORT=${vsock_port}" \
+    --env "IMB_VULKAN_SPIRV_COMPUTE=1" \
+    --env "IMB_VULKAN_GENERIC_COMPUTE=1" \
     --env "IMB_VULKAN_SPARSE_IMAGES=1" \
+    --env "IMB_VULKAN_COMPUTE_TRACE=${IMB_VULKAN_COMPUTE_TRACE:-}" \
     --env "VK_DRIVER_FILES=/usr/local/share/vulkan/icd.d/imb_icd.json" \
     --entrypoint /usr/local/bin/imb-vulkan-probe \
     "${image}" \
@@ -57,7 +68,7 @@ container run \
 
 connected=0
 for _ in {1..40}; do
-    if "${adapter}" \
+    if IMB_SPIRV_CROSS="${spirv_cross}" "${adapter}" \
         --container "${container_id}" \
         --vsock-port "${vsock_port}" >"${adapter_log}" 2>&1; then
         connected=1
@@ -89,16 +100,23 @@ fi
 
 if ! grep -F 'VULKAN_RASTER triangle=64x64 format=RGBA8' "${guest_log}" >/dev/null; then
     echo "test-vulkan-icd: Vulkan raster did not complete through the Metal bridge" >&2
+    sed -n '1,240p' "${adapter_log}" >&2
     sed -n '1,240p' "${guest_log}" >&2
     exit 1
 fi
-if ! grep -F 'VULKAN_BLAS triangles=1 geometry=opaque backend=Metal fence=signaled' "${guest_log}" >/dev/null; then
+if ! grep -F 'VULKAN_BLAS triangles=2 geometries=opaque backend=Metal fence=signaled' "${guest_log}" >/dev/null; then
     echo "test-vulkan-icd: Vulkan BLAS did not complete through the Metal bridge" >&2
     sed -n '1,240p' "${adapter_log}" >&2
     sed -n '1,240p' "${guest_log}" >&2
     exit 1
 fi
-if ! grep -F 'VULKAN_TLAS instances=1 child_blas=1 backend=Metal fence=signaled' "${guest_log}" >/dev/null; then
+if ! grep -F 'VULKAN_AS_COMMAND_ORDER copies=2 builds=2 shared_input=1 preserved=passed' "${guest_log}" >/dev/null; then
+    echo "test-vulkan-icd: interleaved transfer/BLAS command order was not preserved" >&2
+    sed -n '1,240p' "${adapter_log}" >&2
+    sed -n '1,240p' "${guest_log}" >&2
+    exit 1
+fi
+if ! grep -F 'VULKAN_TLAS instances=2 child_blas=2 backend=Metal fence=signaled' "${guest_log}" >/dev/null; then
     echo "test-vulkan-icd: Vulkan TLAS did not complete through the Metal bridge" >&2
     sed -n '1,240p' "${adapter_log}" >&2
     sed -n '1,240p' "${guest_log}" >&2

@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cerrno>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -19,8 +21,10 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -42,6 +46,820 @@ constexpr std::size_t kShaderGroupHandleSize = 32;
 // is backed by a 2x2 group of Metal tiles.
 constexpr VkDeviceSize kMetalSparseImageBlockBytes = 16384;
 constexpr VkDeviceSize kSparseImageBlockBytes = 65536;
+constexpr std::uint32_t kCameraStateMagic = UINT32_C(0x31434d49);
+constexpr std::uint16_t kCameraStateLegacyVersion = 2;
+constexpr std::uint16_t kSceneStatePreviousVersion = 3;
+constexpr std::uint16_t kSceneStateLightingVersion = 4;
+constexpr std::uint16_t kSceneStateGeometryVersion = 5;
+constexpr std::uint16_t kSceneStateNormalsVersion = 6;
+constexpr std::uint16_t kSceneStateTextureVersion = 7;
+constexpr std::uint16_t kSceneStateMaterialVersion = 8;
+constexpr std::uint16_t kSceneStateEmissionVersion = 9;
+constexpr std::uint16_t kSceneStateParameterTextureVersion = 10;
+constexpr std::uint16_t kSceneStateVersion = 11;
+constexpr std::size_t kCameraStateSize = 96;
+constexpr std::size_t kSceneStatePreviousHeaderSize = 100;
+constexpr std::size_t kSceneStateHeaderSize = 148;
+constexpr std::size_t kSceneMeshRecordSize = 88;
+constexpr std::size_t kSceneMeshGeometryRecordSize = 96;
+constexpr std::size_t kSceneMeshNormalsRecordSize = 100;
+constexpr std::size_t kSceneMeshTextureRecordSize = 116;
+constexpr std::size_t kSceneMeshMaterialRecordSize = 124;
+constexpr std::size_t kSceneMeshEmissionRecordSize = 140;
+constexpr std::size_t kSceneMeshParameterTextureRecordSize = 192;
+constexpr std::size_t kSceneMeshNormalTextureRecordSize = 204;
+constexpr std::uint32_t kMaxSceneMeshCount = 4096;
+constexpr std::uint32_t kMaxSceneMeshVertexCount = 16U * 1024U * 1024U;
+constexpr std::uint32_t kMaxSceneMeshIndexCount = 48U * 1024U * 1024U;
+constexpr std::size_t kMaxSceneStateBytes = 512U * 1024U * 1024U;
+
+struct BridgeRayCamera {
+    std::uint64_t sequence = 0;
+    std::array<float, 3> position{};
+    std::array<float, 3> forward{};
+    std::array<float, 3> up{};
+    float verticalFOVRadians = 0.0f;
+    float nearDistance = 0.0f;
+    float farDistance = 0.0f;
+    bool hasSphereLight = false;
+    std::array<float, 3> sphereLightPosition{};
+    std::array<float, 3> sphereLightColor{};
+    float sphereLightIntensity = 0.0f;
+    float sphereLightRadius = 0.0f;
+    bool hasDistantLight = false;
+    std::array<float, 3> distantLightDirection{};
+    std::array<float, 3> distantLightColor{};
+    float distantLightIntensity = 0.0f;
+    float distantLightAngleDegrees = 0.0f;
+    bool hasDomeLight = false;
+    std::array<float, 3> domeLightColor{};
+    float domeLightIntensity = 0.0f;
+};
+
+struct BridgeSceneTextureMap {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t channel = 0;
+    std::vector<std::uint8_t> rgba8;
+};
+
+struct BridgeSceneMesh {
+    std::uint64_t pathHash = 0;
+    std::uint32_t triangleCount = 0;
+    std::uint32_t materialFlags = 0;
+    std::array<float, 3> boundsMinimum{};
+    std::array<float, 3> boundsMaximum{};
+    std::array<float, 12> worldTransform{};
+    std::vector<float> vertices;
+    std::vector<std::uint32_t> indices;
+    std::vector<float> cornerNormals;
+    std::vector<float> cornerUVs;
+    std::uint32_t textureWidth = 0;
+    std::uint32_t textureHeight = 0;
+    std::vector<std::uint8_t> textureRGBA8;
+    float roughness = 0.5f;
+    float metallic = 0.0f;
+    std::array<float, 3> emissionColor{};
+    float emissionIntensity = 0.0f;
+    BridgeSceneTextureMap roughnessTexture;
+    BridgeSceneTextureMap metallicTexture;
+    BridgeSceneTextureMap emissionTexture;
+    BridgeSceneTextureMap normalTexture;
+};
+
+struct BridgeSceneState {
+    BridgeRayCamera camera{};
+    std::vector<BridgeSceneMesh> meshes;
+    bool hasMeshManifest = false;
+};
+
+struct BridgeSceneMetalMesh {
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint64_t contentHash = 0;
+    std::uint64_t pathHash = 0;
+    std::uint64_t vertexBufferResourceID = 0;
+    std::uint64_t indexBufferResourceID = 0;
+    std::uint64_t textureResourceID = 0;
+    std::uint64_t roughnessTextureResourceID = 0;
+    std::uint64_t metallicTextureResourceID = 0;
+    std::uint64_t emissionTextureResourceID = 0;
+    std::uint64_t normalTextureResourceID = 0;
+    std::uint64_t materialDescriptorResourceID = 0;
+    std::uint64_t accelerationStructureResourceID = 0;
+};
+
+std::uint16_t readCameraU16(const std::array<std::uint8_t, kCameraStateSize>& bytes, std::size_t offset) {
+    return static_cast<std::uint16_t>(bytes[offset])
+        | static_cast<std::uint16_t>(bytes[offset + 1]) << 8;
+}
+
+std::uint32_t readCameraU32(const std::array<std::uint8_t, kCameraStateSize>& bytes, std::size_t offset) {
+    std::uint32_t result = 0;
+    for (std::size_t index = 0; index < 4; ++index) {
+        result |= static_cast<std::uint32_t>(bytes[offset + index]) << (index * 8);
+    }
+    return result;
+}
+
+std::uint64_t readCameraU64(const std::array<std::uint8_t, kCameraStateSize>& bytes, std::size_t offset) {
+    std::uint64_t result = 0;
+    for (std::size_t index = 0; index < 8; ++index) {
+        result |= static_cast<std::uint64_t>(bytes[offset + index]) << (index * 8);
+    }
+    return result;
+}
+
+float readCameraFloat(const std::array<std::uint8_t, kCameraStateSize>& bytes, std::size_t offset) {
+    return std::bit_cast<float>(readCameraU32(bytes, offset));
+}
+
+float vectorLengthSquared(const std::array<float, 3>& value) {
+    return value[0] * value[0] + value[1] * value[1] + value[2] * value[2];
+}
+
+std::optional<BridgeSceneState> readLiveSceneState() {
+    const char* path = std::getenv("IMB_CAMERA_STATE_FILE");
+    if (path == nullptr || path[0] == '\0') return std::nullopt;
+
+    std::ifstream input(path, std::ios::binary);
+    if (!input) return std::nullopt;
+    std::vector<std::uint8_t> allBytes(
+        (std::istreambuf_iterator<char>(input)),
+        std::istreambuf_iterator<char>()
+    );
+    if (allBytes.size() < kCameraStateSize) return std::nullopt;
+    std::array<std::uint8_t, kCameraStateSize> bytes{};
+    std::copy_n(allBytes.begin(), bytes.size(), bytes.begin());
+    const std::uint16_t version = readCameraU16(bytes, 4);
+    if (readCameraU32(bytes, 0) != kCameraStateMagic
+        || !(version == kCameraStateLegacyVersion
+            || version == kSceneStatePreviousVersion
+            || (version >= kSceneStateLightingVersion
+                && version <= kSceneStateVersion))
+        || (readCameraU16(bytes, 6) & 1u) == 0) {
+        return std::nullopt;
+    }
+    if ((version == kCameraStateLegacyVersion && allBytes.size() != kCameraStateSize)
+        || (version == kSceneStatePreviousVersion
+            && allBytes.size() < kSceneStatePreviousHeaderSize)
+        || (version >= kSceneStateLightingVersion
+            && version <= kSceneStateVersion
+            && allBytes.size() < kSceneStateHeaderSize)) {
+        return std::nullopt;
+    }
+
+    BridgeSceneState scene{};
+    auto& camera = scene.camera;
+    camera.sequence = readCameraU64(bytes, 8);
+    for (std::size_t index = 0; index < 3; ++index) {
+        camera.position[index] = readCameraFloat(bytes, 16 + index * 4);
+        camera.forward[index] = readCameraFloat(bytes, 28 + index * 4);
+        camera.up[index] = readCameraFloat(bytes, 40 + index * 4);
+    }
+    camera.verticalFOVRadians = readCameraFloat(bytes, 52);
+    camera.nearDistance = readCameraFloat(bytes, 56);
+    camera.farDistance = readCameraFloat(bytes, 60);
+    const std::uint16_t stateFlags = readCameraU16(bytes, 6);
+    camera.hasSphereLight = (stateFlags & 2u) != 0;
+    for (std::size_t index = 0; index < 3; ++index) {
+        camera.sphereLightPosition[index] = readCameraFloat(bytes, 64 + index * 4);
+        camera.sphereLightColor[index] = readCameraFloat(bytes, 76 + index * 4);
+    }
+    camera.sphereLightIntensity = readCameraFloat(bytes, 88);
+    camera.sphereLightRadius = readCameraFloat(bytes, 92);
+    const auto finiteVector = [](const std::array<float, 3>& value) {
+        return std::all_of(value.begin(), value.end(), [](float component) {
+            return std::isfinite(component);
+        });
+    };
+    if (camera.sequence == 0
+        || !finiteVector(camera.position)
+        || !finiteVector(camera.forward)
+        || !finiteVector(camera.up)
+        || !std::isfinite(camera.verticalFOVRadians)
+        || !std::isfinite(camera.nearDistance)
+        || !std::isfinite(camera.farDistance)
+        || vectorLengthSquared(camera.forward) <= 0.000001f
+        || vectorLengthSquared(camera.up) <= 0.000001f
+        || camera.verticalFOVRadians <= 0.01f
+        || camera.verticalFOVRadians >= 3.13f
+        || camera.nearDistance <= 0.0f
+        || camera.farDistance <= camera.nearDistance) {
+        return std::nullopt;
+    }
+    if (camera.hasSphereLight
+        && (!finiteVector(camera.sphereLightPosition)
+            || !finiteVector(camera.sphereLightColor)
+            || !std::isfinite(camera.sphereLightIntensity)
+            || !std::isfinite(camera.sphereLightRadius)
+            || std::any_of(
+                camera.sphereLightColor.begin(),
+                camera.sphereLightColor.end(),
+                [](float component) { return component < 0.0f; }
+            )
+            || camera.sphereLightIntensity < 0.0f
+            || camera.sphereLightRadius <= 0.0f)) {
+        return std::nullopt;
+    }
+
+    const auto readAllU32 = [&allBytes](std::size_t offset) {
+        std::uint32_t result = 0;
+        for (std::size_t index = 0; index < 4; ++index) {
+            result |= static_cast<std::uint32_t>(allBytes[offset + index])
+                << (index * 8);
+        }
+        return result;
+    };
+    const auto readAllU64 = [&allBytes](std::size_t offset) {
+        std::uint64_t result = 0;
+        for (std::size_t index = 0; index < 8; ++index) {
+            result |= static_cast<std::uint64_t>(allBytes[offset + index])
+                << (index * 8);
+        }
+        return result;
+    };
+    const auto readAllFloat = [&readAllU32](std::size_t offset) {
+        return std::bit_cast<float>(readAllU32(offset));
+    };
+    if (version >= kSceneStateLightingVersion
+        && version <= kSceneStateVersion) {
+        camera.hasDistantLight = (stateFlags & 8u) != 0;
+        camera.hasDomeLight = (stateFlags & 16u) != 0;
+        for (std::size_t index = 0; index < 3; ++index) {
+            camera.distantLightDirection[index] = readAllFloat(96 + index * 4);
+            camera.distantLightColor[index] = readAllFloat(108 + index * 4);
+            camera.domeLightColor[index] = readAllFloat(128 + index * 4);
+        }
+        camera.distantLightIntensity = readAllFloat(120);
+        camera.distantLightAngleDegrees = readAllFloat(124);
+        camera.domeLightIntensity = readAllFloat(140);
+        if (camera.hasDistantLight
+            && (!finiteVector(camera.distantLightDirection)
+                || !finiteVector(camera.distantLightColor)
+                || vectorLengthSquared(camera.distantLightDirection) <= 0.000001f
+                || !std::isfinite(camera.distantLightIntensity)
+                || !std::isfinite(camera.distantLightAngleDegrees)
+                || std::any_of(
+                    camera.distantLightColor.begin(),
+                    camera.distantLightColor.end(),
+                    [](float component) { return component < 0.0f; }
+                )
+                || camera.distantLightIntensity < 0.0f
+                || camera.distantLightAngleDegrees < 0.0f
+                || camera.distantLightAngleDegrees > 180.0f)) {
+            return std::nullopt;
+        }
+        if (camera.hasDomeLight
+            && (!finiteVector(camera.domeLightColor)
+                || !std::isfinite(camera.domeLightIntensity)
+                || std::any_of(
+                    camera.domeLightColor.begin(),
+                    camera.domeLightColor.end(),
+                    [](float component) { return component < 0.0f; }
+                )
+                || camera.domeLightIntensity < 0.0f)) {
+            return std::nullopt;
+        }
+    }
+
+    if (version == kSceneStatePreviousVersion
+        || (version >= kSceneStateLightingVersion
+            && version <= kSceneStateVersion)) {
+        const std::size_t sceneHeaderSize = version >= kSceneStateLightingVersion
+            ? kSceneStateHeaderSize
+            : kSceneStatePreviousHeaderSize;
+        const std::size_t meshCountOffset = version >= kSceneStateLightingVersion
+            ? 144
+            : kCameraStateSize;
+        const std::uint32_t meshCount = readAllU32(meshCountOffset);
+        const bool hasMeshGeometry = version >= kSceneStateGeometryVersion;
+        const bool hasCornerNormals = version >= kSceneStateNormalsVersion;
+        const bool hasFileTextures = version >= kSceneStateTextureVersion;
+        const bool hasMaterialParameters = version >= kSceneStateMaterialVersion;
+        const bool hasEmission = version >= kSceneStateEmissionVersion;
+        const bool hasParameterTextures =
+            version >= kSceneStateParameterTextureVersion;
+        const bool hasNormalTextures = version >= kSceneStateVersion;
+        if (meshCount > kMaxSceneMeshCount || allBytes.size() > kMaxSceneStateBytes) {
+            return std::nullopt;
+        }
+        if (!hasMeshGeometry
+            && (meshCount > (std::numeric_limits<std::size_t>::max()
+                    - sceneHeaderSize) / kSceneMeshRecordSize
+                || allBytes.size() != sceneHeaderSize
+                    + static_cast<std::size_t>(meshCount)
+                        * kSceneMeshRecordSize)) {
+            return std::nullopt;
+        }
+        scene.hasMeshManifest = (readCameraU16(bytes, 6) & 4u) != 0;
+        if (!scene.hasMeshManifest && meshCount != 0) return std::nullopt;
+        if (hasMeshGeometry && (readCameraU16(bytes, 6) & 32u) == 0) {
+            return std::nullopt;
+        }
+        if (hasCornerNormals && (readCameraU16(bytes, 6) & 64u) == 0) {
+            return std::nullopt;
+        }
+        if (hasFileTextures && (readCameraU16(bytes, 6) & 128u) == 0) {
+            return std::nullopt;
+        }
+        if (hasMaterialParameters && (readCameraU16(bytes, 6) & 256u) == 0) {
+            return std::nullopt;
+        }
+        if (hasEmission && (readCameraU16(bytes, 6) & 512u) == 0) {
+            return std::nullopt;
+        }
+        if (hasParameterTextures && (readCameraU16(bytes, 6) & 1024u) == 0) {
+            return std::nullopt;
+        }
+        if (hasNormalTextures && (readCameraU16(bytes, 6) & 2048u) == 0) {
+            return std::nullopt;
+        }
+        try {
+            scene.meshes.reserve(meshCount);
+        } catch (const std::bad_alloc&) {
+            return std::nullopt;
+        }
+        std::size_t recordOffset = sceneHeaderSize;
+        for (std::uint32_t meshIndex = 0; meshIndex < meshCount; ++meshIndex) {
+            const std::size_t recordSize = hasNormalTextures
+                ? kSceneMeshNormalTextureRecordSize
+                : (hasParameterTextures
+                ? kSceneMeshParameterTextureRecordSize
+                : (hasEmission
+                ? kSceneMeshEmissionRecordSize
+                : (hasMaterialParameters
+                ? kSceneMeshMaterialRecordSize
+                : (hasFileTextures
+                ? kSceneMeshTextureRecordSize
+                : (hasCornerNormals
+                    ? kSceneMeshNormalsRecordSize
+                : (hasMeshGeometry
+                    ? kSceneMeshGeometryRecordSize
+                    : kSceneMeshRecordSize))))));
+            if (recordOffset > allBytes.size()
+                || recordSize > allBytes.size() - recordOffset) {
+                return std::nullopt;
+            }
+            BridgeSceneMesh mesh{};
+            mesh.pathHash = readAllU64(recordOffset);
+            mesh.triangleCount = readAllU32(recordOffset + 8);
+            mesh.materialFlags = readAllU32(recordOffset + 12);
+            if (!hasMaterialParameters && (mesh.materialFlags & 16u) != 0) {
+                return std::nullopt;
+            }
+            if (!hasEmission && (mesh.materialFlags & 32u) != 0) {
+                return std::nullopt;
+            }
+            for (std::size_t component = 0; component < 3; ++component) {
+                mesh.boundsMinimum[component] =
+                    readAllFloat(recordOffset + 16 + component * 4);
+                mesh.boundsMaximum[component] =
+                    readAllFloat(recordOffset + 28 + component * 4);
+            }
+            for (std::size_t component = 0; component < 12; ++component) {
+                mesh.worldTransform[component] =
+                    readAllFloat(recordOffset + 40 + component * 4);
+            }
+            if (hasMaterialParameters) {
+                mesh.roughness = readAllFloat(recordOffset + 88);
+                mesh.metallic = readAllFloat(recordOffset + 92);
+                const bool meshHasMaterialParameters =
+                    (mesh.materialFlags & 16u) != 0;
+                if ((meshHasMaterialParameters
+                        && (!std::isfinite(mesh.roughness)
+                            || !std::isfinite(mesh.metallic)
+                            || mesh.roughness < 0.0f || mesh.roughness > 1.0f
+                            || mesh.metallic < 0.0f || mesh.metallic > 1.0f))
+                    || (!meshHasMaterialParameters
+                        && (mesh.roughness != 0.5f || mesh.metallic != 0.0f))) {
+                    return std::nullopt;
+                }
+            }
+            if (hasEmission) {
+                for (std::size_t component = 0; component < 3; ++component) {
+                    mesh.emissionColor[component] =
+                        readAllFloat(recordOffset + 96 + component * 4);
+                }
+                mesh.emissionIntensity = readAllFloat(recordOffset + 108);
+                const bool meshHasEmission = (mesh.materialFlags & 32u) != 0;
+                const bool emissionValid = finiteVector(mesh.emissionColor)
+                    && std::all_of(
+                        mesh.emissionColor.begin(), mesh.emissionColor.end(),
+                        [](float value) { return value >= 0.0f && value <= 1.0f; }
+                    )
+                    && std::isfinite(mesh.emissionIntensity)
+                    && mesh.emissionIntensity >= 0.0f
+                    && mesh.emissionIntensity <= 1000000.0f;
+                if ((meshHasEmission && !emissionValid)
+                    || (!meshHasEmission
+                        && (mesh.emissionColor != std::array<float, 3>{}
+                            || mesh.emissionIntensity != 0.0f))) {
+                    return std::nullopt;
+                }
+            }
+            bool boundsOrdered = true;
+            for (std::size_t component = 0; component < 3; ++component) {
+                if (mesh.boundsMinimum[component] > mesh.boundsMaximum[component]) {
+                    boundsOrdered = false;
+                    break;
+                }
+            }
+            if (mesh.pathHash == 0 || mesh.triangleCount == 0
+                || !finiteVector(mesh.boundsMinimum)
+                || !finiteVector(mesh.boundsMaximum)
+                || !boundsOrdered
+                || std::any_of(
+                    mesh.worldTransform.begin(),
+                    mesh.worldTransform.end(),
+                    [](float component) { return !std::isfinite(component); }
+                )) {
+                return std::nullopt;
+            }
+            recordOffset += recordSize;
+            if (hasMeshGeometry) {
+                const std::size_t recordStart = recordOffset - recordSize;
+                const std::uint32_t vertexCount = hasParameterTextures
+                    ? readAllU32(recordStart + 112)
+                    : readAllU32(recordOffset - (hasFileTextures
+                        ? 28 : (hasCornerNormals ? 12 : 8)));
+                const std::uint32_t indexCount = hasParameterTextures
+                    ? readAllU32(recordStart + 116)
+                    : readAllU32(recordOffset - (hasFileTextures
+                        ? 24 : (hasCornerNormals ? 8 : 4)));
+                const std::uint32_t normalCount = hasParameterTextures
+                    ? readAllU32(recordStart + 120)
+                    : (hasCornerNormals
+                        ? readAllU32(recordOffset - (hasFileTextures ? 20 : 4))
+                        : 0);
+                const std::uint32_t uvCount = hasParameterTextures
+                    ? readAllU32(recordStart + 124)
+                    : (hasFileTextures ? readAllU32(recordOffset - 16) : 0);
+                const std::uint32_t textureWidth = hasParameterTextures
+                    ? readAllU32(recordStart + 128)
+                    : (hasFileTextures ? readAllU32(recordOffset - 12) : 0);
+                const std::uint32_t textureHeight = hasParameterTextures
+                    ? readAllU32(recordStart + 132)
+                    : (hasFileTextures ? readAllU32(recordOffset - 8) : 0);
+                const std::uint32_t textureByteCount = hasParameterTextures
+                    ? readAllU32(recordStart + 136)
+                    : (hasFileTextures ? readAllU32(recordOffset - 4) : 0);
+                const std::uint32_t textureFlags = hasParameterTextures
+                    ? readAllU32(recordStart + 140) : 0;
+                const std::uint32_t roughnessTextureWidth = hasParameterTextures
+                    ? readAllU32(recordStart + 144) : 0;
+                const std::uint32_t roughnessTextureHeight = hasParameterTextures
+                    ? readAllU32(recordStart + 148) : 0;
+                const std::uint32_t roughnessTextureByteCount = hasParameterTextures
+                    ? readAllU32(recordStart + 152) : 0;
+                const std::uint32_t roughnessTextureChannel = hasParameterTextures
+                    ? readAllU32(recordStart + 156) : 0;
+                const std::uint32_t metallicTextureWidth = hasParameterTextures
+                    ? readAllU32(recordStart + 160) : 0;
+                const std::uint32_t metallicTextureHeight = hasParameterTextures
+                    ? readAllU32(recordStart + 164) : 0;
+                const std::uint32_t metallicTextureByteCount = hasParameterTextures
+                    ? readAllU32(recordStart + 168) : 0;
+                const std::uint32_t metallicTextureChannel = hasParameterTextures
+                    ? readAllU32(recordStart + 172) : 0;
+                const std::uint32_t emissionTextureWidth = hasParameterTextures
+                    ? readAllU32(recordStart + 176) : 0;
+                const std::uint32_t emissionTextureHeight = hasParameterTextures
+                    ? readAllU32(recordStart + 180) : 0;
+                const std::uint32_t emissionTextureByteCount = hasParameterTextures
+                    ? readAllU32(recordStart + 184) : 0;
+                const std::uint32_t emissionTextureChannel = hasParameterTextures
+                    ? readAllU32(recordStart + 188) : 0;
+                const std::uint32_t normalTextureWidth = hasNormalTextures
+                    ? readAllU32(recordStart + 192) : 0;
+                const std::uint32_t normalTextureHeight = hasNormalTextures
+                    ? readAllU32(recordStart + 196) : 0;
+                const std::uint32_t normalTextureByteCount = hasNormalTextures
+                    ? readAllU32(recordStart + 200) : 0;
+                const bool hasTextureUVs = uvCount != 0;
+                const bool hasBaseTexture = textureByteCount != 0;
+                const bool hasRoughnessTexture = (textureFlags & 1u) != 0;
+                const bool hasMetallicTexture = (textureFlags & 2u) != 0;
+                const bool hasEmissionTexture = (textureFlags & 4u) != 0;
+                const bool hasNormalTexture = (textureFlags & 8u) != 0;
+                if (vertexCount == 0 || vertexCount > kMaxSceneMeshVertexCount
+                    || indexCount == 0 || indexCount > kMaxSceneMeshIndexCount
+                    || indexCount % 3 != 0
+                    || indexCount / 3 != mesh.triangleCount
+                    || (normalCount != 0 && normalCount != indexCount)
+                    || (hasTextureUVs && uvCount != indexCount)
+                    || (!hasTextureUVs && (hasBaseTexture
+                        || hasRoughnessTexture || hasMetallicTexture
+                        || hasEmissionTexture || hasNormalTexture))
+                    || (textureFlags & ~15u) != 0) {
+                    return std::nullopt;
+                }
+                const std::uint64_t expectedTextureBytes =
+                    static_cast<std::uint64_t>(textureWidth)
+                    * textureHeight * 4;
+                if ((hasBaseTexture
+                        && (textureWidth == 0 || textureHeight == 0
+                            || textureWidth > 4096 || textureHeight > 4096
+                            || expectedTextureBytes != textureByteCount
+                            || (mesh.materialFlags & 8u) == 0))
+                    || (!hasBaseTexture
+                        && (textureWidth != 0 || textureHeight != 0
+                            || (mesh.materialFlags & 8u) != 0))) {
+                    return std::nullopt;
+                }
+                const auto parameterTextureValid = [](
+                    bool present,
+                    std::uint32_t width,
+                    std::uint32_t height,
+                    std::uint32_t byteCount,
+                    std::uint32_t channel,
+                    bool colorOutput
+                ) {
+                    if (!present) {
+                        return width == 0 && height == 0 && byteCount == 0
+                            && channel == 0;
+                    }
+                    const std::uint64_t expectedBytes =
+                        static_cast<std::uint64_t>(width) * height * 4;
+                    return width > 0 && height > 0
+                        && width <= 4096 && height <= 4096
+                        && expectedBytes == byteCount
+                        && (colorOutput ? channel == 4u : channel <= 3u);
+                };
+                if (!parameterTextureValid(
+                        hasRoughnessTexture,
+                        roughnessTextureWidth,
+                        roughnessTextureHeight,
+                        roughnessTextureByteCount,
+                        roughnessTextureChannel,
+                        false
+                    )
+                    || !parameterTextureValid(
+                        hasMetallicTexture,
+                        metallicTextureWidth,
+                        metallicTextureHeight,
+                        metallicTextureByteCount,
+                        metallicTextureChannel,
+                        false
+                    )
+                    || !parameterTextureValid(
+                        hasEmissionTexture,
+                        emissionTextureWidth,
+                        emissionTextureHeight,
+                        emissionTextureByteCount,
+                        emissionTextureChannel,
+                        true
+                    )
+                    || !parameterTextureValid(
+                        hasNormalTexture,
+                        normalTextureWidth,
+                        normalTextureHeight,
+                        normalTextureByteCount,
+                        hasNormalTexture ? 4u : 0u,
+                        true
+                    )) {
+                    return std::nullopt;
+                }
+                const std::size_t vertexValueCount =
+                    static_cast<std::size_t>(vertexCount) * 3;
+                const std::size_t vertexBytes = vertexValueCount * sizeof(float);
+                const std::size_t indexBytes =
+                    static_cast<std::size_t>(indexCount) * sizeof(std::uint32_t);
+                const std::size_t normalValueCount =
+                    static_cast<std::size_t>(normalCount) * 3;
+                const std::size_t normalBytes =
+                    normalValueCount * sizeof(float);
+                const std::size_t uvValueCount =
+                    static_cast<std::size_t>(uvCount) * 2;
+                const std::size_t uvBytes = uvValueCount * sizeof(float);
+                const std::size_t textureBytes = textureByteCount;
+                const std::size_t roughnessTextureBytes =
+                    roughnessTextureByteCount;
+                const std::size_t metallicTextureBytes =
+                    metallicTextureByteCount;
+                const std::size_t emissionTextureBytes =
+                    emissionTextureByteCount;
+                const std::size_t normalTextureBytes = normalTextureByteCount;
+                const std::uint64_t payloadByteCount =
+                    static_cast<std::uint64_t>(vertexBytes) + indexBytes
+                    + normalBytes + uvBytes + textureBytes
+                    + roughnessTextureBytes + metallicTextureBytes
+                    + emissionTextureBytes + normalTextureBytes;
+                if (recordOffset > allBytes.size()
+                    || payloadByteCount > allBytes.size() - recordOffset) {
+                    return std::nullopt;
+                }
+                try {
+                    mesh.vertices.reserve(vertexValueCount);
+                    for (std::size_t valueIndex = 0;
+                         valueIndex < vertexValueCount;
+                         ++valueIndex) {
+                        const float value = readAllFloat(
+                            recordOffset + valueIndex * sizeof(float)
+                        );
+                        if (!std::isfinite(value)) return std::nullopt;
+                        mesh.vertices.push_back(value);
+                    }
+                    const std::size_t indexOffset = recordOffset + vertexBytes;
+                    mesh.indices.reserve(indexCount);
+                    for (std::uint32_t indexIndex = 0;
+                         indexIndex < indexCount;
+                         ++indexIndex) {
+                        const std::uint32_t vertexIndex = readAllU32(
+                            indexOffset
+                                + static_cast<std::size_t>(indexIndex)
+                                    * sizeof(std::uint32_t)
+                        );
+                        if (vertexIndex >= vertexCount) return std::nullopt;
+                        mesh.indices.push_back(vertexIndex);
+                    }
+                    const std::size_t normalOffset =
+                        indexOffset + indexBytes;
+                    mesh.cornerNormals.reserve(normalValueCount);
+                    for (std::size_t valueIndex = 0;
+                         valueIndex < normalValueCount;
+                         ++valueIndex) {
+                        const float value = readAllFloat(
+                            normalOffset + valueIndex * sizeof(float)
+                        );
+                        if (!std::isfinite(value)) return std::nullopt;
+                        mesh.cornerNormals.push_back(value);
+                    }
+                    for (std::uint32_t normalIndex = 0;
+                         normalIndex < normalCount;
+                         ++normalIndex) {
+                        const std::size_t componentOffset =
+                            static_cast<std::size_t>(normalIndex) * 3;
+                        const float x = mesh.cornerNormals[componentOffset];
+                        const float y = mesh.cornerNormals[componentOffset + 1];
+                        const float z = mesh.cornerNormals[componentOffset + 2];
+                        const float lengthSquared = x * x + y * y + z * z;
+                        if (!std::isfinite(lengthSquared)
+                            || lengthSquared <= 0.000000000001F) {
+                            return std::nullopt;
+                        }
+                    }
+                    const std::size_t uvOffset = normalOffset + normalBytes;
+                    mesh.cornerUVs.reserve(uvValueCount);
+                    for (std::size_t valueIndex = 0;
+                         valueIndex < uvValueCount;
+                         ++valueIndex) {
+                        const float value = readAllFloat(
+                            uvOffset + valueIndex * sizeof(float)
+                        );
+                        if (!std::isfinite(value)) return std::nullopt;
+                        mesh.cornerUVs.push_back(value);
+                    }
+                    mesh.textureWidth = textureWidth;
+                    mesh.textureHeight = textureHeight;
+                    const std::size_t textureOffset = uvOffset + uvBytes;
+                    mesh.textureRGBA8.assign(
+                        allBytes.begin() + textureOffset,
+                        allBytes.begin() + textureOffset + textureBytes
+                    );
+                    const std::size_t roughnessTextureOffset =
+                        textureOffset + textureBytes;
+                    mesh.roughnessTexture.width = roughnessTextureWidth;
+                    mesh.roughnessTexture.height = roughnessTextureHeight;
+                    mesh.roughnessTexture.channel = roughnessTextureChannel;
+                    mesh.roughnessTexture.rgba8.assign(
+                        allBytes.begin() + roughnessTextureOffset,
+                        allBytes.begin() + roughnessTextureOffset
+                            + roughnessTextureBytes
+                    );
+                    const std::size_t metallicTextureOffset =
+                        roughnessTextureOffset + roughnessTextureBytes;
+                    mesh.metallicTexture.width = metallicTextureWidth;
+                    mesh.metallicTexture.height = metallicTextureHeight;
+                    mesh.metallicTexture.channel = metallicTextureChannel;
+                    mesh.metallicTexture.rgba8.assign(
+                        allBytes.begin() + metallicTextureOffset,
+                        allBytes.begin() + metallicTextureOffset
+                            + metallicTextureBytes
+                    );
+                    const std::size_t emissionTextureOffset =
+                        metallicTextureOffset + metallicTextureBytes;
+                    mesh.emissionTexture.width = emissionTextureWidth;
+                    mesh.emissionTexture.height = emissionTextureHeight;
+                    mesh.emissionTexture.channel = emissionTextureChannel;
+                    mesh.emissionTexture.rgba8.assign(
+                        allBytes.begin() + emissionTextureOffset,
+                        allBytes.begin() + emissionTextureOffset
+                            + emissionTextureBytes
+                    );
+                    const std::size_t normalTextureOffset =
+                        emissionTextureOffset + emissionTextureBytes;
+                    mesh.normalTexture.width = normalTextureWidth;
+                    mesh.normalTexture.height = normalTextureHeight;
+                    mesh.normalTexture.channel = 4;
+                    mesh.normalTexture.rgba8.assign(
+                        allBytes.begin() + normalTextureOffset,
+                        allBytes.begin() + normalTextureOffset
+                            + normalTextureBytes
+                    );
+                } catch (const std::bad_alloc&) {
+                    return std::nullopt;
+                }
+                recordOffset += vertexBytes + indexBytes + normalBytes
+                    + uvBytes + textureBytes + roughnessTextureBytes
+                    + metallicTextureBytes + emissionTextureBytes
+                    + normalTextureBytes;
+            }
+            try {
+                scene.meshes.push_back(std::move(mesh));
+            } catch (const std::bad_alloc&) {
+                return std::nullopt;
+            }
+        }
+        if (recordOffset != allBytes.size()) return std::nullopt;
+    }
+    return scene;
+}
+
+std::optional<BridgeRayCamera> readLiveCameraState() {
+    const auto scene = readLiveSceneState();
+    if (!scene.has_value()) return std::nullopt;
+    return scene->camera;
+}
+
+bool publishMetalCameraSensorFrame(
+    const char* path,
+    std::uint32_t sourceWidth,
+    std::uint32_t sourceHeight,
+    const std::uint8_t* rgba8
+) {
+    if (path == nullptr || path[0] == '\0' || sourceWidth == 0 || sourceHeight == 0
+        || rgba8 == nullptr) {
+        return false;
+    }
+    auto requestedDimension = [](const char* name, std::uint32_t fallback) {
+        const char* value = std::getenv(name);
+        if (value == nullptr || value[0] == '\0') return fallback;
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        return end != value && *end == '\0' && parsed >= 16 && parsed <= 8192
+            ? static_cast<std::uint32_t>(parsed)
+            : fallback;
+    };
+    const std::uint32_t width = requestedDimension(
+        "IMB_CAMERA_SENSOR_WIDTH",
+        sourceWidth
+    );
+    const std::uint32_t height = requestedDimension(
+        "IMB_CAMERA_SENSOR_HEIGHT",
+        sourceHeight
+    );
+    const std::uint64_t pixelCount =
+        static_cast<std::uint64_t>(width) * height;
+    if (pixelCount > std::numeric_limits<std::size_t>::max() / 3) {
+        return false;
+    }
+    std::vector<std::uint8_t> rgb;
+    try {
+        rgb.resize(static_cast<std::size_t>(pixelCount) * 3);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+    for (std::uint32_t y = 0; y < height; ++y) {
+        const std::uint32_t sourceY = static_cast<std::uint32_t>(
+            static_cast<std::uint64_t>(y) * sourceHeight / height
+        );
+        for (std::uint32_t x = 0; x < width; ++x) {
+            const std::uint32_t sourceX = static_cast<std::uint32_t>(
+                static_cast<std::uint64_t>(x) * sourceWidth / width
+            );
+            const std::size_t sourceOffset = (
+                static_cast<std::size_t>(sourceY) * sourceWidth + sourceX
+            ) * 4;
+            const std::size_t outputOffset = (
+                static_cast<std::size_t>(y) * width + x
+            ) * 3;
+            rgb[outputOffset] = rgba8[sourceOffset];
+            rgb[outputOffset + 1] = rgba8[sourceOffset + 1];
+            rgb[outputOffset + 2] = rgba8[sourceOffset + 2];
+        }
+    }
+    const std::string temporaryPath = std::string(path)
+        + ".tmp." + std::to_string(static_cast<long long>(::getpid()));
+    {
+        std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
+        if (!output) return false;
+        output << "P6\n" << width << " " << height << "\n255\n";
+        output.write(
+            reinterpret_cast<const char*>(rgb.data()),
+            static_cast<std::streamsize>(rgb.size())
+        );
+        if (!output) {
+            output.close();
+            std::remove(temporaryPath.c_str());
+            return false;
+        }
+    }
+    if (std::rename(temporaryPath.c_str(), path) != 0) {
+        std::remove(temporaryPath.c_str());
+        return false;
+    }
+    return true;
+}
 
 struct FormatBlockInfo {
     std::uint32_t width = 1;
@@ -1091,7 +1909,8 @@ public:
         std::uint32_t width,
         std::uint32_t height,
         std::uint32_t missRGBA8,
-        std::uint32_t hitRGBA8
+        std::uint32_t hitRGBA8,
+        const BridgeRayCamera* camera
     ) {
         if (imageID == 0 || accelerationStructureID == 0 || width == 0 || height == 0) {
             throw std::runtime_error("invalid Metal ray dispatch request");
@@ -1106,6 +1925,48 @@ public:
         imb::appendLittleEndian(payload, height);
         imb::appendLittleEndian(payload, missRGBA8);
         imb::appendLittleEndian(payload, hitRGBA8);
+        std::uint32_t rayOptions = IMB_TRACE_RAYS_OPTION_NONE;
+        if (camera != nullptr) {
+            rayOptions |= static_cast<std::uint32_t>(IMB_TRACE_RAYS_OPTION_LIVE_CAMERA);
+            if (camera->hasSphereLight) {
+                rayOptions |= static_cast<std::uint32_t>(
+                    IMB_TRACE_RAYS_OPTION_LIVE_SPHERE_LIGHT
+                );
+            }
+            if (camera->hasDistantLight) {
+                rayOptions |= static_cast<std::uint32_t>(
+                    IMB_TRACE_RAYS_OPTION_LIVE_DISTANT_LIGHT
+                );
+            }
+            if (camera->hasDomeLight) {
+                rayOptions |= static_cast<std::uint32_t>(
+                    IMB_TRACE_RAYS_OPTION_LIVE_DOME_LIGHT
+                );
+            }
+        }
+        imb::appendLittleEndian(payload, rayOptions);
+        imb::appendLittleEndian(payload, std::uint32_t{0});
+        const auto appendFloat = [&payload](float value) {
+            imb::appendLittleEndian(payload, std::bit_cast<std::uint32_t>(value));
+        };
+        const BridgeRayCamera emptyCamera{};
+        const auto& encodedCamera = camera == nullptr ? emptyCamera : *camera;
+        for (float value : encodedCamera.position) appendFloat(value);
+        for (float value : encodedCamera.forward) appendFloat(value);
+        for (float value : encodedCamera.up) appendFloat(value);
+        appendFloat(encodedCamera.verticalFOVRadians);
+        appendFloat(encodedCamera.nearDistance);
+        appendFloat(encodedCamera.farDistance);
+        for (float value : encodedCamera.sphereLightPosition) appendFloat(value);
+        for (float value : encodedCamera.sphereLightColor) appendFloat(value);
+        appendFloat(encodedCamera.sphereLightIntensity);
+        appendFloat(encodedCamera.sphereLightRadius);
+        for (float value : encodedCamera.distantLightDirection) appendFloat(value);
+        for (float value : encodedCamera.distantLightColor) appendFloat(value);
+        appendFloat(encodedCamera.distantLightIntensity);
+        appendFloat(encodedCamera.distantLightAngleDegrees);
+        for (float value : encodedCamera.domeLightColor) appendFloat(value);
+        appendFloat(encodedCamera.domeLightIntensity);
         const auto reply = exchange(IMB_MSG_SUBMIT_COMMAND, std::move(payload), imageID);
         expectType(reply, IMB_MSG_SUBMIT_COMMAND);
         if (reply.header.resource_id == 0) throw std::runtime_error("host returned ray dispatch fence ID zero");
@@ -1262,6 +2123,7 @@ struct PipelineState {
     VkDevice device = VK_NULL_HANDLE;
     PipelineLayoutState* layout = nullptr;
     bool isAddUInt32 = false;
+    std::uint64_t computeHash = 0;
     std::uint64_t bridgeComputePipelineID = 0;
     bool graphics = false;
     bool isFixedTriangle = false;
@@ -1301,7 +2163,13 @@ struct AccelerationStructureKHRState {
     VkAccelerationStructureTypeKHR type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
     VkDeviceAddress deviceAddress = 0;
     std::uint64_t bridgeResourceID = 0;
+    std::uint64_t triangleCount = 0;
+    std::array<float, 3> triangleBoundsMinimum{};
+    std::array<float, 3> triangleBoundsMaximum{};
+    bool hasTriangleBounds = false;
     bool built = false;
+    bool builtFromSceneState = false;
+    std::uint64_t sceneStateSequence = 0;
 };
 
 struct DeferredOperationKHRState {
@@ -1371,6 +2239,7 @@ struct RecordedAccelerationStructureCopyNV {
 };
 
 struct RecordedAccelerationStructureBuildKHR {
+    std::uint64_t sequence = 0;
     AccelerationStructureKHRState* destination = nullptr;
     AccelerationStructureKHRState* source = nullptr;
     VkAccelerationStructureTypeKHR type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
@@ -1418,7 +2287,9 @@ struct RecordedRayTraceKHR {
 };
 
 struct RecordedComputeDispatch {
+    std::uint64_t sequence = 0;
     PipelineState* pipeline = nullptr;
+    bool bridgeEligible = false;
     std::array<DescriptorSetState*, 32> descriptorSets{};
     std::uint32_t groupCountX = 0;
     std::uint32_t groupCountY = 0;
@@ -1496,7 +2367,7 @@ struct CommandBufferState {
     std::vector<RecordedAccelerationStructureCopyKHR> accelerationStructureCopiesKHR;
     std::vector<RecordedRayTraceKHR> rayTracesKHR;
     std::vector<RecordedComputeDispatch> computeDispatches;
-    std::uint64_t nextTransferSequence = 1;
+    std::uint64_t nextCommandSequence = 1;
     std::vector<RecordedBufferCopy> bufferCopies;
     std::vector<RecordedBufferUpdate> bufferUpdates;
     std::vector<RecordedBufferFill> bufferFills;
@@ -1570,6 +2441,10 @@ struct DriverState {
     std::uint64_t nextAccelerationStructureHandle = UINT64_C(0x494d420000000001);
     VkDeviceAddress nextBufferDeviceAddress = UINT64_C(0x0000010000000000);
     std::uint64_t nextStorageDescriptorSequence = 1;
+    // Exact local-space Mesh points and triangulated indices published by the
+    // real USD stage use dedicated Metal resources.  They remain alive for
+    // the lifetime of the device because the fallback TLAS references them.
+    std::vector<BridgeSceneMetalMesh> sceneMetalMeshes;
     // The RTX render graph writes the primary ray result into one pair of
     // RGBA images, then Kit presents a separate triple-buffered RGBA image in
     // its UI draw.  Keep the most recent real Metal result so that queue
@@ -1579,6 +2454,9 @@ struct DriverState {
     std::uint32_t latestMetalSceneWidth = 0;
     std::uint32_t latestMetalSceneHeight = 0;
     imb::Bytes latestMetalSceneRGBA8;
+    VkDevice cameraSensorFrameDevice = VK_NULL_HANDLE;
+    bool cameraSensorFrameAttempted = false;
+    bool cameraSensorFramePublished = false;
 };
 
 DriverState gState;
@@ -1629,6 +2507,11 @@ std::uint32_t configuredVsockPort() {
 
 bool traceEnabled() {
     const char* value = std::getenv("IMB_VULKAN_TRACE");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
+bool semaphoreTraceEnabled() {
+    const char* value = std::getenv("IMB_VULKAN_SEMAPHORE_TRACE");
     return value != nullptr && std::strcmp(value, "0") != 0;
 }
 
@@ -1763,8 +2646,33 @@ bool sceneGridPresentationEnabled() {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
+bool fullWorkspaceOnlyEnabled() {
+    // Kit can keep an undocked Viewport window alive after Isaac Sim's Full
+    // layout is restored. Both windows use the same UI graphics pipeline, but
+    // the native bridge currently has one presentation surface. In Full mode
+    // the launcher therefore asks us to present only the root that contains
+    // the right and bottom dock regions of the normal Isaac workspace.
+    const char* value = std::getenv("IMB_VULKAN_FULL_WORKSPACE_ONLY");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+bool fullWorkspaceLayoutReady() {
+    const char* path = std::getenv("IMB_VULKAN_FULL_WORKSPACE_READY_FILE");
+    return path == nullptr || *path == '\0' || ::access(path, F_OK) == 0;
+}
+
+bool uiPresentationTraceEnabled() {
+    const char* value = std::getenv("IMB_VULKAN_UI_TRACE");
+    return traceEnabled() || (value != nullptr && std::strcmp(value, "0") != 0);
+}
+
+bool uiSnapshotLayoutChangesEnabled() {
+    const char* value = std::getenv("IMB_VULKAN_UI_SNAPSHOT_CHANGES");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
 bool sparseImagesEnabled() {
-    // Protocol 1.10 maps Vulkan image pages through a real Metal sparse heap.
+    // The current protocol maps Vulkan image pages through a real Metal sparse heap.
     // The launcher enables this after both the dedicated tile probe and the
     // real Kit texture-streaming path completed through mip 0 without a crash.
     const char* value = std::getenv("IMB_VULKAN_SPARSE_IMAGES");
@@ -3130,6 +4038,39 @@ VKAPI_ATTR void VKAPI_CALL imb_vkDestroyDevice(VkDevice device, const VkAllocati
     std::lock_guard lock(gState.mutex);
     const auto found = gState.devices.find(device);
     if (found == gState.devices.end()) return;
+    for (auto iterator = gState.sceneMetalMeshes.begin();
+         iterator != gState.sceneMetalMeshes.end();) {
+        if (iterator->device != device) {
+            ++iterator;
+            continue;
+        }
+        if (gState.bridge != nullptr) {
+            const std::array<std::uint64_t, 9> resourceIDs{
+                iterator->accelerationStructureResourceID,
+                iterator->materialDescriptorResourceID,
+                iterator->normalTextureResourceID,
+                iterator->emissionTextureResourceID,
+                iterator->metallicTextureResourceID,
+                iterator->roughnessTextureResourceID,
+                iterator->textureResourceID,
+                iterator->indexBufferResourceID,
+                iterator->vertexBufferResourceID,
+            };
+            for (const auto resourceID : resourceIDs) {
+                if (resourceID == 0) continue;
+                try {
+                    gState.bridge->destroyBuffer(resourceID);
+                } catch (const std::exception& error) {
+                    std::fprintf(
+                        stderr,
+                        "imb-vulkan-icd: USD Mesh Metal resource destroy warning: %s\n",
+                        error.what()
+                    );
+                }
+            }
+        }
+        iterator = gState.sceneMetalMeshes.erase(iterator);
+    }
     for (auto iterator = gState.accelerationStructuresNV.begin();
          iterator != gState.accelerationStructuresNV.end();) {
         auto* state = *iterator;
@@ -3167,6 +4108,11 @@ VKAPI_ATTR void VKAPI_CALL imb_vkDestroyDevice(VkDevice device, const VkAllocati
         gState.latestMetalSceneWidth = 0;
         gState.latestMetalSceneHeight = 0;
         gState.latestMetalSceneRGBA8.clear();
+    }
+    if (gState.cameraSensorFrameDevice == device) {
+        gState.cameraSensorFrameDevice = VK_NULL_HANDLE;
+        gState.cameraSensorFrameAttempted = false;
+        gState.cameraSensorFramePublished = false;
     }
     destroyDispatchableHandle(device);
 }
@@ -4499,6 +5445,20 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkCreateBufferView(
     if (createInfo == nullptr || bufferView == nullptr
         || createInfo->buffer == VK_NULL_HANDLE
         || createInfo->format == VK_FORMAT_UNDEFINED) {
+        static bool reportedInvalidArguments = false;
+        if (!reportedInvalidArguments) {
+            reportedInvalidArguments = true;
+            std::fprintf(
+                stderr,
+                "imb-vulkan-icd: invalid buffer-view arguments info=%p out=%p buffer=%p format=%d\n",
+                static_cast<const void*>(createInfo),
+                static_cast<void*>(bufferView),
+                reinterpret_cast<void*>(
+                    createInfo == nullptr ? VK_NULL_HANDLE : createInfo->buffer
+                ),
+                createInfo == nullptr ? VK_FORMAT_UNDEFINED : createInfo->format
+            );
+        }
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     *bufferView = VK_NULL_HANDLE;
@@ -4506,11 +5466,29 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkCreateBufferView(
     auto* buffer = objectState<BufferState>(createInfo->buffer);
     if (!validDevice(device) || !gState.buffers.contains(buffer)
         || buffer->device != device || createInfo->offset >= buffer->size) {
+        static bool reportedInvalidBuffer = false;
+        if (!reportedInvalidBuffer) {
+            reportedInvalidBuffer = true;
+            std::fprintf(
+                stderr,
+                "imb-vulkan-icd: invalid buffer-view source device=%p buffer=%p state=%p validDevice=%d known=%d owner=%p offset=%llu size=%llu format=%d\n",
+                reinterpret_cast<void*>(device),
+                reinterpret_cast<void*>(createInfo->buffer),
+                static_cast<void*>(buffer),
+                validDevice(device) ? 1 : 0,
+                gState.buffers.contains(buffer) ? 1 : 0,
+                static_cast<void*>(
+                    gState.buffers.contains(buffer) ? buffer->device : VK_NULL_HANDLE
+                ),
+                static_cast<unsigned long long>(createInfo->offset),
+                static_cast<unsigned long long>(
+                    gState.buffers.contains(buffer) ? buffer->size : 0
+                ),
+                createInfo->format
+            );
+        }
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    const VkDeviceSize range = createInfo->range == VK_WHOLE_SIZE
-        ? buffer->size - createInfo->offset
-        : createInfo->range;
     const auto block = formatBlockInfo(createInfo->format);
     if (!texelBufferFormatSupported(createInfo->format)) {
         static std::unordered_set<std::uint32_t> reportedFormats;
@@ -4523,10 +5501,36 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkCreateBufferView(
         }
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
-    if (range == 0 || range > buffer->size - createInfo->offset
-        || block.width != 1 || block.height != 1 || block.depth != 1
-        || block.bytes == 0 || (createInfo->offset % block.bytes) != 0
-        || (range % block.bytes) != 0
+    if (block.width != 1 || block.height != 1 || block.depth != 1
+        || block.bytes == 0 || (createInfo->offset % block.bytes) != 0) {
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    const VkDeviceSize remaining = buffer->size - createInfo->offset;
+    const VkDeviceSize requestedRange = createInfo->range == VK_WHOLE_SIZE
+        ? remaining
+        : createInfo->range;
+    if (requestedRange == 0 || requestedRange > remaining) {
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+    // VK_WHOLE_SIZE is defined as the largest complete texel range. Real
+    // Isaac RTX also submits the equivalent raw remaining-byte count (for
+    // example 1161 bytes for R32_UINT). Accept that narrow non-conformant
+    // spelling by discarding only the incomplete final texel.
+    const VkDeviceSize range = requestedRange - (requestedRange % block.bytes);
+    if (range != requestedRange) {
+        static bool reportedRoundedTail = false;
+        if (!reportedRoundedTail) {
+            reportedRoundedTail = true;
+            std::fprintf(
+                stderr,
+                "imb-vulkan-icd: rounded incomplete texel-buffer tail requested=%llu usable=%llu texel=%u\n",
+                static_cast<unsigned long long>(requestedRange),
+                static_cast<unsigned long long>(range),
+                block.bytes
+            );
+        }
+    }
+    if (range == 0 || (range % block.bytes) != 0
         || range / block.bytes > (UINT64_C(1) << 27)) {
         std::fprintf(
             stderr,
@@ -5023,6 +6027,7 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkCreateComputePipelines(
         state->device = device;
         state->layout = layout;
         state->isAddUInt32 = isAddUInt32;
+        state->computeHash = shader->hash;
         if (spirvComputeBridgeEnabled()
             && (gState.bridge->capabilities().bits & IMB_CAP_METAL_SPIRV_COMPUTE) != 0
             && info.stage.pSpecializationInfo == nullptr) {
@@ -6136,7 +7141,15 @@ VkResult syncTransferredImageLocked(ImageState* image) {
     return result;
 }
 
-VkResult executeRecordedTransfersLocked(
+VkResult bridgePrimitiveAccelerationStructureBuildLocked(
+    const RecordedAccelerationStructureBuildKHR& build
+);
+VkResult bridgeInstanceAccelerationStructureBuildLocked(
+    const RecordedAccelerationStructureBuildKHR& build
+);
+VkResult bridgeComputeDispatchLocked(const RecordedComputeDispatch& dispatch);
+
+VkResult executeRecordedCommandsLocked(
     CommandBufferState* command,
     std::unordered_set<ImageState*>& dirtyImages
 ) {
@@ -6145,24 +7158,31 @@ VkResult executeRecordedTransfersLocked(
     std::size_t fillIndex = 0;
     std::size_t clearIndex = 0;
     std::size_t imageCopyIndex = 0;
+    std::size_t accelerationBuildIndex = 0;
+    std::size_t computeDispatchIndex = 0;
     while (copyIndex < command->bufferCopies.size()
         || updateIndex < command->bufferUpdates.size()
         || fillIndex < command->bufferFills.size()
         || clearIndex < command->imageClears.size()
-        || imageCopyIndex < command->imageCopies.size()) {
+        || imageCopyIndex < command->imageCopies.size()
+        || accelerationBuildIndex
+            < command->accelerationStructureBuildsKHR.size()
+        || computeDispatchIndex < command->computeDispatches.size()) {
         std::uint64_t nextSequence = UINT64_MAX;
-        enum class TransferKind {
+        enum class RecordedKind {
             None,
             BufferCopy,
             BufferUpdate,
             BufferFill,
             ImageClear,
             ImageCopy,
+            AccelerationStructureBuild,
+            ComputeDispatch,
         };
-        TransferKind kind = TransferKind::None;
+        RecordedKind kind = RecordedKind::None;
         auto consider = [&nextSequence, &kind](
                             std::uint64_t sequence,
-                            TransferKind candidate
+                            RecordedKind candidate
                         ) {
             if (sequence < nextSequence) {
                 nextSequence = sequence;
@@ -6172,37 +7192,52 @@ VkResult executeRecordedTransfersLocked(
         if (copyIndex < command->bufferCopies.size()) {
             consider(
                 command->bufferCopies[copyIndex].sequence,
-                TransferKind::BufferCopy
+                RecordedKind::BufferCopy
             );
         }
         if (updateIndex < command->bufferUpdates.size()) {
             consider(
                 command->bufferUpdates[updateIndex].sequence,
-                TransferKind::BufferUpdate
+                RecordedKind::BufferUpdate
             );
         }
         if (fillIndex < command->bufferFills.size()) {
             consider(
                 command->bufferFills[fillIndex].sequence,
-                TransferKind::BufferFill
+                RecordedKind::BufferFill
             );
         }
         if (clearIndex < command->imageClears.size()) {
             consider(
                 command->imageClears[clearIndex].sequence,
-                TransferKind::ImageClear
+                RecordedKind::ImageClear
             );
         }
         if (imageCopyIndex < command->imageCopies.size()) {
             consider(
                 command->imageCopies[imageCopyIndex].sequence,
-                TransferKind::ImageCopy
+                RecordedKind::ImageCopy
+            );
+        }
+        if (accelerationBuildIndex
+            < command->accelerationStructureBuildsKHR.size()) {
+            consider(
+                command->accelerationStructureBuildsKHR[
+                    accelerationBuildIndex
+                ].sequence,
+                RecordedKind::AccelerationStructureBuild
+            );
+        }
+        if (computeDispatchIndex < command->computeDispatches.size()) {
+            consider(
+                command->computeDispatches[computeDispatchIndex].sequence,
+                RecordedKind::ComputeDispatch
             );
         }
 
         VkResult result = VK_SUCCESS;
         switch (kind) {
-        case TransferKind::BufferCopy: {
+        case RecordedKind::BufferCopy: {
             const auto& copy = command->bufferCopies[copyIndex++];
             for (const auto& region : copy.regions) {
                 result = copyBufferBytesLocked(copy.source, copy.destination, region);
@@ -6221,7 +7256,7 @@ VkResult executeRecordedTransfersLocked(
             }
             break;
         }
-        case TransferKind::BufferUpdate: {
+        case RecordedKind::BufferUpdate: {
             const auto& update = command->bufferUpdates[updateIndex++];
             result = writeBufferBytesLocked(
                 update.destination,
@@ -6231,22 +7266,76 @@ VkResult executeRecordedTransfersLocked(
             );
             break;
         }
-        case TransferKind::BufferFill:
+        case RecordedKind::BufferFill:
             result = executeBufferFillLocked(command->bufferFills[fillIndex++]);
             break;
-        case TransferKind::ImageClear: {
+        case RecordedKind::ImageClear: {
             const auto& clear = command->imageClears[clearIndex++];
             result = executeImageClearLocked(clear);
             if (result == VK_SUCCESS) dirtyImages.insert(clear.image);
             break;
         }
-        case TransferKind::ImageCopy: {
+        case RecordedKind::ImageCopy: {
             const auto& copy = command->imageCopies[imageCopyIndex++];
             result = executeImageCopyLocked(copy);
             if (result == VK_SUCCESS) dirtyImages.insert(copy.destination);
             break;
         }
-        case TransferKind::None:
+        case RecordedKind::AccelerationStructureBuild: {
+            const auto& build = command->accelerationStructureBuildsKHR[
+                accelerationBuildIndex++
+            ];
+            result = build.type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
+                ? bridgeInstanceAccelerationStructureBuildLocked(build)
+                : bridgePrimitiveAccelerationStructureBuildLocked(build);
+            if (result == VK_ERROR_FEATURE_NOT_PRESENT
+                && build.type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
+                // RTX can submit a TLAS whose instance records retain
+                // NVIDIA-only/null child addresses. Preserve command order
+                // for all completed BLASes, then populate this same TLAS from
+                // the visible USD manifest in the fallback below.
+                if (rayTracingTraceEnabled()) {
+                    std::fprintf(
+                        stderr,
+                        "imb-vulkan-icd: deferring unsupported scene TLAS build to Metal BLAS fallback dst=%p sequence=%llu\n",
+                        static_cast<void*>(build.destination),
+                        static_cast<unsigned long long>(build.sequence)
+                    );
+                }
+                result = VK_SUCCESS;
+            }
+            break;
+        }
+        case RecordedKind::ComputeDispatch: {
+            const auto& dispatch = command->computeDispatches[
+                computeDispatchIndex++
+            ];
+            result = bridgeComputeDispatchLocked(dispatch);
+            // RTX keeps legal null/partially-bound descriptors in layouts
+            // whose shader permutations do not necessarily read them. A
+            // missing CPU backing makes only this optional Metal translation
+            // ineligible; it must not poison the Vulkan queue.
+            if (result == VK_ERROR_FEATURE_NOT_PRESENT
+                || result == VK_ERROR_FORMAT_NOT_SUPPORTED
+                || result == VK_ERROR_MEMORY_MAP_FAILED) {
+                if (computeTraceEnabled()) {
+                    std::fprintf(
+                        stderr,
+                        "imb-vulkan-icd: skipped unsupported Metal compute pipeline=%llu result=%d sequence=%llu\n",
+                        static_cast<unsigned long long>(
+                            dispatch.pipeline == nullptr
+                                ? 0
+                                : dispatch.pipeline->bridgeComputePipelineID
+                        ),
+                        result,
+                        static_cast<unsigned long long>(dispatch.sequence)
+                    );
+                }
+                result = VK_SUCCESS;
+            }
+            break;
+        }
+        case RecordedKind::None:
             return VK_ERROR_INITIALIZATION_FAILED;
         }
         if (result != VK_SUCCESS) return result;
@@ -6322,6 +7411,18 @@ VkResult bridgePrimitiveAccelerationStructureBuildLocked(
     } catch (const std::bad_alloc&) {
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
+    std::uint64_t totalTriangleCount = 0;
+    std::array<float, 3> triangleBoundsMinimum{
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::max(),
+    };
+    std::array<float, 3> triangleBoundsMaximum{
+        std::numeric_limits<float>::lowest(),
+        std::numeric_limits<float>::lowest(),
+        std::numeric_limits<float>::lowest(),
+    };
+    bool triangleBoundsValid = true;
     for (std::size_t index = 0; index < build.geometries.size(); ++index) {
         const auto& geometry = build.geometries[index];
         const auto& range = build.ranges[index];
@@ -6362,6 +7463,7 @@ VkResult bridgePrimitiveAccelerationStructureBuildLocked(
             bridgeGeometry.dataResourceID = vertexBuffer->memory->resourceID;
             bridgeGeometry.stride = static_cast<std::uint32_t>(triangles.vertexStride);
             bridgeGeometry.vertexFormat = 1;
+            BufferState* indexBuffer = nullptr;
 
             if (triangles.indexType == VK_INDEX_TYPE_NONE_KHR) {
                 vertexOffset += range.primitiveOffset;
@@ -6370,7 +7472,10 @@ VkResult bridgePrimitiveAccelerationStructureBuildLocked(
                     && triangles.indexType != VK_INDEX_TYPE_UINT32) {
                     return VK_ERROR_FORMAT_NOT_SUPPORTED;
                 }
-                auto* indexBuffer = bufferForDeviceAddressLocked(build.destination->device, triangles.indexData.deviceAddress);
+                indexBuffer = bufferForDeviceAddressLocked(
+                    build.destination->device,
+                    triangles.indexData.deviceAddress
+                );
                 if (indexBuffer == nullptr || indexBuffer->memory == nullptr) return VK_ERROR_MEMORY_MAP_FAILED;
                 if (rayTracingTraceEnabled()) {
                     std::fprintf(
@@ -6394,8 +7499,9 @@ VkResult bridgePrimitiveAccelerationStructureBuildLocked(
             }
             bridgeGeometry.dataOffset = vertexOffset;
 
+            BufferState* transformBuffer = nullptr;
             if (triangles.transformData.deviceAddress != 0) {
-                auto* transformBuffer = bufferForDeviceAddressLocked(
+                transformBuffer = bufferForDeviceAddressLocked(
                     build.destination->device,
                     triangles.transformData.deviceAddress
                 );
@@ -6409,7 +7515,146 @@ VkResult bridgePrimitiveAccelerationStructureBuildLocked(
                     + (triangles.transformData.deviceAddress - transformBuffer->deviceAddress)
                     + range.transformOffset;
             }
+
+            if (totalTriangleCount
+                > std::numeric_limits<std::uint64_t>::max() - range.primitiveCount) {
+                triangleBoundsValid = false;
+            } else {
+                totalTriangleCount += range.primitiveCount;
+            }
+            std::array<float, 12> geometryTransform{
+                1.0F, 0.0F, 0.0F, 0.0F,
+                0.0F, 1.0F, 0.0F, 0.0F,
+                0.0F, 0.0F, 1.0F, 0.0F,
+            };
+            if (triangleBoundsValid && transformBuffer != nullptr) {
+                if (bridgeGeometry.transformOffset
+                    > transformBuffer->memory->bytes.size()
+                    || sizeof(VkTransformMatrixKHR)
+                    > transformBuffer->memory->bytes.size()
+                        - bridgeGeometry.transformOffset) {
+                    triangleBoundsValid = false;
+                } else {
+                    for (std::size_t component = 0;
+                         component < geometryTransform.size();
+                         ++component) {
+                        std::uint32_t bits = 0;
+                        std::memcpy(
+                            &bits,
+                            transformBuffer->memory->bytes.data()
+                                + bridgeGeometry.transformOffset
+                                + component * sizeof(std::uint32_t),
+                            sizeof(bits)
+                        );
+                        geometryTransform[component] = std::bit_cast<float>(bits);
+                        if (!std::isfinite(geometryTransform[component])) {
+                            triangleBoundsValid = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            const std::uint64_t vertexReferenceCount =
+                static_cast<std::uint64_t>(range.primitiveCount) * 3;
+            for (std::uint64_t vertexReference = 0;
+                 triangleBoundsValid && vertexReference < vertexReferenceCount;
+                 ++vertexReference) {
+                std::uint64_t vertexIndex = vertexReference;
+                if (indexBuffer != nullptr) {
+                    const std::uint64_t indexStride =
+                        triangles.indexType == VK_INDEX_TYPE_UINT16 ? 2 : 4;
+                    if (vertexReference
+                        > (std::numeric_limits<std::uint64_t>::max()
+                            - bridgeGeometry.indexOffset) / indexStride) {
+                        triangleBoundsValid = false;
+                        break;
+                    }
+                    const std::uint64_t indexOffset = bridgeGeometry.indexOffset
+                        + vertexReference * indexStride;
+                    if (indexOffset > indexBuffer->memory->bytes.size()
+                        || indexStride
+                            > indexBuffer->memory->bytes.size() - indexOffset) {
+                        triangleBoundsValid = false;
+                        break;
+                    }
+                    if (indexStride == 2) {
+                        std::uint16_t value = 0;
+                        std::memcpy(
+                            &value,
+                            indexBuffer->memory->bytes.data() + indexOffset,
+                            sizeof(value)
+                        );
+                        vertexIndex = value;
+                    } else {
+                        std::uint32_t value = 0;
+                        std::memcpy(
+                            &value,
+                            indexBuffer->memory->bytes.data() + indexOffset,
+                            sizeof(value)
+                        );
+                        vertexIndex = value;
+                    }
+                }
+                if (vertexIndex
+                    > (std::numeric_limits<std::uint64_t>::max()
+                        - bridgeGeometry.dataOffset) / bridgeGeometry.stride) {
+                    triangleBoundsValid = false;
+                    break;
+                }
+                const std::uint64_t pointOffset = bridgeGeometry.dataOffset
+                    + vertexIndex * bridgeGeometry.stride;
+                if (pointOffset > vertexBuffer->memory->bytes.size()
+                    || 12 > vertexBuffer->memory->bytes.size() - pointOffset) {
+                    triangleBoundsValid = false;
+                    break;
+                }
+                std::array<float, 3> point{};
+                for (std::size_t component = 0; component < point.size(); ++component) {
+                    std::uint32_t bits = 0;
+                    std::memcpy(
+                        &bits,
+                        vertexBuffer->memory->bytes.data()
+                            + pointOffset + component * sizeof(std::uint32_t),
+                        sizeof(bits)
+                    );
+                    point[component] = std::bit_cast<float>(bits);
+                    if (!std::isfinite(point[component])) {
+                        triangleBoundsValid = false;
+                        break;
+                    }
+                }
+                if (!triangleBoundsValid) break;
+                const std::array<float, 3> transformed{
+                    geometryTransform[0] * point[0]
+                        + geometryTransform[1] * point[1]
+                        + geometryTransform[2] * point[2]
+                        + geometryTransform[3],
+                    geometryTransform[4] * point[0]
+                        + geometryTransform[5] * point[1]
+                        + geometryTransform[6] * point[2]
+                        + geometryTransform[7],
+                    geometryTransform[8] * point[0]
+                        + geometryTransform[9] * point[1]
+                        + geometryTransform[10] * point[2]
+                        + geometryTransform[11],
+                };
+                for (std::size_t component = 0; component < 3; ++component) {
+                    if (!std::isfinite(transformed[component])) {
+                        triangleBoundsValid = false;
+                        break;
+                    }
+                    triangleBoundsMinimum[component] = std::min(
+                        triangleBoundsMinimum[component],
+                        transformed[component]
+                    );
+                    triangleBoundsMaximum[component] = std::max(
+                        triangleBoundsMaximum[component],
+                        transformed[component]
+                    );
+                }
+            }
         } else if (geometry.geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
+            triangleBoundsValid = false;
             const auto& aabbs = geometry.geometry.aabbs;
             if (aabbs.sType != VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR
                 || aabbs.stride < 24 || aabbs.stride > UINT32_MAX) {
@@ -6445,12 +7690,29 @@ VkResult bridgePrimitiveAccelerationStructureBuildLocked(
         std::fprintf(stderr, "imb-vulkan-icd: Metal primitive AS build failed: %s\n", error.what());
         return VK_ERROR_DEVICE_LOST;
     }
+    build.destination->triangleCount = totalTriangleCount;
+    build.destination->hasTriangleBounds =
+        triangleBoundsValid && totalTriangleCount != 0;
+    if (build.destination->hasTriangleBounds) {
+        build.destination->triangleBoundsMinimum = triangleBoundsMinimum;
+        build.destination->triangleBoundsMaximum = triangleBoundsMaximum;
+    }
     build.destination->built = true;
+    build.destination->builtFromSceneState = false;
+    build.destination->sceneStateSequence = 0;
     std::fprintf(
         stderr,
-        "imb-vulkan-icd: Metal primitive AS built host=%llu geometries=%zu\n",
+        "imb-vulkan-icd: Metal primitive AS built host=%llu geometries=%zu triangles=%llu bounds=%s[(%.6g,%.6g,%.6g),(%.6g,%.6g,%.6g)]\n",
         static_cast<unsigned long long>(build.destination->bridgeResourceID),
-        bridgeGeometries.size()
+        bridgeGeometries.size(),
+        static_cast<unsigned long long>(build.destination->triangleCount),
+        build.destination->hasTriangleBounds ? "" : "unavailable ",
+        build.destination->triangleBoundsMinimum[0],
+        build.destination->triangleBoundsMinimum[1],
+        build.destination->triangleBoundsMinimum[2],
+        build.destination->triangleBoundsMaximum[0],
+        build.destination->triangleBoundsMaximum[1],
+        build.destination->triangleBoundsMaximum[2]
     );
     return VK_SUCCESS;
 }
@@ -6556,6 +7818,8 @@ VkResult bridgeInstanceAccelerationStructureBuildLocked(
         return VK_ERROR_DEVICE_LOST;
     }
     build.destination->built = true;
+    build.destination->builtFromSceneState = false;
+    build.destination->sceneStateSequence = 0;
     std::fprintf(
         stderr,
         "imb-vulkan-icd: Metal instance AS built host=%llu instances=%zu\n",
@@ -6563,6 +7827,537 @@ VkResult bridgeInstanceAccelerationStructureBuildLocked(
         bridgeInstances.size()
     );
     return VK_SUCCESS;
+}
+
+std::pair<std::array<float, 3>, std::array<float, 3>> transformedSceneMeshBounds(
+    const BridgeSceneMesh& mesh
+) {
+    std::array<float, 3> minimum{
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::max(),
+        std::numeric_limits<float>::max(),
+    };
+    std::array<float, 3> maximum{
+        std::numeric_limits<float>::lowest(),
+        std::numeric_limits<float>::lowest(),
+        std::numeric_limits<float>::lowest(),
+    };
+    for (std::uint32_t corner = 0; corner < 8; ++corner) {
+        const std::array<float, 3> point{
+            (corner & 1u) == 0
+                ? mesh.boundsMinimum[0] : mesh.boundsMaximum[0],
+            (corner & 2u) == 0
+                ? mesh.boundsMinimum[1] : mesh.boundsMaximum[1],
+            (corner & 4u) == 0
+                ? mesh.boundsMinimum[2] : mesh.boundsMaximum[2],
+        };
+        const std::array<float, 3> transformed{
+            mesh.worldTransform[0] * point[0]
+                + mesh.worldTransform[1] * point[1]
+                + mesh.worldTransform[2] * point[2]
+                + mesh.worldTransform[3],
+            mesh.worldTransform[4] * point[0]
+                + mesh.worldTransform[5] * point[1]
+                + mesh.worldTransform[6] * point[2]
+                + mesh.worldTransform[7],
+            mesh.worldTransform[8] * point[0]
+                + mesh.worldTransform[9] * point[1]
+                + mesh.worldTransform[10] * point[2]
+                + mesh.worldTransform[11],
+        };
+        for (std::size_t component = 0; component < 3; ++component) {
+            minimum[component] = std::min(minimum[component], transformed[component]);
+            maximum[component] = std::max(maximum[component], transformed[component]);
+        }
+    }
+    return {minimum, maximum};
+}
+
+float sceneBoundsError(
+    const std::array<float, 3>& leftMinimum,
+    const std::array<float, 3>& leftMaximum,
+    const std::array<float, 3>& rightMinimum,
+    const std::array<float, 3>& rightMaximum
+) {
+    float centerDistanceSquared = 0.0F;
+    float extentDistanceSquared = 0.0F;
+    float leftExtentSquared = 0.0F;
+    float rightExtentSquared = 0.0F;
+    for (std::size_t component = 0; component < 3; ++component) {
+        const float leftCenter =
+            (leftMinimum[component] + leftMaximum[component]) * 0.5F;
+        const float rightCenter =
+            (rightMinimum[component] + rightMaximum[component]) * 0.5F;
+        const float leftExtent = leftMaximum[component] - leftMinimum[component];
+        const float rightExtent = rightMaximum[component] - rightMinimum[component];
+        const float centerDelta = leftCenter - rightCenter;
+        const float extentDelta = leftExtent - rightExtent;
+        centerDistanceSquared += centerDelta * centerDelta;
+        extentDistanceSquared += extentDelta * extentDelta;
+        leftExtentSquared += leftExtent * leftExtent;
+        rightExtentSquared += rightExtent * rightExtent;
+    }
+    const float scale = std::max(
+        std::max(std::sqrt(leftExtentSquared), std::sqrt(rightExtentSquared)),
+        0.0001F
+    );
+    return (std::sqrt(centerDistanceSquared)
+        + 0.5F * std::sqrt(extentDistanceSquared)) / scale;
+}
+
+std::uint64_t bridgeSceneMeshAccelerationStructureLocked(
+    VkDevice device,
+    const BridgeSceneMesh& mesh
+) {
+    auto appendHashBytes = [](std::uint64_t& hash, const void* data, std::size_t size) {
+        const auto* bytes = static_cast<const std::uint8_t*>(data);
+        for (std::size_t index = 0; index < size; ++index) {
+            hash ^= bytes[index];
+            hash *= UINT64_C(1099511628211);
+        }
+    };
+    std::uint64_t contentHash = UINT64_C(14695981039346656037);
+    const auto appendScalar = [&appendHashBytes, &contentHash](const auto& value) {
+        appendHashBytes(contentHash, &value, sizeof(value));
+    };
+    const auto appendVector = [&appendHashBytes, &contentHash](const auto& values) {
+        if (!values.empty()) {
+            appendHashBytes(
+                contentHash,
+                values.data(),
+                values.size() * sizeof(typename std::decay_t<decltype(values)>::value_type)
+            );
+        }
+    };
+    appendScalar(mesh.triangleCount);
+    appendScalar(mesh.materialFlags);
+    appendVector(mesh.vertices);
+    appendVector(mesh.indices);
+    appendVector(mesh.cornerNormals);
+    appendVector(mesh.cornerUVs);
+    appendScalar(mesh.textureWidth);
+    appendScalar(mesh.textureHeight);
+    appendVector(mesh.textureRGBA8);
+    appendScalar(mesh.roughness);
+    appendScalar(mesh.metallic);
+    for (const float component : mesh.emissionColor) appendScalar(component);
+    appendScalar(mesh.emissionIntensity);
+    const auto appendTextureMap = [&appendScalar, &appendVector](
+                                      const BridgeSceneTextureMap& map) {
+        appendScalar(map.width);
+        appendScalar(map.height);
+        appendScalar(map.channel);
+        appendVector(map.rgba8);
+    };
+    appendTextureMap(mesh.roughnessTexture);
+    appendTextureMap(mesh.metallicTexture);
+    appendTextureMap(mesh.emissionTexture);
+    appendTextureMap(mesh.normalTexture);
+
+    for (const auto& cached : gState.sceneMetalMeshes) {
+        if (cached.device == device && cached.contentHash == contentHash) {
+            return cached.accelerationStructureResourceID;
+        }
+    }
+    if (gState.bridge == nullptr || mesh.vertices.empty() || mesh.indices.empty()
+        || mesh.vertices.size() % 3 != 0 || mesh.indices.size() % 3 != 0
+        || mesh.indices.size() / 3 != mesh.triangleCount) {
+        return 0;
+    }
+
+    const bool hasAuthoredCornerNormals =
+        mesh.cornerNormals.size() == mesh.indices.size() * 3;
+    const bool hasFileTexture =
+        mesh.cornerUVs.size() == mesh.indices.size() * 2
+        && mesh.textureWidth > 0 && mesh.textureHeight > 0
+        && mesh.textureRGBA8.size()
+            == static_cast<std::size_t>(mesh.textureWidth)
+                * mesh.textureHeight * 4;
+    const auto hasTextureMap = [](const BridgeSceneTextureMap& map) {
+        return map.width > 0 && map.height > 0
+            && map.rgba8.size()
+                == static_cast<std::size_t>(map.width) * map.height * 4;
+    };
+    const bool hasRoughnessTexture = hasTextureMap(mesh.roughnessTexture);
+    const bool hasMetallicTexture = hasTextureMap(mesh.metallicTexture);
+    const bool hasEmissionTexture = hasTextureMap(mesh.emissionTexture);
+    const bool hasNormalTexture = hasTextureMap(mesh.normalTexture);
+    const bool hasParameterTextures = hasRoughnessTexture
+        || hasMetallicTexture || hasEmissionTexture;
+    const bool hasMaterialDescriptorTextures =
+        hasParameterTextures || hasNormalTexture;
+    const bool hasMaterialTextureUVs =
+        mesh.cornerUVs.size() == mesh.indices.size() * 2
+        && (hasFileTexture || hasMaterialDescriptorTextures);
+    const bool hasMaterialParameters = (mesh.materialFlags & 16u) != 0;
+    const bool hasEmission = (mesh.materialFlags & 32u) != 0;
+    const bool usesEmissionVertexFormat = hasEmission
+        || hasMaterialDescriptorTextures;
+    const bool hasMaterialAttributes = hasMaterialParameters
+        || hasEmission || hasMaterialDescriptorTextures;
+    const bool hasInterleavedAttributes =
+        hasAuthoredCornerNormals || hasMaterialTextureUVs
+        || hasMaterialAttributes;
+    std::vector<float> interleavedVertices;
+    const float* vertexData = mesh.vertices.data();
+    std::size_t vertexValueCount = mesh.vertices.size();
+    if (hasInterleavedAttributes) {
+        try {
+            const std::size_t valuesPerCorner = hasNormalTexture
+                ? 20 : (usesEmissionVertexFormat
+                ? 14 : (hasMaterialParameters
+                    ? 10 : (hasMaterialTextureUVs ? 8 : 6)));
+            interleavedVertices.reserve(mesh.indices.size() * valuesPerCorner);
+            for (std::size_t corner = 0; corner < mesh.indices.size(); ++corner) {
+                const std::size_t pointOffset =
+                    static_cast<std::size_t>(mesh.indices[corner]) * 3;
+                const std::size_t normalOffset = corner * 3;
+                interleavedVertices.insert(
+                    interleavedVertices.end(),
+                    mesh.vertices.begin() + pointOffset,
+                    mesh.vertices.begin() + pointOffset + 3
+                );
+                if (hasAuthoredCornerNormals) {
+                    interleavedVertices.insert(
+                        interleavedVertices.end(),
+                        mesh.cornerNormals.begin() + normalOffset,
+                        mesh.cornerNormals.begin() + normalOffset + 3
+                    );
+                } else {
+                    const std::size_t triangleCorner = (corner / 3) * 3;
+                    const auto point = [&mesh, triangleCorner](std::size_t index) {
+                        const std::size_t offset = static_cast<std::size_t>(
+                            mesh.indices[triangleCorner + index]
+                        ) * 3;
+                        return std::array<float, 3>{
+                            mesh.vertices[offset], mesh.vertices[offset + 1],
+                            mesh.vertices[offset + 2],
+                        };
+                    };
+                    const auto a = point(0);
+                    const auto b = point(1);
+                    const auto c = point(2);
+                    const std::array<float, 3> edgeA{
+                        b[0] - a[0], b[1] - a[1], b[2] - a[2],
+                    };
+                    const std::array<float, 3> edgeB{
+                        c[0] - a[0], c[1] - a[1], c[2] - a[2],
+                    };
+                    std::array<float, 3> normal{
+                        edgeA[1] * edgeB[2] - edgeA[2] * edgeB[1],
+                        edgeA[2] * edgeB[0] - edgeA[0] * edgeB[2],
+                        edgeA[0] * edgeB[1] - edgeA[1] * edgeB[0],
+                    };
+                    const float length = std::sqrt(
+                        normal[0] * normal[0] + normal[1] * normal[1]
+                            + normal[2] * normal[2]
+                    );
+                    if (!std::isfinite(length) || length <= 0.000001F) return 0;
+                    for (float& component : normal) component /= length;
+                    interleavedVertices.insert(
+                        interleavedVertices.end(), normal.begin(), normal.end()
+                    );
+                }
+                if (hasMaterialTextureUVs) {
+                    const std::size_t uvOffset = corner * 2;
+                    interleavedVertices.insert(
+                        interleavedVertices.end(),
+                        mesh.cornerUVs.begin() + uvOffset,
+                        mesh.cornerUVs.begin() + uvOffset + 2
+                    );
+                } else if (hasMaterialAttributes) {
+                    interleavedVertices.push_back(0.0f);
+                    interleavedVertices.push_back(0.0f);
+                }
+                if (hasMaterialAttributes) {
+                    interleavedVertices.push_back(mesh.roughness);
+                    interleavedVertices.push_back(mesh.metallic);
+                }
+                if (usesEmissionVertexFormat) {
+                    interleavedVertices.insert(
+                        interleavedVertices.end(),
+                        mesh.emissionColor.begin(), mesh.emissionColor.end()
+                    );
+                    interleavedVertices.push_back(mesh.emissionIntensity);
+                }
+                if (hasNormalTexture) {
+                    const std::size_t triangleCorner = (corner / 3) * 3;
+                    const auto trianglePoint = [&mesh, triangleCorner](
+                        std::size_t index
+                    ) {
+                        const std::size_t offset = static_cast<std::size_t>(
+                            mesh.indices[triangleCorner + index]
+                        ) * 3;
+                        return std::array<float, 3>{
+                            mesh.vertices[offset], mesh.vertices[offset + 1],
+                            mesh.vertices[offset + 2],
+                        };
+                    };
+                    const auto triangleUV = [&mesh, triangleCorner](
+                        std::size_t index
+                    ) {
+                        const std::size_t offset =
+                            (triangleCorner + index) * 2;
+                        return std::array<float, 2>{
+                            mesh.cornerUVs[offset], mesh.cornerUVs[offset + 1],
+                        };
+                    };
+                    const auto pointA = trianglePoint(0);
+                    const auto pointB = trianglePoint(1);
+                    const auto pointC = trianglePoint(2);
+                    const auto uvA = triangleUV(0);
+                    const auto uvB = triangleUV(1);
+                    const auto uvC = triangleUV(2);
+                    const std::array<float, 3> edgeA{
+                        pointB[0] - pointA[0],
+                        pointB[1] - pointA[1],
+                        pointB[2] - pointA[2],
+                    };
+                    const std::array<float, 3> edgeB{
+                        pointC[0] - pointA[0],
+                        pointC[1] - pointA[1],
+                        pointC[2] - pointA[2],
+                    };
+                    const float deltaU1 = uvB[0] - uvA[0];
+                    const float deltaV1 = uvB[1] - uvA[1];
+                    const float deltaU2 = uvC[0] - uvA[0];
+                    const float deltaV2 = uvC[1] - uvA[1];
+                    const float determinant =
+                        deltaU1 * deltaV2 - deltaV1 * deltaU2;
+                    if (!std::isfinite(determinant)
+                        || std::abs(determinant) <= 0.000000000001F) {
+                        return 0;
+                    }
+                    const float inverseDeterminant = 1.0F / determinant;
+                    std::array<float, 3> tangent{};
+                    std::array<float, 3> bitangent{};
+                    float tangentLengthSquared = 0.0F;
+                    float bitangentLengthSquared = 0.0F;
+                    for (std::size_t component = 0; component < 3; ++component) {
+                        tangent[component] = (
+                            edgeA[component] * deltaV2
+                            - edgeB[component] * deltaV1
+                        ) * inverseDeterminant;
+                        bitangent[component] = (
+                            edgeB[component] * deltaU1
+                            - edgeA[component] * deltaU2
+                        ) * inverseDeterminant;
+                        tangentLengthSquared +=
+                            tangent[component] * tangent[component];
+                        bitangentLengthSquared +=
+                            bitangent[component] * bitangent[component];
+                    }
+                    if (!std::isfinite(tangentLengthSquared)
+                        || !std::isfinite(bitangentLengthSquared)
+                        || tangentLengthSquared <= 0.000000000001F
+                        || bitangentLengthSquared <= 0.000000000001F) {
+                        return 0;
+                    }
+                    const float inverseTangentLength =
+                        1.0F / std::sqrt(tangentLengthSquared);
+                    const float inverseBitangentLength =
+                        1.0F / std::sqrt(bitangentLengthSquared);
+                    for (std::size_t component = 0; component < 3; ++component) {
+                        tangent[component] *= inverseTangentLength;
+                        bitangent[component] *= inverseBitangentLength;
+                    }
+                    interleavedVertices.insert(
+                        interleavedVertices.end(), tangent.begin(), tangent.end()
+                    );
+                    interleavedVertices.insert(
+                        interleavedVertices.end(),
+                        bitangent.begin(), bitangent.end()
+                    );
+                }
+            }
+        } catch (const std::bad_alloc&) {
+            return 0;
+        }
+        vertexData = interleavedVertices.data();
+        vertexValueCount = interleavedVertices.size();
+    }
+    const std::uint64_t vertexBytes = static_cast<std::uint64_t>(
+        vertexValueCount * sizeof(float)
+    );
+    const std::uint64_t indexBytes = hasInterleavedAttributes
+        ? 0
+        : static_cast<std::uint64_t>(
+            mesh.indices.size() * sizeof(std::uint32_t)
+        );
+    BridgeSceneMetalMesh resources{};
+    resources.device = device;
+    resources.contentHash = contentHash;
+    resources.pathHash = mesh.pathHash;
+    const auto destroyCreatedResources = [&resources]() {
+        if (gState.bridge == nullptr) return;
+        const std::array<std::uint64_t, 9> resourceIDs{
+            resources.accelerationStructureResourceID,
+            resources.materialDescriptorResourceID,
+            resources.normalTextureResourceID,
+            resources.emissionTextureResourceID,
+            resources.metallicTextureResourceID,
+            resources.roughnessTextureResourceID,
+            resources.textureResourceID,
+            resources.indexBufferResourceID,
+            resources.vertexBufferResourceID,
+        };
+        for (const auto resourceID : resourceIDs) {
+            if (resourceID == 0) continue;
+            try {
+                gState.bridge->destroyBuffer(resourceID);
+            } catch (const std::exception&) {
+            }
+        }
+    };
+    try {
+        resources.vertexBufferResourceID = gState.bridge->createBuffer(vertexBytes);
+        if (indexBytes != 0) {
+            resources.indexBufferResourceID = gState.bridge->createBuffer(indexBytes);
+        }
+        if (hasFileTexture) {
+            resources.textureResourceID = gState.bridge->createImage(
+                mesh.textureWidth, mesh.textureHeight, IMB_IMAGE_FORMAT_RGBA8_UNORM
+            );
+            gState.bridge->writeImage(
+                resources.textureResourceID,
+                mesh.textureRGBA8.data(),
+                mesh.textureRGBA8.size()
+            );
+        }
+        const auto uploadParameterTexture = [](
+            const BridgeSceneTextureMap& map,
+            std::uint64_t& resourceID
+        ) {
+            resourceID = gState.bridge->createImage(
+                map.width, map.height, IMB_IMAGE_FORMAT_RGBA8_UNORM
+            );
+            gState.bridge->writeImage(
+                resourceID, map.rgba8.data(), map.rgba8.size()
+            );
+        };
+        if (hasRoughnessTexture) {
+            uploadParameterTexture(
+                mesh.roughnessTexture,
+                resources.roughnessTextureResourceID
+            );
+        }
+        if (hasMetallicTexture) {
+            uploadParameterTexture(
+                mesh.metallicTexture,
+                resources.metallicTextureResourceID
+            );
+        }
+        if (hasEmissionTexture) {
+            uploadParameterTexture(
+                mesh.emissionTexture,
+                resources.emissionTextureResourceID
+            );
+        }
+        if (hasNormalTexture) {
+            uploadParameterTexture(
+                mesh.normalTexture,
+                resources.normalTextureResourceID
+            );
+        }
+        if (hasMaterialDescriptorTextures) {
+            constexpr std::uint32_t kMaterialDescriptorMagic =
+                UINT32_C(0x314d424d);
+            std::vector<std::uint8_t> descriptor;
+            descriptor.reserve(hasNormalTexture ? 56 : 48);
+            std::uint32_t descriptorFlags = 0;
+            if (resources.textureResourceID != 0) descriptorFlags |= 1u;
+            if (resources.roughnessTextureResourceID != 0) descriptorFlags |= 2u;
+            if (resources.metallicTextureResourceID != 0) descriptorFlags |= 4u;
+            if (resources.emissionTextureResourceID != 0) descriptorFlags |= 8u;
+            if (resources.normalTextureResourceID != 0) descriptorFlags |= 16u;
+            const std::uint32_t packedChannels =
+                mesh.roughnessTexture.channel
+                | (mesh.metallicTexture.channel << 4)
+                | (mesh.emissionTexture.channel << 8);
+            imb::appendLittleEndian(descriptor, kMaterialDescriptorMagic);
+            imb::appendLittleEndian(
+                descriptor,
+                std::uint32_t{hasNormalTexture ? 2u : 1u}
+            );
+            imb::appendLittleEndian(descriptor, descriptorFlags);
+            imb::appendLittleEndian(descriptor, packedChannels);
+            const auto appendResourceID = [&descriptor](std::uint64_t resourceID) {
+                imb::appendLittleEndian(
+                    descriptor, static_cast<std::uint32_t>(resourceID)
+                );
+                imb::appendLittleEndian(
+                    descriptor, static_cast<std::uint32_t>(resourceID >> 32)
+                );
+            };
+            appendResourceID(resources.textureResourceID);
+            appendResourceID(resources.roughnessTextureResourceID);
+            appendResourceID(resources.metallicTextureResourceID);
+            appendResourceID(resources.emissionTextureResourceID);
+            if (hasNormalTexture) {
+                appendResourceID(resources.normalTextureResourceID);
+            }
+            resources.materialDescriptorResourceID =
+                gState.bridge->createBuffer(descriptor.size());
+            gState.bridge->writeBuffer(
+                resources.materialDescriptorResourceID,
+                descriptor.data(),
+                descriptor.size()
+            );
+        }
+        gState.bridge->writeBuffer(
+            resources.vertexBufferResourceID,
+            reinterpret_cast<const std::uint8_t*>(vertexData),
+            vertexBytes
+        );
+        if (indexBytes != 0) {
+            gState.bridge->writeBuffer(
+                resources.indexBufferResourceID,
+                reinterpret_cast<const std::uint8_t*>(mesh.indices.data()),
+                indexBytes
+            );
+        }
+        resources.accelerationStructureResourceID =
+            gState.bridge->createAccelerationStructure(
+                static_cast<std::uint32_t>(
+                    VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR
+                ),
+                std::max<std::uint64_t>(vertexBytes + indexBytes, 1)
+            );
+        BridgePrimitiveAccelerationStructureGeometry geometry{};
+        geometry.kind = 0;
+        geometry.flags = 0;
+        geometry.dataResourceID = resources.vertexBufferResourceID;
+        geometry.dataOffset = 0;
+        geometry.primitiveCount = mesh.triangleCount;
+        geometry.stride = hasNormalTexture
+            ? 20 * sizeof(float)
+            : (usesEmissionVertexFormat
+            ? 14 * sizeof(float)
+            : (hasMaterialParameters
+                ? 10 * sizeof(float)
+                : (hasMaterialTextureUVs
+                    ? 8 * sizeof(float)
+                    : (hasAuthoredCornerNormals
+                        ? 6 * sizeof(float) : 3 * sizeof(float)))));
+        geometry.indexResourceID = resources.indexBufferResourceID;
+        geometry.indexOffset = 0;
+        geometry.indexType = hasInterleavedAttributes ? 0 : 2;
+        geometry.vertexFormat = hasNormalTexture
+            ? 6 : (usesEmissionVertexFormat
+            ? 5 : (hasMaterialParameters
+                ? 4 : (hasMaterialTextureUVs
+                    ? 3 : (hasAuthoredCornerNormals ? 2 : 1))));
+        gState.bridge->buildPrimitiveAccelerationStructure(
+            resources.accelerationStructureResourceID,
+            0,
+            {geometry}
+        );
+        gState.sceneMetalMeshes.push_back(resources);
+        return resources.accelerationStructureResourceID;
+    } catch (...) {
+        destroyCreatedResources();
+        throw;
+    }
 }
 
 VkResult bridgeFallbackInstanceAccelerationStructureBuildLocked(
@@ -6581,16 +8376,18 @@ VkResult bridgeFallbackInstanceAccelerationStructureBuildLocked(
             continue;
         }
         if (acceleration->type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
-            if (acceleration->built) {
+            if (acceleration->built && !acceleration->builtFromSceneState) {
                 *topLevelOutput = acceleration;
                 return VK_SUCCESS;
             }
-            if (topLevel == nullptr) topLevel = acceleration;
+            if (topLevel == nullptr || acceleration->builtFromSceneState) {
+                topLevel = acceleration;
+            }
         } else if (acceleration->built) {
             children.push_back(acceleration);
         }
     }
-    if (topLevel == nullptr || children.empty()) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (topLevel == nullptr) return VK_ERROR_FEATURE_NOT_PRESENT;
     std::sort(
         children.begin(),
         children.end(),
@@ -6599,35 +8396,244 @@ VkResult bridgeFallbackInstanceAccelerationStructureBuildLocked(
         }
     );
 
+    const auto liveScene = readLiveSceneState();
+    if (!liveScene.has_value() || !liveScene->hasMeshManifest) {
+        if (rayTracingTraceEnabled()) {
+            std::fprintf(
+                stderr,
+                "imb-vulkan-icd: refusing fallback TLAS without a live USD Mesh manifest\n"
+            );
+        }
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    if (topLevel->built
+        && topLevel->sceneStateSequence == liveScene->camera.sequence) {
+        *topLevelOutput = topLevel;
+        return VK_SUCCESS;
+    }
+
     const std::array<float, 12> identity{
         1.0F, 0.0F, 0.0F, 0.0F,
         0.0F, 1.0F, 0.0F, 0.0F,
         0.0F, 0.0F, 1.0F, 0.0F,
     };
     std::vector<BridgeInstanceAccelerationStructureInstance> instances;
+    std::unordered_set<AccelerationStructureKHRState*> matchedChildren;
+    std::unordered_set<std::uint64_t> activeSceneResources;
+    std::size_t sceneGeometryMeshCount = 0;
+    std::size_t reclaimedSceneResourceCount = 0;
     try {
-        instances.reserve(children.size());
-        for (std::size_t index = 0; index < children.size(); ++index) {
+        instances.reserve(liveScene->meshes.size());
+        for (std::size_t meshIndex = 0;
+             meshIndex < liveScene->meshes.size();
+             ++meshIndex) {
+            const auto& mesh = liveScene->meshes[meshIndex];
+            const auto worldBounds = transformedSceneMeshBounds(mesh);
+            AccelerationStructureKHRState* bestChild = nullptr;
+            float bestLocalError = std::numeric_limits<float>::max();
+            float bestWorldError = std::numeric_limits<float>::max();
+            float bestError = std::numeric_limits<float>::max();
+            std::uint64_t childResourceID = 0;
+            bool usesSceneGeometry = false;
+            if (!mesh.vertices.empty() && !mesh.indices.empty()) {
+                childResourceID = bridgeSceneMeshAccelerationStructureLocked(
+                    device,
+                    mesh
+                );
+                usesSceneGeometry = childResourceID != 0;
+                if (usesSceneGeometry) {
+                    activeSceneResources.insert(childResourceID);
+                }
+            }
+            if (!usesSceneGeometry) {
+                for (auto* child : children) {
+                    if (matchedChildren.contains(child)
+                        || !child->hasTriangleBounds
+                        || child->triangleCount != mesh.triangleCount) {
+                        continue;
+                    }
+                    const float localError = sceneBoundsError(
+                        child->triangleBoundsMinimum,
+                        child->triangleBoundsMaximum,
+                        mesh.boundsMinimum,
+                        mesh.boundsMaximum
+                    );
+                    const float worldError = sceneBoundsError(
+                        child->triangleBoundsMinimum,
+                        child->triangleBoundsMaximum,
+                        worldBounds.first,
+                        worldBounds.second
+                    );
+                    const float error = std::min(localError, worldError);
+                    if (error < bestError) {
+                        bestChild = child;
+                        bestLocalError = localError;
+                        bestWorldError = worldError;
+                        bestError = error;
+                    }
+                }
+                constexpr float kMaximumBoundsMatchError = 0.2F;
+                if (bestChild == nullptr || bestError > kMaximumBoundsMatchError) {
+                    std::fprintf(
+                        stderr,
+                        "imb-vulkan-icd: USD Mesh has no matching real BLAS pathHash=%#llx triangles=%u bestBoundsError=%.6g\n",
+                        static_cast<unsigned long long>(mesh.pathHash),
+                        mesh.triangleCount,
+                        bestError
+                    );
+                    continue;
+                }
+                matchedChildren.insert(bestChild);
+                childResourceID = bestChild->bridgeResourceID;
+            }
             BridgeInstanceAccelerationStructureInstance instance{};
-            for (std::size_t component = 0; component < identity.size(); ++component) {
+            const bool verticesAlreadyInWorld =
+                !usesSceneGeometry
+                && bestWorldError + 0.0001F < bestLocalError;
+            const auto& transform = verticesAlreadyInWorld
+                ? identity : mesh.worldTransform;
+            for (std::size_t component = 0; component < transform.size(); ++component) {
                 std::memcpy(
                     &instance.transformationBits[component],
-                    &identity[component],
+                    &transform[component],
                     sizeof(std::uint32_t)
                 );
             }
             instance.mask = 0xff;
-            instance.userID = static_cast<std::uint32_t>(
-                std::min<std::size_t>(index, 0x00ff'ffffU)
+            std::uint64_t textureResourceID = 0;
+            std::uint64_t materialDescriptorResourceID = 0;
+            const auto materialResource = std::find_if(
+                gState.sceneMetalMeshes.begin(),
+                gState.sceneMetalMeshes.end(),
+                [device, childResourceID](const auto& candidate) {
+                    return candidate.device == device
+                        && candidate.accelerationStructureResourceID
+                            == childResourceID;
+                }
             );
-            instance.accelerationStructureResourceID = children[index]->bridgeResourceID;
+            if (materialResource != gState.sceneMetalMeshes.end()) {
+                textureResourceID = materialResource->textureResourceID;
+                materialDescriptorResourceID =
+                    materialResource->materialDescriptorResourceID;
+            }
+            if (materialDescriptorResourceID != 0
+                && materialDescriptorResourceID <= UINT32_C(0x003fffff)) {
+                instance.userID = UINT32_C(0x00c00000)
+                    | static_cast<std::uint32_t>(
+                        materialDescriptorResourceID
+                    );
+            } else if (textureResourceID != 0
+                && textureResourceID <= UINT32_C(0x003fffff)) {
+                instance.userID = UINT32_C(0x00400000)
+                    | static_cast<std::uint32_t>(textureResourceID);
+            } else if ((mesh.materialFlags & 2u) != 0) {
+                const std::uint32_t packedRGB = mesh.materialFlags >> 8;
+                const std::uint32_t red = packedRGB & 0xffu;
+                const std::uint32_t green = (packedRGB >> 8) & 0xffu;
+                const std::uint32_t blue7 = (packedRGB >> 17) & 0x7fu;
+                instance.userID = UINT32_C(0x00800000)
+                    | red | (green << 8) | (blue7 << 16);
+            }
+            instance.accelerationStructureResourceID = childResourceID;
             instances.push_back(instance);
+            if (usesSceneGeometry) {
+                ++sceneGeometryMeshCount;
+                std::fprintf(
+                    stderr,
+                    "imb-vulkan-icd: built USD Mesh BLAS pathHash=%#llx vertices=%zu triangles=%u host=%llu instanceTransform=usd-world source=scene-state-v11 normals=%s material=%s texture=%ux%u roughness=%.3f metallic=%.3f emission=(%.3f,%.3f,%.3f)x%.3f parameterTextures=roughness:%ux%u[c%u],metallic:%ux%u[c%u],emission:%ux%u[rgb],normal:%ux%u[rgb-tangent]\n",
+                    static_cast<unsigned long long>(mesh.pathHash),
+                    mesh.vertices.size() / 3,
+                    mesh.triangleCount,
+                    static_cast<unsigned long long>(childResourceID),
+                    mesh.cornerNormals.empty()
+                        ? "geometric-face" : "authored-corner",
+                    textureResourceID != 0
+                        ? "file-texture"
+                        : ((mesh.materialFlags & 2u) != 0
+                        ? ((mesh.materialFlags & 4u) != 0
+                            ? "connected-fallback-color"
+                            : ((mesh.materialFlags & 1u) != 0
+                                ? "bound-base-color" : "display-color"))
+                        : ((mesh.materialFlags & 1u) != 0 ? "bound" : "none")),
+                    mesh.textureWidth,
+                    mesh.textureHeight,
+                    mesh.roughness,
+                    mesh.metallic,
+                    mesh.emissionColor[0],
+                    mesh.emissionColor[1],
+                    mesh.emissionColor[2],
+                    mesh.emissionIntensity,
+                    mesh.roughnessTexture.width,
+                    mesh.roughnessTexture.height,
+                    mesh.roughnessTexture.channel,
+                    mesh.metallicTexture.width,
+                    mesh.metallicTexture.height,
+                    mesh.metallicTexture.channel,
+                    mesh.emissionTexture.width,
+                    mesh.emissionTexture.height,
+                    mesh.normalTexture.width,
+                    mesh.normalTexture.height
+                );
+            } else {
+                std::fprintf(
+                    stderr,
+                    "imb-vulkan-icd: matched USD Mesh pathHash=%#llx triangles=%u host=%llu localBoundsError=%.6g worldBoundsError=%.6g instanceTransform=%s material=%s\n",
+                    static_cast<unsigned long long>(mesh.pathHash),
+                    mesh.triangleCount,
+                    static_cast<unsigned long long>(bestChild->bridgeResourceID),
+                    bestLocalError,
+                    bestWorldError,
+                    verticesAlreadyInWorld ? "identity" : "usd-world",
+                    (mesh.materialFlags & 2u) != 0
+                        ? ((mesh.materialFlags & 4u) != 0
+                            ? "connected-fallback-color"
+                            : ((mesh.materialFlags & 1u) != 0
+                                ? "bound-base-color" : "display-color"))
+                        : ((mesh.materialFlags & 1u) != 0 ? "bound" : "none")
+                );
+            }
         }
+        if (instances.empty()) return VK_ERROR_FEATURE_NOT_PRESENT;
         gState.bridge->buildInstanceAccelerationStructure(
             topLevel->bridgeResourceID,
             0,
             instances
         );
+        for (auto iterator = gState.sceneMetalMeshes.begin();
+             iterator != gState.sceneMetalMeshes.end();) {
+            if (iterator->device != device
+                || activeSceneResources.contains(
+                    iterator->accelerationStructureResourceID
+                )) {
+                ++iterator;
+                continue;
+            }
+            const std::array<std::uint64_t, 9> resourceIDs{
+                iterator->accelerationStructureResourceID,
+                iterator->materialDescriptorResourceID,
+                iterator->normalTextureResourceID,
+                iterator->emissionTextureResourceID,
+                iterator->metallicTextureResourceID,
+                iterator->roughnessTextureResourceID,
+                iterator->textureResourceID,
+                iterator->indexBufferResourceID,
+                iterator->vertexBufferResourceID,
+            };
+            for (const auto resourceID : resourceIDs) {
+                if (resourceID == 0) continue;
+                try {
+                    gState.bridge->destroyBuffer(resourceID);
+                } catch (const std::exception& error) {
+                    std::fprintf(
+                        stderr,
+                        "imb-vulkan-icd: stale animated USD Mesh resource destroy warning: %s\n",
+                        error.what()
+                    );
+                }
+            }
+            iterator = gState.sceneMetalMeshes.erase(iterator);
+            ++reclaimedSceneResourceCount;
+        }
     } catch (const std::bad_alloc&) {
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     } catch (const std::exception& error) {
@@ -6639,12 +8645,18 @@ VkResult bridgeFallbackInstanceAccelerationStructureBuildLocked(
         return VK_ERROR_DEVICE_LOST;
     }
     topLevel->built = true;
+    topLevel->builtFromSceneState = true;
+    topLevel->sceneStateSequence = liveScene->camera.sequence;
     *topLevelOutput = topLevel;
     std::fprintf(
         stderr,
-        "imb-vulkan-icd: fallback Metal instance AS built host=%llu realBLASInstances=%zu reason=Kit-null-TLAS\n",
+        "imb-vulkan-icd: fallback Metal instance AS built host=%llu matchedUSDMeshes=%zu sceneGeometryMeshes=%zu excludedInternalBLAS=%zu sceneSequence=%llu reclaimedSceneResources=%zu reason=Kit-null-TLAS\n",
         static_cast<unsigned long long>(topLevel->bridgeResourceID),
-        instances.size()
+        instances.size(),
+        sceneGeometryMeshCount,
+        children.size() - matchedChildren.size(),
+        static_cast<unsigned long long>(liveScene->camera.sequence),
+        reclaimedSceneResourceCount
     );
     return VK_SUCCESS;
 }
@@ -7737,6 +9749,7 @@ VKAPI_ATTR void VKAPI_CALL imb_vkCmdBuildAccelerationStructuresKHR(
             return;
         }
         RecordedAccelerationStructureBuildKHR build{};
+        build.sequence = command->nextCommandSequence++;
         build.destination = destination;
         build.source = info.srcAccelerationStructure == VK_NULL_HANDLE ? nullptr : source;
         build.type = info.type;
@@ -7777,8 +9790,9 @@ VKAPI_ATTR void VKAPI_CALL imb_vkCmdBuildAccelerationStructuresKHR(
             const auto& recorded = command->accelerationStructureBuildsKHR.back();
             std::fprintf(
                 stderr,
-                "imb-vulkan-icd: record build AS KHR command=%p dst=%p src=%p type=%d mode=%d geometries=%u firstType=%d firstPrimitives=%u scratch=%#llx\n",
+                "imb-vulkan-icd: record build AS KHR command=%p sequence=%llu dst=%p src=%p type=%d mode=%d geometries=%u firstType=%d firstPrimitives=%u scratch=%#llx\n",
                 static_cast<void*>(command),
+                static_cast<unsigned long long>(recorded.sequence),
                 static_cast<void*>(destination),
                 static_cast<void*>(info.srcAccelerationStructure == VK_NULL_HANDLE ? nullptr : source),
                 info.type,
@@ -8514,7 +10528,7 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkResetCommandPool(
             commandBuffer->accelerationStructureCopiesKHR.clear();
             commandBuffer->rayTracesKHR.clear();
             commandBuffer->computeDispatches.clear();
-            commandBuffer->nextTransferSequence = 1;
+            commandBuffer->nextCommandSequence = 1;
             commandBuffer->bufferCopies.clear();
             commandBuffer->bufferUpdates.clear();
             commandBuffer->bufferFills.clear();
@@ -8607,7 +10621,7 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkBeginCommandBuffer(
     state->accelerationStructureCopiesKHR.clear();
     state->rayTracesKHR.clear();
     state->computeDispatches.clear();
-    state->nextTransferSequence = 1;
+    state->nextCommandSequence = 1;
     state->bufferCopies.clear();
     state->bufferUpdates.clear();
     state->bufferFills.clear();
@@ -8663,7 +10677,7 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkResetCommandBuffer(
     state->accelerationStructureCopiesKHR.clear();
     state->rayTracesKHR.clear();
     state->computeDispatches.clear();
-    state->nextTransferSequence = 1;
+    state->nextCommandSequence = 1;
     state->bufferCopies.clear();
     state->bufferUpdates.clear();
     state->bufferFills.clear();
@@ -8866,27 +10880,37 @@ VKAPI_ATTR void VKAPI_CALL imb_vkCmdDispatch(
     }
     if (genericComputeBridgeEnabled() && command->pipeline != nullptr
         && gState.pipelines.contains(command->pipeline)
-        && command->pipeline->bridgeComputePipelineID != 0
-        && command->pipeline->layout != nullptr
-        && command->computePushConstants.size() >= requiredPushConstantSize) {
+        && command->pipeline->layout != nullptr) {
+        const bool bridgeEligible =
+            command->pipeline->bridgeComputePipelineID != 0
+            && command->computePushConstants.size() >= requiredPushConstantSize;
         command->computeDispatches.push_back(RecordedComputeDispatch{
+            command->nextCommandSequence++,
             command->pipeline,
+            bridgeEligible,
             command->computeDescriptorSets,
             groupCountX,
             groupCountY,
             groupCountZ,
             command->computePushConstants,
         });
-        if (traceEnabled()) {
+        if (traceEnabled() || computeTraceEnabled() || rayTracingTraceEnabled()) {
             std::fprintf(
                 stderr,
-                "imb-vulkan-icd: recorded Metal compute dispatch pipeline=%llu groups=%ux%ux%u\n",
+                "imb-vulkan-icd: recorded compute dispatch hash=%016llx pipeline=%llu eligible=%d groups=%ux%ux%u sequence=%llu\n",
+                static_cast<unsigned long long>(
+                    command->pipeline->computeHash
+                ),
                 static_cast<unsigned long long>(
                     command->pipeline->bridgeComputePipelineID
                 ),
+                bridgeEligible ? 1 : 0,
                 groupCountX,
                 groupCountY,
-                groupCountZ
+                groupCountZ,
+                static_cast<unsigned long long>(
+                    command->computeDispatches.back().sequence
+                )
             );
         }
     }
@@ -8963,7 +10987,7 @@ VKAPI_ATTR void VKAPI_CALL imb_vkCmdCopyBuffer(
     }
     try {
         RecordedBufferCopy copy;
-        copy.sequence = command->nextTransferSequence++;
+        copy.sequence = command->nextCommandSequence++;
         copy.source = source;
         copy.destination = destination;
         copy.regions.assign(regions, regions + regionCount);
@@ -9035,7 +11059,7 @@ VKAPI_ATTR void VKAPI_CALL imb_vkCmdUpdateBuffer(
     }
     try {
         RecordedBufferUpdate update;
-        update.sequence = command->nextTransferSequence++;
+        update.sequence = command->nextCommandSequence++;
         update.destination = destination;
         update.offset = destinationOffset;
         const auto* bytes = static_cast<const std::uint8_t*>(data);
@@ -9069,7 +11093,7 @@ VKAPI_ATTR void VKAPI_CALL imb_vkCmdFillBuffer(
     }
     try {
         command->bufferFills.push_back({
-            command->nextTransferSequence++,
+            command->nextCommandSequence++,
             destination,
             destinationOffset,
             fillSize,
@@ -9117,7 +11141,7 @@ VKAPI_ATTR void VKAPI_CALL imb_vkCmdClearColorImage(
     }
     try {
         RecordedImageClear clear;
-        clear.sequence = command->nextTransferSequence++;
+        clear.sequence = command->nextCommandSequence++;
         clear.image = destination;
         clear.color = *color;
         clear.ranges.assign(ranges, ranges + rangeCount);
@@ -9216,7 +11240,7 @@ VKAPI_ATTR void VKAPI_CALL imb_vkCmdCopyImage(
     }
     try {
         RecordedImageCopy copy;
-        copy.sequence = command->nextTransferSequence++;
+        copy.sequence = command->nextCommandSequence++;
         copy.source = source;
         copy.destination = destination;
         copy.regions.assign(regions, regions + regionCount);
@@ -10187,7 +12211,7 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkSignalSemaphore(
 VKAPI_ATTR VkResult VKAPI_CALL imb_vkWaitSemaphores(
     VkDevice device,
     const VkSemaphoreWaitInfo* waitInfo,
-    std::uint64_t
+    std::uint64_t timeout
 ) {
     if (waitInfo == nullptr
         || (waitInfo->semaphoreCount != 0
@@ -10208,6 +12232,20 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkWaitSemaphores(
         const bool satisfied = state->timeline
             ? state->value >= waitInfo->pValues[index]
             : state->signaled;
+        if (!satisfied && semaphoreTraceEnabled()) {
+            std::fprintf(
+                stderr,
+                "imb-vulkan-icd: semaphore wait unsatisfied handle=%p timeline=%d actual=%llu requested=%llu timeout=%llu flags=%#x\n",
+                static_cast<void*>(state),
+                state->timeline ? 1 : 0,
+                static_cast<unsigned long long>(
+                    state->timeline ? state->value : (state->signaled ? 1U : 0U)
+                ),
+                static_cast<unsigned long long>(waitInfo->pValues[index]),
+                static_cast<unsigned long long>(timeout),
+                waitInfo->flags
+            );
+        }
         anySatisfied = anySatisfied || satisfied;
         allSatisfied = allSatisfied && satisfied;
     }
@@ -10970,6 +13008,21 @@ VkResult completeQueueSubmitSynchronizationLocked(
                 semaphore->value = std::max(semaphore->value, signalValue);
             }
             semaphore->signaled = true;
+            if (semaphoreTraceEnabled()) {
+                std::fprintf(
+                    stderr,
+                    "imb-vulkan-icd: semaphore exact completion handle=%p timeline=%d value=%llu submit=%u signal=%u\n",
+                    static_cast<void*>(semaphore),
+                    semaphore->timeline ? 1 : 0,
+                    static_cast<unsigned long long>(
+                        semaphore->timeline
+                            ? semaphore->value
+                            : (semaphore->signaled ? 1U : 0U)
+                    ),
+                    submitIndex,
+                    index
+                );
+            }
             const VkResult syncResult = syncSemaphoreToExternalFDLocked(semaphore);
             if (syncResult != VK_SUCCESS) return syncResult;
         }
@@ -11024,6 +13077,7 @@ VkResult uploadComputeImageForMetalLocked(ImageState* image) {
 
 VkResult bridgeComputeDispatchLocked(const RecordedComputeDispatch& dispatch) {
     if (dispatch.pipeline == nullptr || !gState.pipelines.contains(dispatch.pipeline)
+        || !dispatch.bridgeEligible
         || dispatch.pipeline->bridgeComputePipelineID == 0 || gState.bridge == nullptr
         || dispatch.groupCountX == 0 || dispatch.groupCountY == 0
         || dispatch.groupCountZ == 0) {
@@ -11031,10 +13085,18 @@ VkResult bridgeComputeDispatchLocked(const RecordedComputeDispatch& dispatch) {
     }
 
     std::vector<BridgeComputeBinding> bindings;
-    std::vector<const DescriptorSetState::BufferBinding*> writableBuffers;
+    struct WritableBuffer {
+        const DescriptorSetState::BufferBinding* descriptor = nullptr;
+        VkDeviceSize range = 0;
+    };
+    std::vector<WritableBuffer> writableBuffers;
     std::vector<ImageState*> writableImages;
     try {
-        for (std::uint32_t setIndex = 0; setIndex < dispatch.descriptorSets.size(); ++setIndex) {
+        const std::size_t setCount = std::min<std::size_t>(
+            dispatch.descriptorSets.size(),
+            dispatch.pipeline->layout->setLayouts.size()
+        );
+        for (std::uint32_t setIndex = 0; setIndex < setCount; ++setIndex) {
             auto* set = dispatch.descriptorSets[setIndex];
             if (set == nullptr) continue;
             if (!gState.descriptorSets.contains(set)) return VK_ERROR_INITIALIZATION_FAILED;
@@ -11043,8 +13105,39 @@ VkResult bridgeComputeDispatchLocked(const RecordedComputeDispatch& dispatch) {
                     || !gState.buffers.contains(descriptor.buffer)) {
                     return VK_ERROR_MEMORY_MAP_FAILED;
                 }
+                if (descriptor.offset > descriptor.buffer->size) {
+                    return VK_ERROR_MEMORY_MAP_FAILED;
+                }
+                const VkDeviceSize availableRange =
+                    descriptor.buffer->size - descriptor.offset;
+                const VkDeviceSize descriptorRange =
+                    descriptor.range == VK_WHOLE_SIZE
+                        ? availableRange
+                        : descriptor.range;
+                if (descriptorRange == 0 || descriptorRange > availableRange) {
+                    return VK_ERROR_MEMORY_MAP_FAILED;
+                }
                 const VkResult uploadResult = uploadBufferForMetalLocked(descriptor.buffer);
-                if (uploadResult != VK_SUCCESS) return uploadResult;
+                if (uploadResult != VK_SUCCESS) {
+                    if (computeTraceEnabled()) {
+                        std::fprintf(
+                            stderr,
+                            "imb-vulkan-icd: compute buffer unavailable hash=%016llx set=%u binding=%u array=%u result=%d buffer=%p memory=%p sparseBindings=%zu range=%llu\n",
+                            static_cast<unsigned long long>(
+                                dispatch.pipeline->computeHash
+                            ),
+                            setIndex,
+                            static_cast<std::uint32_t>(key >> 32),
+                            static_cast<std::uint32_t>(key),
+                            uploadResult,
+                            static_cast<void*>(descriptor.buffer),
+                            static_cast<void*>(descriptor.buffer->memory),
+                            descriptor.buffer->sparseBindings.size(),
+                            static_cast<unsigned long long>(descriptor.range)
+                        );
+                    }
+                    return uploadResult;
+                }
                 const bool writable =
                     descriptor.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
                     || descriptor.type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
@@ -11068,9 +13161,11 @@ VkResult bridgeComputeDispatchLocked(const RecordedComputeDispatch& dispatch) {
                         : 0,
                     descriptor.buffer->memory->resourceID,
                     descriptor.buffer->memoryOffset + descriptor.offset,
-                    descriptor.range,
+                    descriptorRange,
                 });
-                if (writable) writableBuffers.push_back(&descriptor);
+                if (writable) {
+                    writableBuffers.push_back({&descriptor, descriptorRange});
+                }
             }
             for (const auto& [key, descriptor] : set->computeImages) {
                 if (descriptor.image == nullptr || !gState.images.contains(descriptor.image)) {
@@ -11079,7 +13174,28 @@ VkResult bridgeComputeDispatchLocked(const RecordedComputeDispatch& dispatch) {
                 const bool writable = descriptor.type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
                 const VkResult uploadResult =
                     uploadComputeImageForMetalLocked(descriptor.image);
-                if (uploadResult != VK_SUCCESS) return uploadResult;
+                if (uploadResult != VK_SUCCESS) {
+                    if (computeTraceEnabled()) {
+                        std::fprintf(
+                            stderr,
+                            "imb-vulkan-icd: compute image unavailable hash=%016llx set=%u binding=%u array=%u result=%d image=%p memory=%p sparseBindings=%zu format=%d extent=%ux%u\n",
+                            static_cast<unsigned long long>(
+                                dispatch.pipeline->computeHash
+                            ),
+                            setIndex,
+                            static_cast<std::uint32_t>(key >> 32),
+                            static_cast<std::uint32_t>(key),
+                            uploadResult,
+                            static_cast<void*>(descriptor.image),
+                            static_cast<void*>(descriptor.image->memory),
+                            descriptor.image->sparseBindings.size(),
+                            descriptor.image->format,
+                            descriptor.image->extent.width,
+                            descriptor.image->extent.height
+                        );
+                    }
+                    return uploadResult;
+                }
                 bindings.push_back(BridgeComputeBinding{
                     setIndex,
                     static_cast<std::uint32_t>(key >> 32),
@@ -11106,20 +13222,21 @@ VkResult bridgeComputeDispatchLocked(const RecordedComputeDispatch& dispatch) {
         );
         gState.bridge->waitFence(fence);
 
-        for (const auto* descriptor : writableBuffers) {
+        for (const auto& writable : writableBuffers) {
+            const auto* descriptor = writable.descriptor;
             auto* memory = descriptor->buffer->memory;
             const VkDeviceSize offset = descriptor->buffer->memoryOffset + descriptor->offset;
-            if (offset > memory->size || descriptor->range > memory->size - offset) {
+            if (offset > memory->size || writable.range > memory->size - offset) {
                 return VK_ERROR_MEMORY_MAP_FAILED;
             }
             gState.bridge->readBuffer(
                 memory->resourceID,
                 memory->bytes.data() + offset,
-                descriptor->range,
+                writable.range,
                 offset
             );
             const VkResult syncResult =
-                syncMemoryToExternalFDLocked(memory, offset, descriptor->range);
+                syncMemoryToExternalFDLocked(memory, offset, writable.range);
             if (syncResult != VK_SUCCESS) return syncResult;
         }
         for (auto* image : writableImages) {
@@ -11191,9 +13308,11 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
         }
     }
 
-    // Host-visible buffer contents are the backing store for this ICD.  Apply
-    // transfer commands before inspecting SBTs or acceleration-structure input
-    // in later commands from the same queue submission.
+    // Host-visible buffer contents are the backing store for this ICD. Replay
+    // transfers, supported compute dispatches, and KHR acceleration-structure
+    // builds in their recorded Vulkan order. Kit reuses geometry ring ranges
+    // between Mesh builds, so batching producers before/after every BLAS would
+    // make multiple BLASes read the same Mesh.
     std::unordered_set<ImageState*> transferredImages;
     for (std::uint32_t submitIndex = 0; submitIndex < submitCount; ++submitIndex) {
         const auto& submit = submits[submitIndex];
@@ -11206,48 +13325,14 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                 || command->device != device) {
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
-            const VkResult transferResult =
-                executeRecordedTransfersLocked(command, transferredImages);
-            if (transferResult != VK_SUCCESS) return transferResult;
+            const VkResult commandResult =
+                executeRecordedCommandsLocked(command, transferredImages);
+            if (commandResult != VK_SUCCESS) return commandResult;
         }
     }
     for (auto* image : transferredImages) {
         const VkResult syncResult = syncTransferredImageLocked(image);
         if (syncResult != VK_SUCCESS) return syncResult;
-    }
-
-    for (std::uint32_t submitIndex = 0; submitIndex < submitCount; ++submitIndex) {
-        const auto& submit = submits[submitIndex];
-        for (std::uint32_t commandIndex = 0; commandIndex < submit.commandBufferCount; ++commandIndex) {
-            auto* command =
-                reinterpret_cast<CommandBufferState*>(submit.pCommandBuffers[commandIndex]);
-            for (const auto& dispatch : command->computeDispatches) {
-                const VkResult result = bridgeComputeDispatchLocked(dispatch);
-                // RTX keeps legal null/partially-bound descriptors in layouts
-                // whose shader permutations do not necessarily read them.
-                // A missing CPU backing therefore makes only this optional
-                // Metal translation ineligible; it must not fail the Vulkan
-                // queue and poison the render-graph submission semaphore.
-                if (result == VK_ERROR_FEATURE_NOT_PRESENT
-                    || result == VK_ERROR_FORMAT_NOT_SUPPORTED
-                    || result == VK_ERROR_MEMORY_MAP_FAILED) {
-                    if (computeTraceEnabled()) {
-                        std::fprintf(
-                            stderr,
-                            "imb-vulkan-icd: skipped unsupported Metal compute pipeline=%llu result=%d\n",
-                            static_cast<unsigned long long>(
-                                dispatch.pipeline == nullptr
-                                    ? 0
-                                    : dispatch.pipeline->bridgeComputePipelineID
-                            ),
-                            result
-                        );
-                    }
-                    continue;
-                }
-                if (result != VK_SUCCESS) return result;
-            }
-        }
     }
 
     const bool isSimpleSubmit = submitCount == 1 && submits[0].commandBufferCount == 1
@@ -11257,14 +13342,15 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
     bool isMetalRasterSubmit = isSimpleSubmit;
     bool isMetalUISubmit = false;
     bool containsUnsupportedRayTracing = false;
-    bool containsMetalAccelerationStructureBuild = false;
     bool nullSceneRTXInitializationCandidate = true;
     std::vector<const RecordedRayTraceKHR*> nullSceneRTXTraces;
+    std::vector<const RecordedRayTraceKHR*> sceneRayTraces;
     const RecordedRayTraceKHR* metalRayTrace = nullptr;
     const RecordedRayTraceKHR* mainSceneRayTrace = nullptr;
     CommandBufferState* addCommand = nullptr;
     CommandBufferState* rasterCommand = nullptr;
     CommandBufferState* uiCommand = nullptr;
+    std::vector<CommandBufferState*> uiCommands;
     if (isSimpleSubmit) {
         addCommand = reinterpret_cast<CommandBufferState*>(submits[0].pCommandBuffers[0]);
         rasterCommand = addCommand;
@@ -11290,14 +13376,21 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                 && candidate->pipeline->isKitUI && candidate->framebuffer != nullptr
                 && candidate->framebuffer->colorImage != nullptr && !candidate->uiDraws.empty()
                 && !candidate->insideRenderPass) {
-                uiCommand = candidate;
+                uiCommands.push_back(candidate);
+                // Full can submit its docked workspace and an undocked
+                // viewport window together. The viewport is commonly recorded
+                // last, so "last command wins" replaces Stage/Property/Content
+                // with only the viewport. The main workspace has the richer
+                // indexed UI list; retain that command as the presentation
+                // surface while still acknowledging the whole Vulkan submit.
+                if (uiCommand == nullptr
+                    || candidate->uiDraws.size() > uiCommand->uiDraws.size()) {
+                    uiCommand = candidate;
+                }
                 isMetalUISubmit = true;
             }
             if (gState.commandBuffers.contains(candidate) && candidate->executable
                 && candidate->device == device) {
-                if (!candidate->accelerationStructureBuildsKHR.empty()) {
-                    containsMetalAccelerationStructureBuild = true;
-                }
                 if (!candidate->accelerationStructureBuildsNV.empty()
                     || !candidate->accelerationStructureCopiesNV.empty()
                     || !candidate->rayTracesNV.empty()
@@ -11376,12 +13469,24 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                             || raygenHash == UINT64_C(0x9eeed51da7b7135d)
                             || raygenHash == UINT64_C(0xa00a626692fa2fee)
                             || raygenHash == UINT64_C(0x72f6dc6c98605c7f);
-                        if (raygenHash == UINT64_C(0xf2dbfaa8274b5250)
-                            && trace.width == 1280 && trace.height == 720
-                            && mainSceneRayTrace == nullptr) {
-                            mainSceneRayTrace = &trace;
+                        const bool knownSceneRayTrace =
+                            raygenHash == UINT64_C(0xf2dbfaa8274b5250)
+                            && trace.width >= 16 && trace.height >= 16
+                            && trace.width <= 8192 && trace.height <= 8192
+                            && trace.depth == 1;
+                        if (knownSceneRayTrace) {
+                            sceneRayTraces.push_back(&trace);
+                            if (mainSceneRayTrace == nullptr
+                                || (trace.width == 1280 && trace.height == 720)) {
+                                mainSceneRayTrace = &trace;
+                            }
                         }
-                        if (!hasAccelerationStructure && knownNullSceneRaygen) {
+                        if (knownSceneRayTrace) {
+                            // The scene's TLAS can be null until the visible
+                            // USD Mesh fallback is built below. Viewport and
+                            // Camera Render Products may coexist in this one
+                            // command buffer and must all be executed.
+                        } else if (!hasAccelerationStructure && knownNullSceneRaygen) {
                             nullSceneRTXTraces.push_back(&trace);
                         } else {
                             nullSceneRTXInitializationCandidate = false;
@@ -11392,51 +13497,12 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
         }
     }
 
-    // Execute acceleration-structure builds before considering the trace
-    // commands recorded later in the same Vulkan command buffer. RTX records
-    // its first scene BLAS builds and null-TLAS initialization traces together.
-    if (containsMetalAccelerationStructureBuild) {
-        for (std::uint32_t submitIndex = 0; submitIndex < submitCount; ++submitIndex) {
-            const auto& submit = submits[submitIndex];
-            for (std::uint32_t commandIndex = 0; commandIndex < submit.commandBufferCount; ++commandIndex) {
-                auto* command = reinterpret_cast<CommandBufferState*>(submit.pCommandBuffers[commandIndex]);
-                if (!gState.commandBuffers.contains(command) || !command->executable
-                    || command->device != device) {
-                    return VK_ERROR_INITIALIZATION_FAILED;
-                }
-                for (const auto& build : command->accelerationStructureBuildsKHR) {
-                    const VkResult buildResult = build.type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR
-                        ? bridgeInstanceAccelerationStructureBuildLocked(build)
-                        : bridgePrimitiveAccelerationStructureBuildLocked(build);
-                    if (buildResult == VK_ERROR_FEATURE_NOT_PRESENT
-                        && build.type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
-                        // RTX can submit a TLAS whose instance records still
-                        // contain NVIDIA-only/null child addresses even though
-                        // the real scene BLAS builds in the same command buffer
-                        // are valid.  Leave that TLAS unbuilt here so the
-                        // identity-transform fallback below can populate the
-                        // same object from those completed real BLASes.
-                        if (rayTracingTraceEnabled()) {
-                            std::fprintf(
-                                stderr,
-                                "imb-vulkan-icd: deferring unsupported scene TLAS build to Metal BLAS fallback dst=%p\n",
-                                static_cast<void*>(build.destination)
-                            );
-                        }
-                        continue;
-                    }
-                    if (buildResult != VK_SUCCESS) return buildResult;
-                }
-            }
-        }
-    }
-
     // Isaac RTX creates the real scene TLAS object but leaves its descriptors
     // null when its NVIDIA-only scene-instance producer is unavailable.  The
     // scene BLASes above still contain the real Hydra geometry and are now
-    // built by Metal.  Place those real BLASes into the existing TLAS using
-    // identity transforms (the explicit validation stage is world-aligned),
-    // then route the primary 1280x720 trace through Metal's intersector.
+    // built by Metal. Match the visible USD Mesh manifest to those BLASes,
+    // apply the authored world transforms, exclude renderer-internal BLASes,
+    // and route viewport or camera-render-product traces through Metal.
     if (mainSceneRayTrace != nullptr
         && gState.bridge != nullptr
         && (gState.bridge->capabilities().bits & IMB_CAP_METAL_RAY_DISPATCH) != 0) {
@@ -11452,6 +13518,12 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
         } else if (fallbackResult != VK_ERROR_FEATURE_NOT_PRESENT) {
             return fallbackResult;
         }
+    }
+    std::vector<const RecordedRayTraceKHR*> metalRayTraces;
+    if (metalRayTrace == mainSceneRayTrace && !sceneRayTraces.empty()) {
+        metalRayTraces = sceneRayTraces;
+    } else if (metalRayTrace != nullptr) {
+        metalRayTraces.push_back(metalRayTrace);
     }
 
     // NV ray-tracing commands are deliberately never acknowledged as complete
@@ -11501,23 +13573,52 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
             }
             const std::uint64_t bridgeFence = gState.bridge->submitNoop();
             gState.bridge->waitFence(bridgeFence);
-            for (std::uint32_t submitIndex = 0; submitIndex < submitCount; ++submitIndex) {
+            // These null-TLAS initialization submits can contain RTX work the
+            // bridge deliberately does not execute. Advancing a timeline
+            // semaphore directly to Kit's requested value would report that
+            // all of that work completed and can release dependent TaskGroups
+            // too early. Preserve the conservative one-step completion used by
+            // this fallback path; ordinary UI submissions below use the exact
+            // VkTimelineSemaphoreSubmitInfo values after their Metal fence.
+            for (std::uint32_t submitIndex = 0;
+                 submitIndex < submitCount;
+                 ++submitIndex) {
                 const auto& submit = submits[submitIndex];
-                for (std::uint32_t index = 0; index < submit.waitSemaphoreCount; ++index) {
-                    auto* semaphore = objectState<SemaphoreState>(submit.pWaitSemaphores[index]);
-                    if (gState.semaphores.contains(semaphore) && !semaphore->timeline) {
+                for (std::uint32_t index = 0;
+                     index < submit.waitSemaphoreCount;
+                     ++index) {
+                    auto* semaphore = objectState<SemaphoreState>(
+                        submit.pWaitSemaphores[index]
+                    );
+                    if (gState.semaphores.contains(semaphore)
+                        && !semaphore->timeline) {
                         semaphore->signaled = false;
-                        const VkResult syncResult = syncSemaphoreToExternalFDLocked(semaphore);
-                        if (syncResult != VK_SUCCESS) return syncResult;
                     }
                 }
-                for (std::uint32_t index = 0; index < submit.signalSemaphoreCount; ++index) {
-                    auto* semaphore = objectState<SemaphoreState>(submit.pSignalSemaphores[index]);
+                for (std::uint32_t index = 0;
+                     index < submit.signalSemaphoreCount;
+                     ++index) {
+                    auto* semaphore = objectState<SemaphoreState>(
+                        submit.pSignalSemaphores[index]
+                    );
                     if (gState.semaphores.contains(semaphore)) {
                         semaphore->signaled = true;
                         if (semaphore->timeline) ++semaphore->value;
-                        const VkResult syncResult = syncSemaphoreToExternalFDLocked(semaphore);
-                        if (syncResult != VK_SUCCESS) return syncResult;
+                        if (semaphoreTraceEnabled()) {
+                            std::fprintf(
+                                stderr,
+                                "imb-vulkan-icd: semaphore conservative null-TLAS completion handle=%p timeline=%d value=%llu submit=%u signal=%u\n",
+                                static_cast<void*>(semaphore),
+                                semaphore->timeline ? 1 : 0,
+                                static_cast<unsigned long long>(
+                                    semaphore->timeline
+                                        ? semaphore->value
+                                        : (semaphore->signaled ? 1U : 0U)
+                                ),
+                                submitIndex,
+                                index
+                            );
+                        }
                     }
                 }
             }
@@ -11543,11 +13644,16 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
 
-    if (metalRayTrace != nullptr) {
+    if (!metalRayTraces.empty()) {
         if (!gState.bridge
             || (gState.bridge->capabilities().bits & IMB_CAP_METAL_RAY_DISPATCH) == 0) {
             return VK_ERROR_FEATURE_NOT_PRESENT;
         }
+        for (const auto* currentRayTrace : metalRayTraces) {
+        // A single Kit queue submit can contain both the interactive viewport
+        // and one or more Camera Render Products. Process each recognized
+        // scene trace instead of silently retaining only the first dispatch.
+        metalRayTrace = currentRayTrace;
         ImageState* targetImage = nullptr;
         AccelerationStructureKHRState* topLevel = nullptr;
         for (auto* set : metalRayTrace->descriptorSets) {
@@ -11633,19 +13739,90 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
             if (memoryResult != VK_SUCCESS) return memoryResult;
             const VkResult imageResult = ensureImageBackingLocked(targetImage);
             if (imageResult != VK_SUCCESS) return imageResult;
+            const bool isSceneRayTrace = std::find(
+                sceneRayTraces.begin(),
+                sceneRayTraces.end(),
+                metalRayTrace
+            ) != sceneRayTraces.end();
+            const bool isViewportSceneRayTrace = isSceneRayTrace
+                && metalRayTrace->width == 1280
+                && metalRayTrace->height == 720;
+            const std::optional<BridgeRayCamera> liveCamera =
+                isSceneRayTrace
+                ? readLiveCameraState()
+                : std::nullopt;
+            if (rayTracingTraceEnabled() && liveCamera.has_value()) {
+                static std::uint64_t lastLoggedCameraSequence = 0;
+                if (liveCamera->sequence != lastLoggedCameraSequence) {
+                    lastLoggedCameraSequence = liveCamera->sequence;
+                    std::fprintf(
+                        stderr,
+                        "imb-vulkan-icd: live Kit camera sequence=%llu position=(%.3f,%.3f,%.3f) forward=(%.3f,%.3f,%.3f) fov=%.4f near=%.4f far=%.1f\n",
+                        static_cast<unsigned long long>(liveCamera->sequence),
+                        liveCamera->position[0],
+                        liveCamera->position[1],
+                        liveCamera->position[2],
+                        liveCamera->forward[0],
+                        liveCamera->forward[1],
+                        liveCamera->forward[2],
+                        liveCamera->verticalFOVRadians,
+                        liveCamera->nearDistance,
+                        liveCamera->farDistance
+                    );
+                    if (liveCamera->hasSphereLight) {
+                        std::fprintf(
+                            stderr,
+                            "imb-vulkan-icd: live USD SphereLight position=(%.3f,%.3f,%.3f) color=(%.3f,%.3f,%.3f) intensity=%.3f radius=%.3f\n",
+                            liveCamera->sphereLightPosition[0],
+                            liveCamera->sphereLightPosition[1],
+                            liveCamera->sphereLightPosition[2],
+                            liveCamera->sphereLightColor[0],
+                            liveCamera->sphereLightColor[1],
+                            liveCamera->sphereLightColor[2],
+                            liveCamera->sphereLightIntensity,
+                            liveCamera->sphereLightRadius
+                        );
+                    }
+                    if (liveCamera->hasDistantLight) {
+                        std::fprintf(
+                            stderr,
+                            "imb-vulkan-icd: live USD DistantLight direction=(%.3f,%.3f,%.3f) color=(%.3f,%.3f,%.3f) intensity=%.3f angle=%.3fdeg\n",
+                            liveCamera->distantLightDirection[0],
+                            liveCamera->distantLightDirection[1],
+                            liveCamera->distantLightDirection[2],
+                            liveCamera->distantLightColor[0],
+                            liveCamera->distantLightColor[1],
+                            liveCamera->distantLightColor[2],
+                            liveCamera->distantLightIntensity,
+                            liveCamera->distantLightAngleDegrees
+                        );
+                    }
+                    if (liveCamera->hasDomeLight) {
+                        std::fprintf(
+                            stderr,
+                            "imb-vulkan-icd: live USD DomeLight color=(%.3f,%.3f,%.3f) intensity=%.3f\n",
+                            liveCamera->domeLightColor[0],
+                            liveCamera->domeLightColor[1],
+                            liveCamera->domeLightColor[2],
+                            liveCamera->domeLightIntensity
+                        );
+                    }
+                }
+            }
             const std::uint64_t bridgeFence = gState.bridge->submitRayTrace(
                 targetImage->resourceID,
                 topLevel->bridgeResourceID,
                 metalRayTrace->width,
                 metalRayTrace->height,
-                metalRayTrace == mainSceneRayTrace
+                isSceneRayTrace
                     ? UINT32_C(0xff302018)
                     : UINT32_C(0xff000000),
-                metalRayTrace == mainSceneRayTrace
+                isSceneRayTrace
                     ? (sceneGridPresentationEnabled()
                         ? UINT32_C(0xffe08c31)
                         : UINT32_C(0xffe08c30))
-                    : UINT32_C(0xff00ff00)
+                    : UINT32_C(0xff00ff00),
+                liveCamera.has_value() ? &*liveCamera : nullptr
             );
             gState.bridge->waitFence(bridgeFence);
             gState.bridge->readImage(
@@ -11653,11 +13830,38 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                 targetImage->memory->bytes.data() + targetImage->memoryOffset,
                 byteCount
             );
+            const char* sensorFramePath =
+                std::getenv("IMB_CAMERA_SENSOR_FRAME_FILE");
+            if (isSceneRayTrace && liveCamera.has_value()
+                && sensorFramePath != nullptr && sensorFramePath[0] != '\0'
+                && !gState.cameraSensorFrameAttempted) {
+                gState.cameraSensorFrameAttempted = true;
+                gState.cameraSensorFrameDevice = device;
+                gState.cameraSensorFramePublished = publishMetalCameraSensorFrame(
+                    sensorFramePath,
+                    targetImage->extent.width,
+                    targetImage->extent.height,
+                    targetImage->memory->bytes.data() + targetImage->memoryOffset
+                );
+                std::fprintf(
+                    stderr,
+                    "imb-vulkan-icd: Metal Camera sensor frame publication %s path=%s sourceResolution=%ux%u requestedResolution=%sx%s bytes=%llu\n",
+                    gState.cameraSensorFramePublished ? "passed" : "failed",
+                    sensorFramePath == nullptr ? "(unset)" : sensorFramePath,
+                    targetImage->extent.width,
+                    targetImage->extent.height,
+                    std::getenv("IMB_CAMERA_SENSOR_WIDTH") == nullptr
+                        ? "(source)" : std::getenv("IMB_CAMERA_SENSOR_WIDTH"),
+                    std::getenv("IMB_CAMERA_SENSOR_HEIGHT") == nullptr
+                        ? "(source)" : std::getenv("IMB_CAMERA_SENSOR_HEIGHT"),
+                    static_cast<unsigned long long>(byteCount)
+                );
+            }
             std::uint64_t hitPixelCount = 0;
             if (traceEnabled() || rayTracingTraceEnabled()) {
                 const auto* pixels = targetImage->memory->bytes.data()
                     + static_cast<std::size_t>(targetImage->memoryOffset);
-                const std::uint32_t missRGBA8 = metalRayTrace == mainSceneRayTrace
+                const std::uint32_t missRGBA8 = isSceneRayTrace
                     ? UINT32_C(0xff302018)
                     : UINT32_C(0xff000000);
                 std::array<std::uint8_t, 4> missBytes{};
@@ -11674,7 +13878,7 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                 byteCount
             );
             if (syncResult != VK_SUCCESS) return syncResult;
-            if (metalRayTrace == mainSceneRayTrace && scenePresentationEnabled()) {
+            if (isViewportSceneRayTrace && scenePresentationEnabled()) {
                 const auto* sceneBytes = targetImage->memory->bytes.data()
                     + static_cast<std::size_t>(targetImage->memoryOffset);
                 gState.latestMetalSceneDevice = device;
@@ -11686,18 +13890,15 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                 );
             }
             targetImage->dirty = true;
-            const VkResult semaphoreResult = completeQueueSubmitSynchronizationLocked(
-                device,
-                submitCount,
-                submits
-            );
-            if (semaphoreResult != VK_SUCCESS) return semaphoreResult;
-            if (fenceState != nullptr) fenceState->signaled = true;
             if (traceEnabled() || rayTracingTraceEnabled()) {
                 std::fprintf(
                     stderr,
                     "imb-vulkan-icd: submitted real Metal %s %ux%u tlas=%llu image=%llu byteCount=%llu hitPixels=%llu\n",
-                    metalRayTrace == mainSceneRayTrace ? "Isaac scene ray dispatch" : "ray probe",
+                    isSceneRayTrace
+                        ? (isViewportSceneRayTrace
+                            ? "Isaac viewport scene ray dispatch"
+                            : "Isaac camera render-product ray dispatch")
+                        : "ray probe",
                     metalRayTrace->width,
                     metalRayTrace->height,
                     static_cast<unsigned long long>(topLevel->bridgeResourceID),
@@ -11706,11 +13907,20 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                     static_cast<unsigned long long>(hitPixelCount)
                 );
             }
-            return VK_SUCCESS;
         } catch (const std::exception& error) {
             std::fprintf(stderr, "imb-vulkan-icd: Metal ray probe submit failed: %s\n", error.what());
             return VK_ERROR_DEVICE_LOST;
         }
+        // Continue with any additional Camera Render Product in this submit.
+        }
+        const VkResult semaphoreResult = completeQueueSubmitSynchronizationLocked(
+            device,
+            submitCount,
+            submits
+        );
+        if (semaphoreResult != VK_SUCCESS) return semaphoreResult;
+        if (fenceState != nullptr) fenceState->signaled = true;
+        return VK_SUCCESS;
     }
 
     if (!isMetalAddSubmit && !isMetalRasterSubmit && !isMetalUISubmit) {
@@ -11767,7 +13977,127 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
 
     if (!gState.bridge) return VK_ERROR_DEVICE_LOST;
     if (isMetalUISubmit) {
+        if (uiPresentationTraceEnabled() && uiCommands.size() > 1) {
+            std::fprintf(
+                stderr,
+                "imb-vulkan-icd: Kit UI submit candidates=%zu selectedDraws=%zu\n",
+                uiCommands.size(),
+                uiCommand->uiDraws.size()
+            );
+            for (const auto* candidate : uiCommands) {
+                const auto* candidateImage = candidate->framebuffer->colorImage;
+                std::fprintf(
+                    stderr,
+                    "imb-vulkan-icd: Kit UI candidate command=%p extent=%ux%u draws=%zu selected=%d\n",
+                    static_cast<const void*>(candidate),
+                    candidateImage->extent.width,
+                    candidateImage->extent.height,
+                    candidate->uiDraws.size(),
+                    candidate == uiCommand ? 1 : 0
+                );
+            }
+        }
         auto* image = uiCommand->framebuffer->colorImage;
+        const std::uint32_t rootWidth = image->extent.width;
+        const std::uint32_t rootHeight = image->extent.height;
+        const bool layoutReady = fullWorkspaceLayoutReady();
+        bool hasRightDock = false;
+        bool hasBottomDock = false;
+        std::uint64_t layoutSignature = 1469598103934665603ULL;
+        for (const auto& draw : uiCommand->uiDraws) {
+            const std::int64_t x = std::max<std::int64_t>(draw.scissor.offset.x, 0);
+            const std::int64_t y = std::max<std::int64_t>(draw.scissor.offset.y, 0);
+            const std::uint64_t width = draw.scissor.extent.width;
+            const std::uint64_t height = draw.scissor.extent.height;
+            const std::uint64_t components[] = {
+                static_cast<std::uint64_t>(x),
+                static_cast<std::uint64_t>(y),
+                width,
+                height,
+            };
+            for (const auto component : components) {
+                layoutSignature ^= component;
+                layoutSignature *= 1099511628211ULL;
+            }
+            hasRightDock = hasRightDock || (
+                x * 100 >= static_cast<std::int64_t>(rootWidth) * 60
+                && width * 100 <= static_cast<std::uint64_t>(rootWidth) * 45
+                && height * 100 >= static_cast<std::uint64_t>(rootHeight) * 25
+            );
+            hasBottomDock = hasBottomDock || (
+                y * 100 >= static_cast<std::int64_t>(rootHeight) * 50
+                && x * 100 <= static_cast<std::int64_t>(rootWidth) * 10
+                && width * 100 >= static_cast<std::uint64_t>(rootWidth) * 45
+                && height * 100 >= static_cast<std::uint64_t>(rootHeight) * 15
+            );
+        }
+        auto completeSkippedUISubmit = [&]() -> VkResult {
+            const VkResult semaphoreResult = completeQueueSubmitSynchronizationLocked(
+                device,
+                submitCount,
+                submits
+            );
+            if (semaphoreResult != VK_SUCCESS) return semaphoreResult;
+            if (fenceState != nullptr) {
+                fenceState->bridgeFenceID = 0;
+                fenceState->resultMemory = nullptr;
+                fenceState->resultImage = nullptr;
+                fenceState->submitted = false;
+                fenceState->signaled = true;
+            }
+            return VK_SUCCESS;
+        };
+        if (uiSnapshotLayoutChangesEnabled()) {
+            static std::unordered_set<std::uint64_t> capturedLayoutSignatures;
+            if (!capturedLayoutSignatures.insert(layoutSignature).second) {
+                return completeSkippedUISubmit();
+            }
+            std::fprintf(
+                stderr,
+                "imb-vulkan-icd: snapshot Kit UI root %ux%u draws=%zu target=%llu rightDock=%d bottomDock=%d signature=%#llx\n",
+                rootWidth,
+                rootHeight,
+                uiCommand->uiDraws.size(),
+                static_cast<unsigned long long>(image->resourceID),
+                hasRightDock ? 1 : 0,
+                hasBottomDock ? 1 : 0,
+                static_cast<unsigned long long>(layoutSignature)
+            );
+        }
+        if (fullWorkspaceOnlyEnabled()) {
+            if (!layoutReady || !hasRightDock || !hasBottomDock) {
+                static std::uint64_t lastSkippedLayoutSignature = 0;
+                if (uiPresentationTraceEnabled()
+                    && layoutSignature != lastSkippedLayoutSignature) {
+                    lastSkippedLayoutSignature = layoutSignature;
+                    std::fprintf(
+                        stderr,
+                        "imb-vulkan-icd: skipped Kit UI root %ux%u draws=%zu layoutReady=%d rightDock=%d bottomDock=%d signature=%#llx\n",
+                        rootWidth,
+                        rootHeight,
+                        uiCommand->uiDraws.size(),
+                        layoutReady ? 1 : 0,
+                        hasRightDock ? 1 : 0,
+                        hasBottomDock ? 1 : 0,
+                        static_cast<unsigned long long>(layoutSignature)
+                    );
+                }
+                return completeSkippedUISubmit();
+            }
+            static std::uint64_t lastSelectedLayoutSignature = 0;
+            if (uiPresentationTraceEnabled()
+                && layoutSignature != lastSelectedLayoutSignature) {
+                lastSelectedLayoutSignature = layoutSignature;
+                std::fprintf(
+                    stderr,
+                    "imb-vulkan-icd: selected Isaac Full workspace root %ux%u draws=%zu signature=%#llx\n",
+                    rootWidth,
+                    rootHeight,
+                    uiCommand->uiDraws.size(),
+                    static_cast<unsigned long long>(layoutSignature)
+                );
+            }
+        }
         auto* vertexBuffer = uiCommand->vertexBuffer;
         auto* indexBuffer = uiCommand->indexBuffer;
         if (image == nullptr || image->format != VK_FORMAT_B8G8R8A8_UNORM
@@ -11918,25 +14248,58 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                 uiCommand->clearRGBA8,
                 bridgeDraws
             );
-            for (std::uint32_t submitIndex = 0; submitIndex < submitCount; ++submitIndex) {
-                const auto& submit = submits[submitIndex];
-                for (std::uint32_t index = 0; index < submit.waitSemaphoreCount; ++index) {
-                    auto* semaphore = objectState<SemaphoreState>(submit.pWaitSemaphores[index]);
-                    if (gState.semaphores.contains(semaphore) && !semaphore->timeline) semaphore->signaled = false;
-                }
-                for (std::uint32_t index = 0; index < submit.signalSemaphoreCount; ++index) {
-                    auto* semaphore = objectState<SemaphoreState>(submit.pSignalSemaphores[index]);
-                    if (gState.semaphores.contains(semaphore)) {
-                        semaphore->signaled = true;
-                        if (semaphore->timeline) ++semaphore->value;
-                    }
-                }
-            }
             // Kit reuses its ring buffers immediately after the queue fence is
             // observed. Complete the Metal work here so every presented UI
             // frame is durable on the host and the shared upload range cannot
             // be overwritten while Metal is still reading it.
             gState.bridge->waitFence(bridgeFence);
+            // A Kit UI submit can also contain RTX command buffers that this
+            // fallback path does not execute. Complete its visible Metal UI
+            // work conservatively instead of advancing a timeline directly to
+            // the submit's final value and releasing those RTX dependencies
+            // before their producer exists.
+            for (std::uint32_t submitIndex = 0;
+                 submitIndex < submitCount;
+                 ++submitIndex) {
+                const auto& submit = submits[submitIndex];
+                for (std::uint32_t index = 0;
+                     index < submit.waitSemaphoreCount;
+                     ++index) {
+                    auto* semaphore = objectState<SemaphoreState>(
+                        submit.pWaitSemaphores[index]
+                    );
+                    if (gState.semaphores.contains(semaphore)
+                        && !semaphore->timeline) {
+                        semaphore->signaled = false;
+                    }
+                }
+                for (std::uint32_t index = 0;
+                     index < submit.signalSemaphoreCount;
+                     ++index) {
+                    auto* semaphore = objectState<SemaphoreState>(
+                        submit.pSignalSemaphores[index]
+                    );
+                    if (gState.semaphores.contains(semaphore)) {
+                        semaphore->signaled = true;
+                        if (semaphore->timeline) ++semaphore->value;
+                        if (semaphoreTraceEnabled()) {
+                            std::fprintf(
+                                stderr,
+                                "imb-vulkan-icd: semaphore conservative UI completion handle=%p timeline=%d value=%llu submit=%u signal=%u\n",
+                                static_cast<void*>(semaphore),
+                                semaphore->timeline ? 1 : 0,
+                                static_cast<unsigned long long>(
+                                    semaphore->timeline
+                                        ? semaphore->value
+                                        : (semaphore->signaled ? 1U : 0U)
+                                ),
+                                submitIndex,
+                                index
+                            );
+                        }
+                    }
+                }
+            }
             if (fenceState != nullptr) {
                 fenceState->bridgeFenceID = 0;
                 fenceState->resultMemory = nullptr;
@@ -11944,14 +14307,16 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                 fenceState->submitted = false;
                 fenceState->signaled = true;
             }
-            if (traceEnabled()) {
+            if (uiPresentationTraceEnabled()) {
                 std::fprintf(
                     stderr,
-                    "imb-vulkan-icd: submitted real Kit UI frame %ux%u draws=%zu target=%llu\n",
+                    "imb-vulkan-icd: submitted real Kit UI frame %ux%u draws=%zu target=%llu fence=%llu signature=%#llx\n",
                     image->extent.width,
                     image->extent.height,
                     bridgeDraws.size(),
-                    static_cast<unsigned long long>(image->resourceID)
+                    static_cast<unsigned long long>(image->resourceID),
+                    static_cast<unsigned long long>(bridgeFence),
+                    static_cast<unsigned long long>(layoutSignature)
                 );
             }
             return VK_SUCCESS;

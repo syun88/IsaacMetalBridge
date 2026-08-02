@@ -63,6 +63,8 @@ XPC is host-only control IPC among the CLI/API server, image service, network se
 
 Vsock is verified. Every VM gets `VZVirtioSocketDeviceConfiguration`. The containerization helper connects to the built-in guest agent over vsock, and Apple container exposes `ContainerClient.dial(id:port:)` -> `ContainersService.dial` -> `RuntimeClient.dial` -> `RuntimeService.dial` -> `LinuxContainer.dialVsock`.
 
+For finite `--/app/quitAfter` runs, Kit may close that full-duplex stream after reading a final request but before the host writes its response. `imb-container-host --wait-exit` recognizes only the resulting EOF/EPIPE/connection-reset cases and accepts them only after `ClientProcess.wait()` independently returns init status zero; malformed protocol data and nonzero exits still fail the launcher.
+
 The public Apple-container route is **host-dials-guest**. It does not expose a guest-initiated host listener. The first production IMB transport should therefore run a guest listener and let `imb-host` obtain the connected file descriptor through this route. Any reverse direction requires a separately reviewed change.
 
 ### VirtIO and shared memory
@@ -74,7 +76,7 @@ VirtIO block, network, socket, console, and filesystem devices are verified. A d
 1. **Preferred VM hook:** implement a `VZInstanceExtension` whose `configureVZ` adds only a supported, documented VZ device and whose lifecycle methods own host resources. This hook is before `VZVirtualMachineConfiguration.validate()`.
 2. **Required Apple-container wiring:** the audited `LinuxContainer.create()` does not forward an extension from `RuntimeService.bootstrap`. A narrow wrapper around `VZVirtualMachineManager` at the construction site in `RuntimeService.bootstrap`, or an upstream `LinuxContainer.Configuration.extensions` property, must append the extension to the `VMConfiguration`.
 3. **Host service:** a core/auxiliary Apple-container plugin can host command decoding and Metal resources via XPC. This is useful process isolation but does not itself attach a VM device.
-4. **Implemented no-patch transport:** `imb-container-host` imports `ContainerAPIClient`, calls `ContainerClient.dial(id:port:)`, and serves IMB over the returned full-duplex `FileHandle`. The Linux probe binds `AF_VSOCK`/`VMADDR_CID_ANY`. Protocol 1.10, real Metal sparse-image mappings, generic/texel-buffer compute, translated SPIR-V pipeline creation, fixed raster, Kit UI raster, Metal acceleration structures/ray dispatch, fences, and frame output passed through this path without modifying Apple source.
+4. **Implemented no-patch transport:** `imb-container-host` imports `ContainerAPIClient`, calls `ContainerClient.dial(id:port:)`, and serves IMB over the returned full-duplex `FileHandle`. The Linux probe binds `AF_VSOCK`/`VMADDR_CID_ANY`. Protocol 1.13, real Metal sparse-image mappings, generic/texel-buffer compute, translated SPIR-V pipeline creation, fixed raster, Kit UI raster, bounded visible-USD-Mesh-matched Metal acceleration structures, active-viewport-camera ray dispatch and RGB sensor publication, live SphereLight/DistantLight/DomeLight state, fences, and frame output passed through this path without modifying Apple source.
 5. **Future bulk data:** only after measurement, investigate a supported VZ memory/file-sharing mechanism. Do not label VirtioFS as shared GPU memory.
 
 ## Patch policy

@@ -1,0 +1,510 @@
+# Apple container integration
+
+IsaacMetalBridge is an unofficial experimental compatibility layer.
+It is not affiliated with, endorsed by, sponsored by, or supported by Apple Inc. or NVIDIA Corporation.
+
+## Audited revisions
+
+- `apple/container`: `14233cee65486c1ada2b82403c17d1236a9176c2`
+- pinned `apple/containerization` dependency: version `0.37.0`, revision `1d5641ff962456df021283505eaa6a701d828192`
+
+The first revision is the Git submodule. The second is recorded in the submodule's `Package.resolved`. Findings below come from these exact sources.
+
+## Lifecycle and source map
+
+| Area | Source path | Type/function | Verified role |
+|---|---|---|---|
+| API lifecycle | `Sources/Services/ContainerAPIService/Server/Containers/ContainersService.swift` | `ContainersService.create`, `bootstrap`, `dial`, `delete` | Persists container state, starts the selected runtime plugin, forwards lifecycle calls, returns the vsock file descriptor. |
+| Runtime client | `Sources/Services/Runtime/RuntimeClient/RuntimeClient.swift` | `RuntimeClient.create`, `bootstrap`, `dial` | Opens the per-container XPC endpoint and sends typed routes. |
+| Runtime routes | `Sources/Services/Runtime/RuntimeClient/RuntimeRoutes.swift` | `RuntimeRoutes` | Defines lifecycle, process, file, and `dial` routes. |
+| Linux helper | `Sources/Plugins/RuntimeLinux/RuntimeLinuxHelper+Start.swift` | `RuntimeLinuxHelper.Start.run` | Creates endpoint and anonymous XPC servers and binds route handlers. |
+| VM bootstrap | `Sources/Services/RuntimeLinux/Server/RuntimeService.swift` | `RuntimeService.bootstrap` | Builds bundle/network state, creates `VZVirtualMachineManager`, constructs `LinuxContainer`, and calls `container.create()`. |
+| Workload start | same file | `RuntimeService.startProcess`, `startInitProcess` | Starts the real OCI process after the VM is booted. |
+| Host-to-guest vsock | same file | `RuntimeService.dial` | Calls `LinuxContainer.dialVsock` and returns a file handle over XPC. |
+| Image lifecycle | `Sources/Services/ContainerImagesService/Server/ImagesService.swift` | `pull`, `unpack`, `getImageSnapshot` | Resolves OCI content and snapshots. |
+| Snapshot storage | `Sources/Services/ContainerImagesService/Server/SnapshotStore.swift` | `unpack`, `get`, `delete` | Materializes and locates root filesystem snapshots. |
+| XPC implementation | `Sources/ContainerXPC/XPCClient.swift`, `XPCServer.swift`, `XPCMessage.swift` | `XPCClient.send`, `XPCServer.listen`, `XPCMessage` | Host process IPC, replies, data, endpoints, and file-descriptor passing. |
+| Plugin discovery | `Sources/ContainerPlugin/PluginLoader.swift` | `findPlugins`, `registerWithLaunchd` | Finds configured plugins and registers launchd services. |
+| Plugin schema | `Sources/ContainerPlugin/PluginConfig.swift` | `PluginConfig.DaemonPluginType` | Supports runtime, network, core, and auxiliary XPC services. |
+
+## Virtualization.framework configuration
+
+The following paths are in the pinned `apple/containerization` dependency:
+
+| Source path | Type/function | Verified behavior |
+|---|---|---|
+| `Sources/Containerization/VZVirtualMachineManager.swift` | `VZVirtualMachineManager.create` | Clamps CPU/RAM and creates `VZVirtualMachineInstance`. |
+| `Sources/Containerization/VZVirtualMachineInstance.swift` | `Configuration.toVZ` | Creates `VZVirtualMachineConfiguration`, attaches devices, calls extensions, validates configuration. |
+| same file | `VZInstanceExtension.configureVZ` | Public pre-creation extension hook for mutating the VZ configuration. |
+| same file | `VZVirtualMachineInstance.didCreate/willStop` extension calls | Host lifecycle hooks before VM start and stop. |
+| `Sources/Containerization/VZVirtualMachine+Helpers.swift` | `connect`, `listen`, `waitForAgent` | Operates `VZVirtioSocketDevice`; the built-in agent is reached over vsock. |
+| `Sources/Containerization/Mount.swift` | `Mount.configure` | Adds VirtIO block storage; VirtioFS is assembled by `Configuration.toVZ`. |
+| `Sources/Containerization/LinuxContainer.swift` | `LinuxContainer.create` | Builds the common `VMConfiguration` passed to the VMM. |
+
+`Configuration.toVZ` currently adds:
+
+- `VZVirtioEntropyDeviceConfiguration`
+- `VZVirtioSocketDeviceConfiguration`
+- VirtIO console/serial output
+- `VZVirtioNetworkDeviceConfiguration` instances
+- `VZVirtioBlockDeviceConfiguration` for block mounts
+- `VZVirtioFileSystemDeviceConfiguration` for shared directories/Rosetta
+- `VZGenericPlatformConfiguration`
+
+No `graphicsDevices` assignment or GPU device configuration exists in the audited source.
+
+## Communication mechanisms
+
+### XPC
+
+XPC is host-only control IPC among the CLI/API server, image service, network service, and per-container runtime helper. `XPCMessage` can pass file descriptors and anonymous endpoints.
+
+### Vsock
+
+Vsock is verified. Every VM gets `VZVirtioSocketDeviceConfiguration`. The containerization helper connects to the built-in guest agent over vsock, and Apple container exposes `ContainerClient.dial(id:port:)` -> `ContainersService.dial` -> `RuntimeClient.dial` -> `RuntimeService.dial` -> `LinuxContainer.dialVsock`.
+
+The public Apple-container route is **host-dials-guest**. It does not expose a guest-initiated host listener. The first production IMB transport should therefore run a guest listener and let `imb-host` obtain the connected file descriptor through this route. Any reverse direction requires a separately reviewed change.
+
+### VirtIO and shared memory
+
+VirtIO block, network, socket, console, and filesystem devices are verified. A dedicated GPU VirtIO device and cross-VM shared-memory transport are not present. VirtioFS copies/shares files; it is not evidence of coherent GPU command memory.
+
+## GPU bridge insertion locations
+
+1. **Preferred VM hook:** implement a `VZInstanceExtension` whose `configureVZ` adds only a supported, documented VZ device and whose lifecycle methods own host resources. This hook is before `VZVirtualMachineConfiguration.validate()`.
+2. **Required Apple-container wiring:** the audited `LinuxContainer.create()` does not forward an extension from `RuntimeService.bootstrap`. A narrow wrapper around `VZVirtualMachineManager` at the construction site in `RuntimeService.bootstrap`, or an upstream `LinuxContainer.Configuration.extensions` property, must append the extension to the `VMConfiguration`.
+3. **Host service:** a core/auxiliary Apple-container plugin can host command decoding and Metal resources via XPC. This is useful process isolation but does not itself attach a VM device.
+4. **Implemented no-patch transport:** `imb-container-host` imports `ContainerAPIClient`, calls `ContainerClient.dial(id:port:)`, and serves IMB over the returned full-duplex `FileHandle`. The Linux probe binds `AF_VSOCK`/`VMADDR_CID_ANY`. Protocol 1.10, real Metal sparse-image mappings, generic/texel-buffer compute, translated SPIR-V pipeline creation, fixed raster, Kit UI raster, Metal acceleration structures/ray dispatch, fences, and frame output passed through this path without modifying Apple source.
+5. **Future bulk data:** only after measurement, investigate a supported VZ memory/file-sharing mechanism. Do not label VirtioFS as shared GPU memory.
+
+## Patch policy
+
+The submodule remains read-only. If device wiring becomes necessary, identify exact source functions above, generate a patch against the pinned commit, store it under `patches/apple-container/`, and apply/reverse it with the repository scripts. No Apple-source patch is required for the verified vsock/Metal path.
+# Architecture
+
+IsaacMetalBridge is an unofficial experimental compatibility layer.
+It is not affiliated with, endorsed by, sponsored by, or supported by Apple Inc. or NVIDIA Corporation.
+
+Rendering blocks distinguish the verified fixed-triangle and Kit UI slices from future RTX/general rendering.
+
+## 1. Full system architecture
+
+```mermaid
+flowchart TB
+  subgraph macOS["Apple Silicon macOS"]
+    AC["Apple container services"]
+    HB["imb-host"]
+    MB["Metal backend"]
+    GPU["Apple GPU"]
+    VW["Native macOS viewer"]
+  end
+  subgraph VM["Linux ARM64 VM"]
+    IS["Real Isaac Sim"]
+    KIT["Omniverse Kit / Carbonite / USD / PhysX"]
+    GC["Guest Vulkan/CUDA compatibility layers"]
+    GP["IMB guest endpoint"]
+  end
+  IS --> KIT --> GC --> GP
+  AC --> VM
+  GP <-->|"IMB 1.7 over host-dialed vsock (verified)"| HB
+  HB --> MB --> GPU
+  MB -->|"atomic real Kit UI frames"| VW
+```
+
+## 2. Isaac Sim execution path
+
+```mermaid
+sequenceDiagram
+  participant CLI as container CLI/API
+  participant RT as RuntimeService
+  participant VZ as Linux VM
+  participant Kit as Isaac Sim/Kit
+  participant Bridge as IMB compatibility layer
+  CLI->>RT: create + bootstrap
+  RT->>VZ: configure and start VM
+  RT->>VZ: start OCI process
+  VZ->>Kit: execute real ARM64 launcher
+  Kit->>Bridge: load/call GPU-facing API
+  Bridge-->>Kit: implemented result or explicit unsupported error
+```
+
+## 3. GPU command path
+
+```mermaid
+flowchart LR
+  API["IMB probe / Vulkan / Kit UI / CUDA startup calls"] --> VAL["Guest validation"]
+  VAL --> ENC["IMB command encoder"]
+  ENC --> Q["Transport queue"]
+  Q --> DEC["Host decoder"]
+  DEC --> CAP["Capability manager"]
+  DEC --> RM["Resource manager"]
+  DEC --> METAL["Metal command encoder (compute + narrow raster verified)"]
+  METAL --> CQ["MTLCommandQueue"]
+```
+
+## 4. Host/guest communication
+
+```mermaid
+flowchart LR
+  G["Linux AF_VSOCK listener / probe"] --> CP["Control plane"]
+  CP -->|"HELLO, capabilities, resources, errors"| FR["IMB framing"]
+  DP["Data plane"] -->|"buffers + RGBA8/BGRA8 + Kit UI draws verified"| FR
+  FR <-->|"local pipes and Apple host-dialed vsock verified"| H["Swift host session"]
+```
+
+Apple's audited API supports the host dialing a guest vsock port. `imb-container-host` now uses that exact API and has completed a real ARM64 VM session. Shared memory and a custom VirtIO GPU remain unverified mechanisms.
+
+## 5. Vulkan bridge prototype
+
+```mermaid
+flowchart LR
+  VKL["Guest Vulkan loader / real Kit"] --> ICD["IMB Vulkan startup ICD + exact compute/raster paths"]
+  ICD --> CAPS["Truthful Vulkan capability filter"]
+  ICD --> SPV["Exact ADD_U32 SPIR-V recognition"]
+  ICD --> UI["Exact tested Kit UI pipeline recognition"]
+  ICD --> P["IMB protocol"]
+  P --> MSL["MSL/shader library"]
+  P --> MR["Metal resources and commands"]
+```
+
+The ICD must advertise only implemented limits/features and return standard errors for unsupported behavior.
+
+## 6. CUDA startup bridge and future execution path
+
+```mermaid
+flowchart LR
+  APP["Kit / PhysX / Warp"] --> CUD["Guest CUDA Driver ABI"]
+  CUD --> CTX["Context/module/memory model"]
+  CTX --> PTX["PTX strategy: unresolved"]
+  CTX --> STR["Streams/events mapping"]
+  PTX --> IMB["IMB data/control plane"]
+  STR --> IMB
+  IMB --> MET["Metal compute"]
+```
+
+The tested context/memory/stream/event/module and private export-table startup calls are implemented locally in the guest shim. CUDA kernel execution, PTX conversion, and Metal stream semantics remain unresolved; GPU PhysX may remain blocked.
+
+## 7. Resource lifecycle
+
+```mermaid
+stateDiagram-v2
+  [*] --> Negotiated: HELLO
+  Negotiated --> Allocated: CREATE_RESOURCE
+  Allocated --> Submitted: SUBMIT_COMMAND
+  Submitted --> Signaled: WAIT_FENCE
+  Signaled --> Allocated: reuse
+  Allocated --> Destroyed: DESTROY_RESOURCE
+  Destroyed --> [*]: SHUTDOWN/disconnect
+```
+
+Resource and fence IDs are host-issued. Disconnect destroys session-owned state. Protocol 1.7 buffer resources are real shared `MTLBuffer` objects; RGBA8/BGRA8 images are real shared `MTLTexture` objects; translated compute pipeline resources are real `MTLComputePipelineState` objects; primitive/instance acceleration resources own real Metal acceleration structures; and compute, raster, UI, and ray fences correspond to real committed Metal command buffers. The host can atomically capture completed Kit UI targets for the native viewer. General descriptor/dispatch transport, additional texture formats, and general RTX/Hydra shader semantics remain unimplemented.
+
+## 8. Rendering flow
+
+```mermaid
+flowchart LR
+  KIT["Real Isaac Kit"] --> UI["Recognized UI draw stream"]
+  KIT --> KHR["KHR scene BLAS and trace records"]
+  KHR --> AS["Real Metal primitive and instance AS"]
+  AS --> RAY["Metal intersection dispatch"]
+  RAY --> VP["Kit 1280x720 viewport ring"]
+  VP --> UI
+  UI --> MET["Metal indexed UI raster"]
+  MET --> CAP["Atomic PPM frame capture"]
+  CAP --> VIEW["Native macOS viewer (verified)"]
+  VIEW --> EVT["Bounded input-record file"]
+  EVT --> INJ["Kit Carbonite input provider"]
+  INJ --> KIT
+```
+
+## Component boundaries
+
+Guest: the verified probe/listener, Vulkan ICD, CUDA startup shim, and Kit input extension today; NVML remains future work. Transport: bounded framing and verified vsock for GPU work plus a per-run read-only bind-mounted input-record file, with bulk-transfer mechanisms still future work. Host: decoder, capability manager, real buffer/image/pipeline/acceleration-structure resource manager, frame capture, and interactive native viewer. Metal: shared buffers, RGBA8/BGRA8 textures, translated compute pipeline creation, primitive/instance acceleration structures, bounded ray dispatch, one fixed raster pipeline, and the exact tested Kit UI pipeline. General translated dispatch, live Kit camera/scene transforms, translated hit/miss semantics, materials, lighting, and RTX sensors remain future work.
+# Feasibility matrix
+
+IsaacMetalBridge is an unofficial experimental compatibility layer.
+It is not affiliated with, endorsed by, sponsored by, or supported by Apple Inc. or NVIDIA Corporation.
+
+Classifications describe the current repository at the audited revisions. “Architecturally possible” is not a working implementation claim.
+
+| Capability | Classification | Evidence / missing work |
+|---|---|---|
+| Linux ARM64 Isaac Sim 6.0.1 package/image | Verified startup profile | Official ARM64 image is loaded; the real compatibility checker and official base experience both reached `app ready` under Apple `container`. |
+| Apple `container` ARM64 Linux VM | Verified available | Apple `container` 1.1.0 is installed; its service is running and a real guest returned `aarch64`. |
+| CPU PhysX | Startup verified, results unvalidated | The real PhysX extensions start in the base experience; simulation correctness still needs workload-level validation. |
+| Vulkan loader/device discovery | Verified prototype only | Khronos Linux loader and real Kit load the IMB manifest/library and enumerate `IsaacMetalBridge NVIDIA-compat (Apple M4)`. The ICD remains non-conformant. |
+| Vulkan compute commands | Verified narrow prototype | Standard Vulkan buffer/memory, descriptor, one exactly recognized SPIR-V compute pipeline, command buffer, queue submission, fence, and readback produced `[6,7,8,9]` through vsock and real Metal. |
+| Vulkan raster commands | Verified narrow prototypes | The fixed RGBA8 pipeline produced a checked 64×64 triangle PNG. The exact observed Kit UI pipeline also produces real application chrome through Metal. General graphics remain absent. |
+| Vulkan ray tracing | Verified narrow compatibility slice | The probe and real Isaac trace build KHR BLAS/TLAS compatibility objects backed by Metal and dispatch real intersection rays. General Vulkan RT shader semantics are not implemented. |
+| Vulkan sparse images | Safety-gated, not implemented | Sparse buffers remain available, but sparse image residency is hidden by default. NVIDIA `Simple Grid` geometry now loads and dispatches safely from startup; its three source PNGs resolve, but the texture processor cannot make them resident, so the familiar wireframe material remains incomplete. |
+| Metal ray tracing | Verified execution on current host | Real primitive/instance acceleration structures and a 64×64 probe plus 1280×720 real-Isaac scene dispatch execute on Apple M4. |
+| CUDA Driver API | Verified startup prototype | The tested Driver API/private export-table subset lets Kit, PhysX startup, and Warp discover one compatibility device; general kernel execution is absent. |
+| PTX conversion | Unknown | Toolchain, licensing, correctness, and feature coverage need research. |
+| CUDA streams | Startup handles only | Stream create/query/synchronize/destroy calls are implemented for startup, without general CUDA ordering or kernel semantics. |
+| CUDA events | Startup handles only | Event create/record/query/synchronize/destroy calls are implemented for startup, without CUDA timestamp semantics. |
+| NVML | Requires Linux guest modification | A compatibility library could answer a subset, but truthful telemetry mapping is undecided. |
+| GPU PhysX | Blocked by NVIDIA private technology | Depends on NVIDIA CUDA/GPU implementation details not exposed by this project. |
+| Warp | Device discovery verified | Warp 1.13.0 reports the IMB CUDA compatibility device; arbitrary Warp kernels are not validated. |
+| Isaac Lab | Unknown | Depends on Isaac Sim, Warp, PyTorch/CUDA, memory capacity, and training workloads. |
+| RTX Camera | Blocked by NVIDIA private technology | RTX renderer and sensor pipeline are not public Metal implementations. |
+| RTX LiDAR | Blocked by NVIDIA private technology | Requires NVIDIA RTX sensor/rendering behavior. |
+| GUI | Interactive chrome and validation viewport verified | A native macOS viewer shows the real Kit menus, panels, toolbar, Stage, Property, and Content UI, forwards pointer/keyboard input through Carbonite, and composites a non-black real-geometry Metal intersection result for the included validation stage. |
+| WebRTC | Out of scope | Requires a working renderer and networking validation first. |
+| Host/guest vsock | Verified available | `imb-container-host` uses Apple's `ContainerClient.dial`; a real ARM64 guest completed IMB 1.7 Metal compute, SPIR-V pipeline creation, fixed/UI raster, acceleration structures, ray dispatch, and final frame delivery over the returned full-duplex file handle. |
+| Metal buffer/compute primitive | Verified available | Real `MTLBuffer`, upload/readback, `ADD_U32` compute, and command-buffer fence produced `[6,7,8,9]` from `[1,2,3,4] + 5` on Apple M4, including through a standard Vulkan dispatch. |
+| Dedicated VirtIO GPU | Requires Apple container modification | No GPU device is configured in audited source; VZ extension wiring is needed and VZ support must exist. |
+| Shared-memory data plane | Unknown | No verified coherent shared-memory mechanism has been selected. |
+# Real Isaac Sim environment
+
+IsaacMetalBridge is an unofficial experimental compatibility layer.
+It is not affiliated with, endorsed by, sponsored by, or supported by Apple Inc. or NVIDIA Corporation.
+
+## Validation baseline
+
+The required research baseline is **NVIDIA Isaac Sim 6.0.1 for Linux aarch64**. NVIDIA publishes both a Linux aarch64 standalone package and the multi-architecture `nvcr.io/nvidia/isaac-sim:6.0.1` container. This is the real Isaac Sim distribution; the project does not create a substitute environment.
+
+Primary NVIDIA references:
+
+- [Download Isaac Sim](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/download.html)
+- [Quick Install](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/quick-install.html)
+- [Container Installation](https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_container.html)
+- [Isaac Sim Requirements](https://docs.isaacsim.omniverse.nvidia.com/6.0.0/installation/requirements.html)
+
+## Availability and support boundary
+
+Linux aarch64 availability is verified in NVIDIA's documentation. Apple Silicon compatibility is **not**. NVIDIA's documented aarch64 requirement for Isaac Sim 6.0 is DGX Spark, DGX OS 7, and an NVIDIA driver. NVIDIA also requires an RTX-capable NVIDIA GPU for the compatibility check. Apple GPU/Metal therefore cannot satisfy the published GPU contract without a new compatibility layer.
+
+## Installation methods
+
+1. **External standalone directory:** extract the official Linux aarch64 archive outside this repository, run NVIDIA's `post_install.sh` in its Linux guest, and point `ISAAC_SIM_PATH` to it.
+2. **External OCI image:** manage `nvcr.io/nvidia/isaac-sim:6.0.1` with the user's container/image store and set `IMB_ISAAC_IMAGE`. Do not export or copy the image into this Git tree.
+
+The setup script validates configuration only. It does not download, extract, authenticate to NGC, or accept licenses.
+
+## Container/image requirements
+
+- Linux `arm64`/`aarch64` manifest and user space
+- `/isaac-sim` layout for the official container
+- user-provided `ACCEPT_EULA=Y` only after the user has reviewed and accepted NVIDIA's terms
+- writable external cache, data, config, and log locations
+- outbound HTTPS or separately managed local asset packs
+- the IMB Vulkan ICD and CUDA startup shim for the currently implemented compatibility subset
+
+## Dependencies that must be preserved
+
+- Omniverse Kit and Carbonite plugins
+- PhysX and USD runtime
+- Isaac Sim Python 3.12 environment and extensions
+- glibc and Linux aarch64 dynamic loader expectations
+- the exact shared libraries shipped by NVIDIA
+
+## Expected first failure points
+
+1. **Guest startup:** verified for a minimal ARM64 guest and for a shell override in the real Isaac Sim image.
+2. **Dynamic loading:** the IMB-derived image now supplies the Vulkan ICD and CUDA startup library; NVML and `nvidia-smi` remain unavailable.
+3. **Compatibility checker:** it reaches `app ready`, but still reports an overall failure for the missing NVIDIA management stack. On the tested 32 GiB Mac, the launcher now assigns 24 GiB to the guest by default and Warp reports a 24 GiB compatibility device.
+4. **Kit startup:** the official Base and Full experiences reach `app ready`; the tested UI draw stream and bounded scene presentation reach Metal.
+5. **Feature startup:** Warp discovers the compatibility CUDA device and supported Vulkan compute/ray work reaches Metal, but general CUDA/PTX, GPU PhysX correctness, RTX materials/cameras/sensors, OptiX, and NGX require deeper implementation.
+
+## Milestone procedure
+
+```text
+Phase 0  container CLI/system verified
+Phase 1  uname -m == aarch64 in a real Linux guest
+Phase 2  official compatibility checker or Isaac Sim launcher genuinely executed
+Phase 3  first missing API/library/device call captured from real logs/traces
+Phase 4  official base experience reaches app ready through IMB
+```
+
+Record exact command, image/package digest, exit status, and unedited log location outside Git. A plausible launch narrative is not evidence.
+
+## Current result
+
+On 2026-07-29, Phases 0 through 4, the interactive Kit UI, sparse-image/compute probes, and the bounded Metal ray-validation milestone passed with Apple `container` 1.1.0. The official `nvcr.io/nvidia/isaac-sim:6.0.1` ARM64 image is the base of the derived image; its Omniverse Kit, Carbonite, PhysX, USD, Python, and Isaac extensions remain the real NVIDIA distribution. The IMB Vulkan ICD passes real loader/Metal storage-buffer and texel-buffer compute, transfer/image readback, sparse-image map/unmap, raster, KHR BLAS/TLAS, OPAQUE_FD, and ray-dispatch tests. It supplies the resource, descriptor, synchronization, timeline-semaphore, query-pool, and tested UI-raster subset needed during startup. The CUDA shim supplies the tested Driver API, virtual-memory, and private export-table startup surface. Warp reports CUDA Toolkit 12.9, Driver 12.8, and `cuda:0` as `IsaacMetalBridge CUDA-compat (Apple M4)`.
+
+The official `isaacsim.exp.base.kit` and Full `isaac-sim.sh` experiences load the real Isaac extension stack and report `app ready`. A targeted ARM virtual-counter shim handles the backwards-TSC path that previously aborted Full startup. Observed Kit UI vertex/index rings, texture, scissors, and indexed draws are executed by Metal and displayed in a native macOS window. Real scene BLAS geometry is built into Metal acceleration structures, intersected by Metal, and synchronized into Kit's viewport presentation ring. Isaac Sim base does not open a positional USD in this release, so `isaacmetalbridge.stage` opens only an explicitly selected stage through `omni.usd` during startup and logs its root and `/World` children. Without `--demo-scene` or `--simple-grid`, the launcher does not insert a diagnostic USD. The viewer returns mouse and keyboard records to a separate Kit extension that injects them through Carbonite's input-provider API. Use `ACCEPT_EULA=Y ./scripts/run-isaac-sim.sh --experience full --window --simple-grid`; the script never supplies EULA acceptance on the user's behalf.
+
+The boundary remains substantial: the non-black scene viewport uses a bridge-controlled fallback TLAS and scene-presentation camera/shading path. General scene transforms, live Kit camera state, translated RTX/Hydra shaders, complete materials/lighting, RTX sensor output, NVML, and `nvidia-smi` are absent; CUDA/PTX and GPU PhysX results are not generally implemented. Sparse image residency is enabled by default: Vulkan tile requirements and map/unmap calls reach real Metal sparse heaps and pass the container probe. `--simple-grid` caches the real root USDC and its three wireframe PNG dependencies under ignored `build/runtime`, mounts them read-only, and opens the root through the early startup extension. A verified Full run reported `/World` children `Looks`, `GroundPlane`, `SphereLight`, and `Environment`, presented a visible blue wire grid/axes in the native viewer, reached `app ready`, and exited zero. This presentation does not establish full RTX material equivalence. NVIDIA-only NGX/OptiX remain unavailable. The stable Full path intentionally clears the global ROS environment; its ROS 2 extension logs a non-fatal startup failure, while `--ros2` remains experimental. The verified result must be described as real Full Isaac startup and bounded Metal execution, not full RTX or general CUDA compatibility.
+# Protocol architecture
+
+IsaacMetalBridge is an unofficial experimental compatibility layer.
+It is not affiliated with, endorsed by, sponsored by, or supported by Apple Inc. or NVIDIA Corporation.
+
+The canonical v1 wire definition is [../protocol/README.md](../protocol/README.md) and the portable ABI header is [../protocol/include/imb_protocol.h](../protocol/include/imb_protocol.h).
+
+The control plane contains version negotiation, discovery, error reporting, Ping/Pong, shutdown, resources, and fences. Protocol 1.10 includes real Metal buffer allocation, byte upload/readback, linear and sparse images, sparse-tile map/unmap, fixed raster/UI commands, SPIR-V-to-MSL compute-pipeline creation, generic compute dispatch with buffer/image/texel-buffer descriptors and push constants, primitive/instance Metal acceleration structures, bounded ray dispatch, and real Metal command-buffer completion. Translated RTX/Hydra shader semantics, unsupported FP64 modules, bulk queues, and zero-copy sharing remain future work.
+
+The transport remains abstract. Local tests use child-process pipes. Production-path validation uses a Linux AF_VSOCK listener and a macOS adapter that calls Apple container's existing `ContainerClient.dial(id:port:)`; the complete session has passed in a real ARM64 VM. No dedicated VirtIO GPU or coherent shared memory is claimed.
+# Requirements
+
+IsaacMetalBridge is an unofficial experimental compatibility layer.
+It is not affiliated with, endorsed by, sponsored by, or supported by Apple Inc. or NVIDIA Corporation.
+
+## Development host
+
+- Apple Silicon Mac (`arm64`)
+- macOS 26 recommended by the pinned Apple `container` source; macOS 15 is its build minimum
+- Swift 6 or newer and the Metal SDK
+- CMake 3.25 or newer
+- C++20 compiler
+- Git with submodule support
+- Network access for the first `ContainerAPIClient` Swift dependency resolution and Alpine guest-image build
+
+## Runtime validation inputs
+
+- Apple `container` installed and its system service running
+- A Linux ARM64 guest/image
+- Real Isaac Sim 6.0.1 Linux aarch64 content stored outside this repository
+- Sufficient external disk space (NVIDIA advises at least 50 GB free for standalone quick installation)
+- License acceptance and registry credentials managed by the user, never by repository scripts
+
+## Current host observation (2026-07-19)
+
+Verified on the development host: Apple Silicon `arm64`, macOS 27.0, Swift 6.4, CMake 4.1.0, Apple Clang 21.0.0, and Apple `container` 1.1.0. A real `linux/arm64` guest returned `aarch64`. The official Isaac Sim 6.0.1 ARM64 image is loaded in Apple container's image store and selected by the ignored local `.env`. The Apple client adapter built against the pinned submodule, and a real guest-vsock session completed Metal buffer compute plus fixed RGBA8 raster, fences, and readback.
+
+These observations are a point-in-time result, not a general support claim.
+# Roadmap
+
+IsaacMetalBridge is an unofficial experimental compatibility layer.
+It is not affiliated with, endorsed by, sponsored by, or supported by Apple Inc. or NVIDIA Corporation.
+
+## M0 — Foundation (completed)
+
+- pinned Apple source and source-grounded integration analysis
+- protocol v1 control plane
+- Swift Metal capability host
+- C++20 guest probe and local integration tests
+- honest environment doctor/setup scripts
+
+## M1 — Real guest and Isaac Sim failure capture (completed)
+
+- Apple `container` 1.1.0 is installed outside the repository
+- a real guest reports `aarch64`
+- the user-managed official Isaac Sim 6.0.1 ARM64 image is loaded outside Git
+- NVIDIA's real compatibility checker ran and returned `System checking result: FAILED`
+- captured failures include missing `libcuda.so.1`, NVML, `nvidia-smi`, and Vulkan `ERROR_INCOMPATIBLE_DRIVER`
+
+The original driver-boundary failure was used as the trace baseline for the startup compatibility work below.
+
+## M2 — Production control transport (implemented and verified)
+
+- Linux AF_VSOCK guest listener on an explicit port
+- macOS adapter using Apple container's verified `ContainerClient.dial`
+- protocol 1.10 session verified across a real Apple-container ARM64 VM
+- bounded framing and disconnect cleanup
+
+Remaining hardening: fuzzing, connection timeout/cancellation, and an authentication threat model before any non-local use.
+
+## M3 — Vulkan-to-Metal minimum compute path (prototype verified)
+
+- completed below Vulkan: real `MTLBuffer` allocation, bounded upload/readback, one compute dispatch, and real command-buffer fence
+- verified deterministic result: `[1,2,3,4] + 5 = [6,7,8,9]`, including across VM vsock
+- completed discovery slice: Khronos Linux loader loads the IMB ICD, negotiates via vsock, and enumerates one Vulkan 1.0 physical/logical device and queue
+- completed compute slice: Vulkan buffer/memory, descriptors, one exactly recognized `ADD_U32` SPIR-V module, compute pipeline, command buffer, queue submission, Vulkan fence, and readback map to the verified IMB/Metal path
+- verified through the real Linux Vulkan loader and Apple-container VM: `[1,2,3,4] + 5 = [6,7,8,9]`
+- completed startup compatibility additions include Kit-facing resources, descriptor indexing, timeline semaphores, query pools, and safe generic graphics submission while preserving the exact Metal compute path
+- injected into the real Isaac Sim 6.0.1 ARM64 image and verified through the official base experience
+
+The exact fixed-triangle rendering slice now produces and checks an actual image; this does not imply general or Isaac/RTX rendering.
+
+## M4 — Rendering path
+
+- completed: option-free RGBA8 image/texture mapping and full-image readback
+- completed: exact build-generated vertex/fragment SPIR-V recognition
+- completed: Vulkan render pass, framebuffer, fixed graphics pipeline, draw, queue submission, real Metal fence, pixel validation, and headless PNG output
+- completed: exact tested Isaac Kit UI pipeline recognition, ring-buffer uploads, indexed draws, vertex offsets, scissor rectangles, BGRA8 texture sampling, and alpha blending
+- completed: continuously captured real Kit UI frames displayed by a native macOS viewer
+- completed: native pointer and keyboard input forwarding through Kit's real Carbonite input provider
+- completed: pinned SPIRV-Cross tool and protocol 1.10 live compute-pipeline creation; 162 of 204 real Isaac requests compile on M4
+- completed: generic Metal compute dispatch with push constants, buffer/image descriptors, and Vulkan-format texel-buffer views; the Full trace executes supported pipelines and safely skips unsupported/partially-bound RTX submissions
+- completed: KHR triangle BLAS and instance TLAS compatibility objects backed by real Metal acceleration structures
+- completed: real Metal ray dispatch against real Kit scene BLAS geometry and synchronization into Kit's triple-buffered 1280×720 viewport images
+- completed: non-black `--demo-scene` viewport inside the live Kit UI, with mouse menu interaction and Stage-search keyboard input verified end to end
+- completed: early `omni.usd` startup-stage extension replaces Isaac Sim base's disabled positional-USD path; local demo and real NVIDIA `Simple Grid` roots are verified by their `/World` children
+- completed: unsupported NVIDIA/null scene TLAS records defer to a Metal identity-transform TLAS built from the completed real BLASes instead of aborting the queue submission
+- completed: Vulkan sparse-image memory requirements, mip storage, and tile map/unmap mirrored into real Metal sparse heaps and enabled by default
+- completed: real R32_UINT texel-buffer dispatch plus buffer/image descriptor and readback transport
+- next: lower the 42 FP64-buffer compute requests while preserving Vulkan ABI and expand unsupported descriptor/format coverage
+- next: preserve general scene-instance transforms and bridge live Kit camera state
+- next: translate hit/miss shader semantics, materials/lighting, broader raster commands, and RTX sensor outputs
+
+## M5 — CUDA startup compatibility (prototype startup slice completed)
+
+- traced real CUDA Driver API and private export-table calls from Kit, PhysX, and Warp startup
+- implemented the tested identity, context, allocation, copy, stream, event, module, and export-table startup surface
+- Warp discovers one CUDA compatibility device during real Isaac Sim startup
+- next: evaluate PTX translation and Metal execution feasibility and legal/technical constraints
+- explicitly gate unsupported APIs
+
+## M6 — Real Isaac Sim startup (Base and Full profiles completed)
+
+- official `isaacsim.exp.base.kit` experience reports `app ready`
+- verified both finite smoke-test shutdown and continued running state after readiness; the launcher now propagates a later container-init crash instead of treating readiness alone as success
+- repeatable lifecycle is implemented in `scripts/run-isaac-sim.sh`
+- targeted ARM virtual-counter compatibility removes the Apple-VM backwards-TSC abort
+- official Full experience reports `Isaac Sim Full App is loaded`, reaches `app ready`, displays the real UI and Simple Grid scene presentation, and exits zero in finite validation
+- stable Full startup isolates the bundled ROS environment; explicit `--ros2` remains experimental
+
+GPU PhysX correctness, general RTX/Hydra shader/material/camera/sensor equivalence, long-running Full workload stability, and general CUDA compatibility remain research questions, not scheduled promises. The completed scene-validation milestone displays real loaded geometry through Metal, but currently uses a fallback scene-instance/camera/shading path.
+# Minimal Vulkan ICD
+
+IsaacMetalBridge is an unofficial experimental compatibility layer.
+It is not affiliated with, endorsed by, sponsored by, or supported by Apple Inc. or NVIDIA Corporation.
+
+## Verified scope
+
+The Linux ARM64 guest image contains an experimental Vulkan Installable Client Driver at `/usr/local/lib/libimb_vulkan_icd.so` and a loader manifest at `/usr/local/share/vulkan/icd.d/imb_icd.json`.
+
+The implementation follows Khronos's documented loader/driver discovery ABI:
+
+- exports `vk_icdNegotiateLoaderICDInterfaceVersion`
+- exports `vk_icdGetInstanceProcAddr`
+- negotiates loader/driver interface version 5 or lower
+- uses a version 1.0.1 JSON manifest selected with `VK_DRIVER_FILES`
+- initializes dispatchable handles with the loader magic from `vk_icd.h`
+
+Primary reference: [Khronos Vulkan Loader driver interface](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md).
+
+The current driver combines exact Metal compute, fixed raster, and tested Kit UI raster paths with a broader startup compatibility surface:
+
+- Vulkan 1.1 instance/device identity and creation/destruction
+- one physical device whose name comes from the live IMB/Metal capability reply
+- the feature/limit and extension subset requested by the tested Kit startup, including descriptor indexing, memory budget, dedicated allocation, and timeline semaphores
+- memory and queue-family property reporting for the existing shared-buffer/compute research path
+- one logical device and 16 queues
+- device/queue idle operations
+- storage-buffer creation, host-visible/coherent memory, binding, mapping, and readback
+- descriptor layouts/sets for storage and uniform buffers, sampled/storage images, and uniform/storage texel buffers
+- exact `ADD_U32` plus live SPIR-V-to-MSL compute pipelines
+- primary command-pool/buffer recording for bind, push constants, and three-dimensional dispatch
+- `vkQueueSubmit`, Vulkan fence wait/status/reset, real Metal fence completion, and result readback
+- opaque startup resources for images/views/samplers, render passes/framebuffers, graphics pipelines, pipeline caches, and general descriptor layouts
+- one executable RGBA8 image/render-pass/framebuffer/fixed-triangle graphics pipeline with `vkCmdDraw`, queue submit, Metal fence, and checked readback
+- one exactly recognized Kit UI graphics pipeline with BGRA8 targets, texture descriptors, copy/upload tracking, indexed draws, ring-buffer offsets, scissors, and synchronous Metal completion
+- KHR ray-tracing pipeline/group/SBT compatibility sufficient for the verified probe and observed real-Isaac trace
+- KHR triangle BLAS and instance TLAS builds backed by real Metal acceleration structures
+- a narrow real Metal ray dispatch into RGBA8 and synchronization of the real-Isaac result into Kit's triple-buffered viewport images
+- Vulkan sparse-image requirements and tile map/unmap backed by Metal sparse heaps
+- real generic compute execution for supported translated pipelines with buffer, image, and formatted texel-buffer bindings
+- binary/timeline semaphores and query-pool lifecycle/results
+- synchronous validation/no-op handling for generic graphics submissions outside the fixed triangle and recognized Kit UI paths
+
+The ICD accepts a host connection only when `IMB_VSOCK_PORT` is explicitly set. It performs IMB 1.10 negotiation and requires the live host to advertise Metal buffer, compute, image, fixed raster, UI raster, resource-I/O, and real-fence capabilities before exposing the physical device. Live SPIR-V compute-pipeline creation requires `METAL_SPIRV_COMPUTE`; sparse images require `METAL_SPARSE_IMAGE`; acceleration-structure and ray commands require `METAL_ACCELERATION_STRUCTURE` and `METAL_RAY_DISPATCH`.
+
+## Explicit limitations
+
+This is not a conformant Vulkan implementation and does not report a conformance version. Compute shader modules are sent through the protocol to a pinned SPIRV-Cross build and compiled as real Metal pipelines when supported; the current live Isaac trace creates 162 of 204 requested pipelines and rejects 42 FP64-buffer modules explicitly. Supported generic dispatches execute on Metal. Legal null/partially-bound descriptors and unsupported formats are skipped without failing the entire RTX queue; a measured finite Full run executed 595 Metal dispatches and skipped 2,708 such submissions. General graphics pipelines remain compatibility objects/no-ops outside the verified fixed and Kit UI paths.
+
+The verified ray path intersects real scene BLAS geometry, but Kit's NVIDIA-only instance producer leaves the observed TLAS descriptor null. The current compatibility fallback places built BLASes into one identity-transform TLAS and uses a fixed bridge camera plus diagnostic hit/miss shading. This produces a real non-black Metal intersection viewport for the included validation stage, but it does not implement general scene transforms, live Kit camera state, translated RTX/Hydra shaders, materials, lighting, or sensors. The ICD must not be installed as a system-wide driver.
+
+## Reproducible validation
+
+Run:
+
+```sh
+./scripts/test-vulkan-icd.sh
+```
+
+The script builds a Linux ARM64 image, starts the Khronos loader-linked probe in a real Apple container VM, dials its AF_VSOCK listener through Apple's `ContainerClient`, and requires device discovery, storage-buffer and R32_UINT texel-buffer compute, transfer/image readback, sparse-image map/unmap, raster, KHR BLAS/TLAS, OPAQUE_FD round-trip, and `VULKAN_RAY_DISPATCH rays=64x64 center=hit corner=miss backend=Metal fence=signaled`. Test containers are removed and a builder started by the script is stopped on exit.
+
+The real Full/UI milestone is reproducible with `ACCEPT_EULA=Y ./scripts/run-isaac-sim.sh --experience full --window --simple-grid`. The fixed-raster test writes checked PNG artifacts under `build/artifacts`; the live viewer reads atomic UI frame captures under `build/runtime` and appends input records that the real Kit input provider consumes. The next Vulkan milestones are scene/camera transform propagation, broader formats/descriptors, and RTX shader semantics. Capability advertisement must expand only as each call path is executed and validated.

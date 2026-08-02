@@ -13,7 +13,10 @@ let package = Package(
     targets: [
         .target(
             name: "IMBHostCore",
-            linkerSettings: [.linkedFramework("Metal")]
+            linkerSettings: [
+                .linkedFramework("Metal"),
+                .linkedFramework("MetalKit"),
+            ]
         ),
         .executableTarget(
             name: "imb-host",

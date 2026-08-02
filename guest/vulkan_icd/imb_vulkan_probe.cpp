@@ -758,6 +758,78 @@ int main(int argc, char** argv) {
             throw std::runtime_error("IMB returned a null Metal texel buffer view");
         }
 
+        VkBufferCreateInfo wholeSizeTailBufferInfo = bufferInfo;
+        wholeSizeTailBufferInfo.size = 1161;
+        VkBuffer wholeSizeTailBuffer = VK_NULL_HANDLE;
+        require(
+            vkCreateBuffer(
+                device,
+                &wholeSizeTailBufferInfo,
+                nullptr,
+                &wholeSizeTailBuffer
+            ),
+            "vkCreateBuffer(VK_WHOLE_SIZE tail)"
+        );
+        VkMemoryRequirements wholeSizeTailRequirements{};
+        vkGetBufferMemoryRequirements(
+            device,
+            wholeSizeTailBuffer,
+            &wholeSizeTailRequirements
+        );
+        VkMemoryAllocateInfo wholeSizeTailMemoryInfo{};
+        wholeSizeTailMemoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        wholeSizeTailMemoryInfo.allocationSize = wholeSizeTailRequirements.size;
+        wholeSizeTailMemoryInfo.memoryTypeIndex = memoryTypeIndex;
+        VkDeviceMemory wholeSizeTailMemory = VK_NULL_HANDLE;
+        require(
+            vkAllocateMemory(
+                device,
+                &wholeSizeTailMemoryInfo,
+                nullptr,
+                &wholeSizeTailMemory
+            ),
+            "vkAllocateMemory(VK_WHOLE_SIZE tail)"
+        );
+        require(
+            vkBindBufferMemory(
+                device,
+                wholeSizeTailBuffer,
+                wholeSizeTailMemory,
+                0
+            ),
+            "vkBindBufferMemory(VK_WHOLE_SIZE tail)"
+        );
+        VkBufferViewCreateInfo wholeSizeTailViewInfo = texelViewInfo;
+        wholeSizeTailViewInfo.buffer = wholeSizeTailBuffer;
+        wholeSizeTailViewInfo.range = VK_WHOLE_SIZE;
+        VkBufferView wholeSizeTailView = VK_NULL_HANDLE;
+        require(
+            vkCreateBufferView(
+                device,
+                &wholeSizeTailViewInfo,
+                nullptr,
+                &wholeSizeTailView
+            ),
+            "vkCreateBufferView(VK_WHOLE_SIZE incomplete tail)"
+        );
+        vkDestroyBufferView(device, wholeSizeTailView, nullptr);
+        VkBufferViewCreateInfo explicitTailViewInfo = texelViewInfo;
+        explicitTailViewInfo.buffer = wholeSizeTailBuffer;
+        explicitTailViewInfo.range = wholeSizeTailBufferInfo.size;
+        VkBufferView explicitTailView = VK_NULL_HANDLE;
+        require(
+            vkCreateBufferView(
+                device,
+                &explicitTailViewInfo,
+                nullptr,
+                &explicitTailView
+            ),
+            "vkCreateBufferView(explicit incomplete tail)"
+        );
+        vkDestroyBufferView(device, explicitTailView, nullptr);
+        vkDestroyBuffer(device, wholeSizeTailBuffer, nullptr);
+        vkFreeMemory(device, wholeSizeTailMemory, nullptr);
+
         std::vector<std::uint32_t> texelShaderCode(
             (imb_texel_add_spv_len + sizeof(std::uint32_t) - 1)
                 / sizeof(std::uint32_t)
@@ -942,12 +1014,19 @@ int main(int argc, char** argv) {
                 "vkMapMemory(texel output)");
         const std::uint32_t texelExpected[] = {8, 9, 10, 11};
         if (std::memcmp(mapped, texelExpected, sizeof(texelExpected)) != 0) {
+            const auto* texelActual =
+                static_cast<const std::uint32_t*>(mapped);
+            std::cerr
+                << "imb-vulkan-probe: texel-buffer actual=["
+                << texelActual[0] << "," << texelActual[1] << ","
+                << texelActual[2] << "," << texelActual[3] << "]\n";
             throw std::runtime_error(
                 "Vulkan Metal texel-buffer readback did not match [8,9,10,11]"
             );
         }
         vkUnmapMemory(device, memory);
         std::cout << "VULKAN_TEXEL_BUFFER format=R32_UINT output=[8,9,10,11]"
+                  << " whole_size_tail=passed explicit_tail=passed"
                   << " backend=Metal fence=signaled\n";
 
         vkDestroyFence(device, texelFence, nullptr);
@@ -1685,23 +1764,33 @@ int main(int argc, char** argv) {
             return result;
         };
 
-        constexpr float triangleVertices[] = {
+        constexpr float triangleUploads[] = {
             -1.0f, -1.0f, 0.0f,
              1.0f, -1.0f, 0.0f,
              0.0f,  1.0f, 0.0f,
+             4.0f, -1.0f, 0.0f,
+             6.0f, -1.0f, 0.0f,
+             5.0f,  1.0f, 0.0f,
         };
-        AddressBuffer blasVertices = createAddressBuffer(
-            sizeof(triangleVertices),
-            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
-            "create BLAS vertex buffer"
+        constexpr VkDeviceSize triangleBytes = 9 * sizeof(float);
+        AddressBuffer blasUpload = createAddressBuffer(
+            sizeof(triangleUploads),
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            "create BLAS upload buffer"
         );
         mapped = nullptr;
         require(
-            vkMapMemory(device, blasVertices.memory, 0, sizeof(triangleVertices), 0, &mapped),
-            "vkMapMemory(BLAS vertices)"
+            vkMapMemory(device, blasUpload.memory, 0, sizeof(triangleUploads), 0, &mapped),
+            "vkMapMemory(BLAS upload)"
         );
-        std::memcpy(mapped, triangleVertices, sizeof(triangleVertices));
-        vkUnmapMemory(device, blasVertices.memory);
+        std::memcpy(mapped, triangleUploads, sizeof(triangleUploads));
+        vkUnmapMemory(device, blasUpload.memory);
+        AddressBuffer blasVertices = createAddressBuffer(
+            triangleBytes,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+                | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            "create BLAS vertex buffer"
+        );
 
         VkAccelerationStructureGeometryTrianglesDataKHR triangleData{};
         triangleData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
@@ -1752,11 +1841,33 @@ int main(int argc, char** argv) {
             createAccelerationStructure(device, &blasCreateInfo, nullptr, &blas),
             "vkCreateAccelerationStructureKHR(BLAS)"
         );
+        AddressBuffer secondBlasStorage = createAddressBuffer(
+            blasSizes.accelerationStructureSize,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR,
+            "create second BLAS storage buffer"
+        );
+        VkAccelerationStructureCreateInfoKHR secondBlasCreateInfo = blasCreateInfo;
+        secondBlasCreateInfo.buffer = secondBlasStorage.buffer;
+        VkAccelerationStructureKHR secondBlas = VK_NULL_HANDLE;
+        require(
+            createAccelerationStructure(
+                device,
+                &secondBlasCreateInfo,
+                nullptr,
+                &secondBlas
+            ),
+            "vkCreateAccelerationStructureKHR(second BLAS)"
+        );
 
         AddressBuffer blasScratch = createAddressBuffer(
             blasSizes.buildScratchSize,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             "create BLAS scratch buffer"
+        );
+        AddressBuffer secondBlasScratch = createAddressBuffer(
+            blasSizes.buildScratchSize,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            "create second BLAS scratch buffer"
         );
         blasBuildInfo.dstAccelerationStructure = blas;
         blasBuildInfo.scratchData.deviceAddress = blasScratch.address;
@@ -1768,7 +1879,32 @@ int main(int argc, char** argv) {
         require(vkAllocateCommandBuffers(device, &commandAllocateInfo, &blasCommand),
                 "vkAllocateCommandBuffers(BLAS)");
         require(vkBeginCommandBuffer(blasCommand, &beginInfo), "vkBeginCommandBuffer(BLAS)");
+        VkBufferCopy firstTriangleCopy{0, 0, triangleBytes};
+        vkCmdCopyBuffer(
+            blasCommand,
+            blasUpload.buffer,
+            blasVertices.buffer,
+            1,
+            &firstTriangleCopy
+        );
         cmdBuildAccelerationStructures(blasCommand, 1, &blasBuildInfo, blasRanges);
+        VkBufferCopy secondTriangleCopy{triangleBytes, 0, triangleBytes};
+        vkCmdCopyBuffer(
+            blasCommand,
+            blasUpload.buffer,
+            blasVertices.buffer,
+            1,
+            &secondTriangleCopy
+        );
+        VkAccelerationStructureBuildGeometryInfoKHR secondBlasBuildInfo = blasBuildInfo;
+        secondBlasBuildInfo.dstAccelerationStructure = secondBlas;
+        secondBlasBuildInfo.scratchData.deviceAddress = secondBlasScratch.address;
+        cmdBuildAccelerationStructures(
+            blasCommand,
+            1,
+            &secondBlasBuildInfo,
+            blasRanges
+        );
         require(vkEndCommandBuffer(blasCommand), "vkEndCommandBuffer(BLAS)");
         VkFence blasFence = VK_NULL_HANDLE;
         require(vkCreateFence(device, &fenceInfo, nullptr, &blasFence), "vkCreateFence(BLAS)");
@@ -1782,34 +1918,45 @@ int main(int argc, char** argv) {
             "vkWaitForFences(BLAS)"
         );
         require(vkGetFenceStatus(device, blasFence), "vkGetFenceStatus(BLAS)");
-        std::cout << "VULKAN_BLAS triangles=1 geometry=opaque backend=Metal fence=signaled\n";
+        std::cout << "VULKAN_BLAS triangles=2 geometries=opaque backend=Metal fence=signaled\n";
 
         VkAccelerationStructureDeviceAddressInfoKHR blasAddressInfo{};
         blasAddressInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
         blasAddressInfo.accelerationStructure = blas;
         const VkDeviceAddress blasAddress = getAccelerationStructureDeviceAddress(device, &blasAddressInfo);
         if (blasAddress == 0) throw std::runtime_error("IMB returned a zero BLAS device address");
+        VkAccelerationStructureDeviceAddressInfoKHR secondBlasAddressInfo = blasAddressInfo;
+        secondBlasAddressInfo.accelerationStructure = secondBlas;
+        const VkDeviceAddress secondBlasAddress =
+            getAccelerationStructureDeviceAddress(device, &secondBlasAddressInfo);
+        if (secondBlasAddress == 0) {
+            throw std::runtime_error("IMB returned a zero second BLAS device address");
+        }
 
-        VkAccelerationStructureInstanceKHR tlasInstance{};
-        tlasInstance.transform.matrix[0][0] = 1.0f;
-        tlasInstance.transform.matrix[1][1] = 1.0f;
-        tlasInstance.transform.matrix[2][2] = 1.0f;
-        tlasInstance.instanceCustomIndex = 7;
-        tlasInstance.mask = 0xff;
-        tlasInstance.instanceShaderBindingTableRecordOffset = 3;
-        tlasInstance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
-        tlasInstance.accelerationStructureReference = blasAddress;
+        VkAccelerationStructureInstanceKHR tlasInstancesData[2]{};
+        for (auto& instance : tlasInstancesData) {
+            instance.transform.matrix[0][0] = 1.0f;
+            instance.transform.matrix[1][1] = 1.0f;
+            instance.transform.matrix[2][2] = 1.0f;
+            instance.mask = 0xff;
+            instance.instanceShaderBindingTableRecordOffset = 3;
+            instance.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        }
+        tlasInstancesData[0].instanceCustomIndex = 7;
+        tlasInstancesData[0].accelerationStructureReference = blasAddress;
+        tlasInstancesData[1].instanceCustomIndex = 8;
+        tlasInstancesData[1].accelerationStructureReference = secondBlasAddress;
         AddressBuffer tlasInstances = createAddressBuffer(
-            sizeof(tlasInstance),
+            sizeof(tlasInstancesData),
             VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
             "create TLAS instance buffer"
         );
         mapped = nullptr;
         require(
-            vkMapMemory(device, tlasInstances.memory, 0, sizeof(tlasInstance), 0, &mapped),
-            "vkMapMemory(TLAS instance)"
+            vkMapMemory(device, tlasInstances.memory, 0, sizeof(tlasInstancesData), 0, &mapped),
+            "vkMapMemory(TLAS instances)"
         );
-        std::memcpy(mapped, &tlasInstance, sizeof(tlasInstance));
+        std::memcpy(mapped, tlasInstancesData, sizeof(tlasInstancesData));
         vkUnmapMemory(device, tlasInstances.memory);
 
         VkAccelerationStructureGeometryInstancesDataKHR instancesData{};
@@ -1827,7 +1974,7 @@ int main(int argc, char** argv) {
         tlasBuildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
         tlasBuildInfo.geometryCount = 1;
         tlasBuildInfo.pGeometries = &tlasGeometry;
-        constexpr std::uint32_t tlasPrimitiveCount = 1;
+        constexpr std::uint32_t tlasPrimitiveCount = 2;
         VkAccelerationStructureBuildSizesInfoKHR tlasSizes{};
         tlasSizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
         getAccelerationStructureBuildSizes(
@@ -1883,7 +2030,7 @@ int main(int argc, char** argv) {
             "vkWaitForFences(TLAS)"
         );
         require(vkGetFenceStatus(device, tlasFence), "vkGetFenceStatus(TLAS)");
-        std::cout << "VULKAN_TLAS instances=1 child_blas=1 backend=Metal fence=signaled\n";
+        std::cout << "VULKAN_TLAS instances=2 child_blas=2 backend=Metal fence=signaled\n";
 
         VkImageCreateInfo rayImageInfo{};
         rayImageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -2022,6 +2169,7 @@ int main(int argc, char** argv) {
         vkUnmapMemory(device, rayImageMemory);
         std::cout << "VULKAN_RAY_DISPATCH rays=" << imageWidth << 'x' << imageHeight
                   << " center=hit corner=miss backend=Metal fence=signaled\n";
+        std::cout << "VULKAN_AS_COMMAND_ORDER copies=2 builds=2 shared_input=1 preserved=passed\n";
 
         vkDestroyFence(device, rayFence, nullptr);
         vkFreeCommandBuffers(device, commandPool, 1, &rayCommand);
@@ -2046,12 +2194,19 @@ int main(int argc, char** argv) {
         vkDestroyFence(device, blasFence, nullptr);
         vkFreeCommandBuffers(device, commandPool, 1, &blasCommand);
         destroyAccelerationStructure(device, blas, nullptr);
+        destroyAccelerationStructure(device, secondBlas, nullptr);
         vkDestroyBuffer(device, blasScratch.buffer, nullptr);
         vkFreeMemory(device, blasScratch.memory, nullptr);
+        vkDestroyBuffer(device, secondBlasScratch.buffer, nullptr);
+        vkFreeMemory(device, secondBlasScratch.memory, nullptr);
         vkDestroyBuffer(device, blasStorage.buffer, nullptr);
         vkFreeMemory(device, blasStorage.memory, nullptr);
+        vkDestroyBuffer(device, secondBlasStorage.buffer, nullptr);
+        vkFreeMemory(device, secondBlasStorage.memory, nullptr);
         vkDestroyBuffer(device, blasVertices.buffer, nullptr);
         vkFreeMemory(device, blasVertices.memory, nullptr);
+        vkDestroyBuffer(device, blasUpload.buffer, nullptr);
+        vkFreeMemory(device, blasUpload.memory, nullptr);
 
         vkDestroyFence(device, rasterFence, nullptr);
         vkFreeCommandBuffers(device, commandPool, 1, &rasterCommand);

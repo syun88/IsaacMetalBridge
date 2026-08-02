@@ -72,7 +72,11 @@ public final class BridgeSession: @unchecked Sendable {
         guard header.versionMajor == IMBProtocol.major,
               header.versionMinor == IMBProtocol.minor
         else {
-            return failure(frame, .unsupportedVersion, "session requires protocol 1.10")
+            return failure(
+                frame,
+                .unsupportedVersion,
+                "session requires protocol \(IMBProtocol.major).\(IMBProtocol.minor)"
+            )
         }
 
         switch type {
@@ -651,7 +655,11 @@ public final class BridgeSession: @unchecked Sendable {
         let supported = (minMajor < IMBProtocol.major || (minMajor == IMBProtocol.major && minMinor <= IMBProtocol.minor))
             && (maxMajor > IMBProtocol.major || (maxMajor == IMBProtocol.major && maxMinor >= IMBProtocol.minor))
         guard supported else {
-            return failure(frame, .unsupportedVersion, "no compatible version; host supports 1.10")
+            return failure(
+                frame,
+                .unsupportedVersion,
+                "no compatible version; host supports \(IMBProtocol.major).\(IMBProtocol.minor)"
+            )
         }
 
         negotiated = true
@@ -784,7 +792,7 @@ public final class BridgeSession: @unchecked Sendable {
                 commandResources.formUnion([frame.header.resourceID, vertexBufferID, indexBufferID])
                 commandResources.formUnion(draws.lazy.map(\.textureID).filter { $0 != 0 })
             case 4:
-                guard frame.payload.count == 32,
+                guard frame.payload.count == 168,
                       let target = resources[frame.header.resourceID],
                       target.kind == 2,
                       let accelerationStructureID: UInt64 = try? frame.payload.readLittleEndian(at: 8),
@@ -795,11 +803,125 @@ public final class BridgeSession: @unchecked Sendable {
                       let height: UInt32 = try? frame.payload.readLittleEndian(at: 20),
                       let missRGBA8: UInt32 = try? frame.payload.readLittleEndian(at: 24),
                       let hitRGBA8: UInt32 = try? frame.payload.readLittleEndian(at: 28),
+                      let options: UInt32 = try? frame.payload.readLittleEndian(at: 32),
+                      let reserved1: UInt32 = try? frame.payload.readLittleEndian(at: 36),
                       width == target.width,
                       height == target.height,
+                      options & ~UInt32(15) == 0,
+                      reserved1 == 0,
                       backend.supportsRayDispatch
                 else {
                     return failure(frame, .invalidPayload, "TRACE_RAYS requires an image and a built top-level Metal acceleration structure")
+                }
+                var camera: RayCamera?
+                if options & 1 != 0 {
+                    let values: [Float] = (0..<12).compactMap { index in
+                        guard let bits: UInt32 = try? frame.payload.readLittleEndian(
+                            at: 40 + index * 4
+                        ) else {
+                            return nil
+                        }
+                        return Float(bitPattern: bits)
+                    }
+                    guard values.count == 12,
+                          values.allSatisfy(\.isFinite),
+                          values[9] > 0.01,
+                          values[9] < 3.13,
+                          values[10] > 0,
+                          values[11] > values[10],
+                          values[3] * values[3] + values[4] * values[4]
+                            + values[5] * values[5] > 0.000_001,
+                          values[6] * values[6] + values[7] * values[7]
+                            + values[8] * values[8] > 0.000_001
+                    else {
+                        return failure(frame, .invalidPayload, "TRACE_RAYS live camera is invalid")
+                    }
+                    camera = RayCamera(
+                        position: SIMD3<Float>(values[0], values[1], values[2]),
+                        forward: SIMD3<Float>(values[3], values[4], values[5]),
+                        up: SIMD3<Float>(values[6], values[7], values[8]),
+                        verticalFOVRadians: values[9],
+                        nearDistance: values[10],
+                        farDistance: values[11]
+                    )
+                }
+                var sphereLight: RaySphereLight?
+                if options & 2 != 0 {
+                    let values: [Float] = (0..<8).compactMap { index in
+                        guard let bits: UInt32 = try? frame.payload.readLittleEndian(
+                            at: 88 + index * 4
+                        ) else {
+                            return nil
+                        }
+                        return Float(bitPattern: bits)
+                    }
+                    guard values.count == 8,
+                          values.allSatisfy(\.isFinite),
+                          values[3] >= 0,
+                          values[4] >= 0,
+                          values[5] >= 0,
+                          values[6] >= 0,
+                          values[7] > 0
+                    else {
+                        return failure(frame, .invalidPayload, "TRACE_RAYS live SphereLight is invalid")
+                    }
+                    sphereLight = RaySphereLight(
+                        position: SIMD3<Float>(values[0], values[1], values[2]),
+                        color: SIMD3<Float>(values[3], values[4], values[5]),
+                        intensity: values[6],
+                        radius: values[7]
+                    )
+                }
+                var distantLight: RayDistantLight?
+                if options & 4 != 0 {
+                    let values: [Float] = (0..<8).compactMap { index in
+                        guard let bits: UInt32 = try? frame.payload.readLittleEndian(
+                            at: 120 + index * 4
+                        ) else {
+                            return nil
+                        }
+                        return Float(bitPattern: bits)
+                    }
+                    guard values.count == 8,
+                          values.allSatisfy(\.isFinite),
+                          values[0] * values[0] + values[1] * values[1]
+                            + values[2] * values[2] > 0.000_001,
+                          values[3] >= 0,
+                          values[4] >= 0,
+                          values[5] >= 0,
+                          values[6] >= 0,
+                          values[7] >= 0,
+                          values[7] <= 180
+                    else {
+                        return failure(frame, .invalidPayload, "TRACE_RAYS live DistantLight is invalid")
+                    }
+                    distantLight = RayDistantLight(
+                        direction: SIMD3<Float>(values[0], values[1], values[2]),
+                        color: SIMD3<Float>(values[3], values[4], values[5]),
+                        intensity: values[6],
+                        angleDegrees: values[7]
+                    )
+                }
+                var domeLight: RayDomeLight?
+                if options & 8 != 0 {
+                    let values: [Float] = (0..<4).compactMap { index in
+                        guard let bits: UInt32 = try? frame.payload.readLittleEndian(
+                            at: 152 + index * 4
+                        ) else {
+                            return nil
+                        }
+                        return Float(bitPattern: bits)
+                    }
+                    guard values.count == 4,
+                          values.allSatisfy(\.isFinite),
+                          values.allSatisfy({ $0 >= 0 })
+                    else {
+                        return failure(frame, .invalidPayload, "TRACE_RAYS live DomeLight is invalid")
+                    }
+                    domeLight = RayDomeLight(
+                        color: SIMD3<Float>(values[0], values[1], values[2]),
+                        intensity: values[3]
+                    )
                 }
                 try backend.submitRayTrace(
                     imageID: frame.header.resourceID,
@@ -808,6 +930,10 @@ public final class BridgeSession: @unchecked Sendable {
                     height: height,
                     missRGBA8: missRGBA8,
                     hitRGBA8: hitRGBA8,
+                    camera: camera,
+                    sphereLight: sphereLight,
+                    distantLight: distantLight,
+                    domeLight: domeLight,
                     fenceID: fenceID
                 )
                 commandResources.formUnion([frame.header.resourceID, accelerationStructureID])

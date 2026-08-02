@@ -70,6 +70,23 @@ func log(_ message: String) {
     FileHandle.standardError.write(Data("imb-container-host: \(message)\n".utf8))
 }
 
+func isCleanProtocolDisconnect(_ error: any Error) -> Bool {
+    var current = error as NSError
+    for _ in 0..<4 {
+        if current.domain == NSPOSIXErrorDomain,
+           current.code == POSIXErrorCode.EPIPE.rawValue
+            || current.code == POSIXErrorCode.ECONNRESET.rawValue
+            || current.code == POSIXErrorCode.ENOTCONN.rawValue {
+            return true
+        }
+        guard let underlying = current.userInfo[NSUnderlyingErrorKey] as? NSError else {
+            break
+        }
+        current = underlying
+    }
+    return false
+}
+
 do {
     let arguments = try Arguments.parse(Array(CommandLine.arguments.dropFirst()))
     let metal = MetalCapabilities.detect()
@@ -96,7 +113,8 @@ do {
     } else {
         exitMonitor = nil
     }
-    for sessionIndex in 1...arguments.sessions {
+    var observedExitCode: Int32?
+    sessionLoop: for sessionIndex in 1...arguments.sessions {
         let maximumAttempts = sessionIndex == 1 ? 1 : 200
         var stream: FileHandle?
         var lastDialError: (any Error)?
@@ -119,16 +137,58 @@ do {
             throw lastDialError ?? ArgumentsError.usage("vsock dial failed without an error")
         }
         log("vsock connected session=\(sessionIndex)/\(arguments.sessions)")
-        try BridgeStreamServer.serve(
-            input: stream,
-            output: stream,
-            session: BridgeSession(),
-            log: log
-        )
+        do {
+            try BridgeStreamServer.serve(
+                input: stream,
+                output: stream,
+                session: BridgeSession(),
+                log: log
+            )
+        } catch BridgeStreamError.unexpectedEOF {
+            // Kit's finite --/app/quitAfter path can close the guest vsock
+            // while its Vulkan driver is partway through a final request.
+            // With --wait-exit, the container init status is authoritative:
+            // accept only a verified zero exit and continue to report crashes.
+            guard let exitMonitor else {
+                throw BridgeStreamError.unexpectedEOF
+            }
+            let exitCode = try await exitMonitor.value
+            observedExitCode = exitCode
+            if exitCode != 0 {
+                log("container init exited status=\(exitCode) after protocol EOF")
+                exit(exitCode)
+            }
+            log("protocol stream closed during clean container shutdown")
+            log("session complete session=\(sessionIndex)/\(arguments.sessions)")
+            break sessionLoop
+        } catch {
+            // A finite Kit run can close the guest endpoint after reading a
+            // request but before the host writes its reply. Foundation wraps
+            // that EPIPE/ECONNRESET in NSCocoaErrorDomain. Treat only those
+            // transport disconnects as clean, and only after the container's
+            // init process has independently reported exit status zero.
+            guard isCleanProtocolDisconnect(error), let exitMonitor else {
+                throw error
+            }
+            let exitCode = try await exitMonitor.value
+            observedExitCode = exitCode
+            if exitCode != 0 {
+                log("container init exited status=\(exitCode) after protocol disconnect")
+                exit(exitCode)
+            }
+            log("protocol reply raced clean container shutdown")
+            log("session complete session=\(sessionIndex)/\(arguments.sessions)")
+            break sessionLoop
+        }
         log("session complete session=\(sessionIndex)/\(arguments.sessions)")
     }
     if let exitMonitor {
-        let exitCode = try await exitMonitor.value
+        let exitCode: Int32
+        if let observedExitCode {
+            exitCode = observedExitCode
+        } else {
+            exitCode = try await exitMonitor.value
+        }
         log("container init exited status=\(exitCode)")
         if exitCode != 0 {
             exit(exitCode)

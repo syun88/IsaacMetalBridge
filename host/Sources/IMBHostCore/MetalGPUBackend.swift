@@ -2,6 +2,7 @@ import Foundation
 
 #if canImport(Metal)
 import Metal
+import MetalKit
 #endif
 
 public enum GPUBackendError: Error, CustomStringConvertible {
@@ -180,6 +181,80 @@ public struct SparseImageProperties: Sendable, Equatable {
     }
 }
 
+public struct RayCamera: Sendable, Equatable {
+    public let position: SIMD3<Float>
+    public let forward: SIMD3<Float>
+    public let up: SIMD3<Float>
+    public let verticalFOVRadians: Float
+    public let nearDistance: Float
+    public let farDistance: Float
+
+    public init(
+        position: SIMD3<Float>,
+        forward: SIMD3<Float>,
+        up: SIMD3<Float>,
+        verticalFOVRadians: Float,
+        nearDistance: Float,
+        farDistance: Float
+    ) {
+        self.position = position
+        self.forward = forward
+        self.up = up
+        self.verticalFOVRadians = verticalFOVRadians
+        self.nearDistance = nearDistance
+        self.farDistance = farDistance
+    }
+}
+
+public struct RaySphereLight: Sendable, Equatable {
+    public let position: SIMD3<Float>
+    public let color: SIMD3<Float>
+    public let intensity: Float
+    public let radius: Float
+
+    public init(
+        position: SIMD3<Float>,
+        color: SIMD3<Float>,
+        intensity: Float,
+        radius: Float
+    ) {
+        self.position = position
+        self.color = color
+        self.intensity = intensity
+        self.radius = radius
+    }
+}
+
+public struct RayDistantLight: Sendable, Equatable {
+    /// World-space USD emission direction (local -Z after the prim transform).
+    public let direction: SIMD3<Float>
+    public let color: SIMD3<Float>
+    public let intensity: Float
+    public let angleDegrees: Float
+
+    public init(
+        direction: SIMD3<Float>,
+        color: SIMD3<Float>,
+        intensity: Float,
+        angleDegrees: Float
+    ) {
+        self.direction = direction
+        self.color = color
+        self.intensity = intensity
+        self.angleDegrees = angleDegrees
+    }
+}
+
+public struct RayDomeLight: Sendable, Equatable {
+    public let color: SIMD3<Float>
+    public let intensity: Float
+
+    public init(color: SIMD3<Float>, intensity: Float) {
+        self.color = color
+        self.intensity = intensity
+    }
+}
+
 /// Narrow backend contract used by the protocol session.
 ///
 /// It deliberately covers only the verified Metal milestones: shared buffers,
@@ -282,6 +357,10 @@ public protocol BridgeGPUBackend: AnyObject {
         height: UInt32,
         missRGBA8: UInt32,
         hitRGBA8: UInt32,
+        camera: RayCamera?,
+        sphereLight: RaySphereLight?,
+        distantLight: RayDistantLight?,
+        domeLight: RayDomeLight?,
         fenceID: UInt64
     ) throws
     func waitFence(id: UInt64) throws -> Bool
@@ -314,11 +393,64 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         let sparse: Bool
     }
 
+    private struct TriangleNormalData {
+        let values: [SIMD4<Float>]
+        let triangleCount: UInt32
+        let normalsPerTriangle: UInt32
+    }
+
+    private struct TriangleUVData {
+        let values: [SIMD2<Float>]
+        let triangleCount: UInt32
+    }
+
+    private struct TriangleTangentData {
+        // Two float4 values per triangle: tangent, then bitangent.
+        let values: [SIMD4<Float>]
+        let triangleCount: UInt32
+    }
+
+    private struct MaterialParameterData {
+        let roughness: Float
+        let metallic: Float
+        let emissionColor: SIMD3<Float>
+        let emissionIntensity: Float
+    }
+
+    private struct MaterialTextureDescriptor {
+        let resourceIDs: [UInt64]
+        let channels: SIMD4<UInt32>
+    }
+
     private struct AccelerationStructureResource {
         let type: UInt32
         let requestedSize: UInt64
         var structure: (any MTLAccelerationStructure)?
         var childStructureIDs: [UInt64]
+        // A Metal acceleration structure retains the intersection geometry,
+        // but it does not expose triangle vertices to a compute intersection
+        // shader. Preserve one face normal per triangle while the Vulkan input
+        // buffers are still alive, then build a world-space lookup for each
+        // TLAS instance.
+        var localTriangleNormals: TriangleNormalData?
+        var localTriangleUVs: TriangleUVData?
+        var localTriangleTangents: TriangleTangentData?
+        var worldTriangleNormalBuffer: (any MTLBuffer)?
+        var instanceNormalRangeBuffer: (any MTLBuffer)?
+        var normalInstanceCount: UInt32
+        var triangleUVBuffer: (any MTLBuffer)?
+        var instanceUVRangeBuffer: (any MTLBuffer)?
+        var uvInstanceCount: UInt32
+        var instanceTextureIndexBuffer: (any MTLBuffer)?
+        var instanceMaterialTextureChannelBuffer: (any MTLBuffer)?
+        var worldTriangleTangentBuffer: (any MTLBuffer)?
+        var instanceTangentRangeBuffer: (any MTLBuffer)?
+        var tangentInstanceCount: UInt32
+        var instanceNormalTextureIndexBuffer: (any MTLBuffer)?
+        var materialTextureResourceIDs: [UInt64]
+        var localMaterialParameters: MaterialParameterData?
+        var instanceMaterialParameterBuffer: (any MTLBuffer)?
+        var materialInstanceCount: UInt32
     }
 
     private static let shaderSource = """
@@ -406,11 +538,46 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     #include <metal_raytracing>
     using namespace raytracing;
 
+    float imb_material_channel(float4 value, uint channel)
+    {
+        if (channel == 0u) return value.r;
+        if (channel == 1u) return value.g;
+        if (channel == 2u) return value.b;
+        return value.a;
+    }
+
     kernel void imb_trace_probe(
         instance_acceleration_structure accelerationStructure [[buffer(0)]],
         constant uint2 &extent [[buffer(1)]],
         constant uint2 &colors [[buffer(2)]],
+        constant float4 &cameraPositionAndFov [[buffer(3)]],
+        constant float4 &cameraForwardAndNear [[buffer(4)]],
+        constant float4 &cameraUpAndFar [[buffer(5)]],
+        constant uint &cameraOptions [[buffer(6)]],
+        constant float4 &sphereLightPositionAndIntensity [[buffer(7)]],
+        constant float4 &sphereLightColorAndRadius [[buffer(8)]],
+        constant float4 &distantLightDirectionAndIntensity [[buffer(9)]],
+        constant float4 &distantLightColorAndAngle [[buffer(10)]],
+        constant float4 &domeLightColorAndIntensity [[buffer(11)]],
+        const device float4 *triangleNormals [[buffer(12)]],
+        const device uint4 *instanceNormalRanges [[buffer(13)]],
+        constant uint &normalInstanceCount [[buffer(14)]],
+        const device float2 *triangleUVs [[buffer(15)]],
+        const device uint4 *instanceUVRanges [[buffer(16)]],
+        constant uint &uvInstanceCount [[buffer(17)]],
+        const device uint4 *instanceTextureIndices [[buffer(18)]],
+        constant uint &textureInstanceCount [[buffer(19)]],
+        constant uint &materialTextureCount [[buffer(20)]],
+        const device float4 *instanceMaterialParameters [[buffer(21)]],
+        constant uint &materialInstanceCount [[buffer(22)]],
+        const device uint *instanceMaterialTextureChannels [[buffer(23)]],
+        const device float4 *triangleTangents [[buffer(24)]],
+        const device uint4 *instanceTangentRanges [[buffer(25)]],
+        constant uint &tangentInstanceCount [[buffer(26)]],
+        const device uint *instanceNormalTextureIndices [[buffer(27)]],
         texture2d<float, access::write> output [[texture(0)]],
+        texture2d<float, access::sample> sceneMaterialTexture [[texture(1)]],
+        array<texture2d<float, access::sample>, 16> materialTextures [[texture(2)]],
         uint2 threadID [[thread_position_in_grid]])
     {
         if (threadID.x >= extent.x || threadID.y >= extent.y) return;
@@ -420,24 +587,38 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         const bool simpleGridView = colors.y == 0xffe08c31;
         ray probeRay;
         if (isaacSceneView) {
-            const float3 cameraPosition = float3(4.5, 4.5, 3.5);
-            const float3 cameraTarget = float3(0.0, 0.0, 0.5);
-            const float3 forward = normalize(cameraTarget - cameraPosition);
-            const float3 right = normalize(cross(forward, float3(0.0, 0.0, 1.0)));
+            const bool useLiveCamera = (cameraOptions & 1u) != 0;
+            const float3 cameraPosition = useLiveCamera
+                ? cameraPositionAndFov.xyz
+                : float3(4.5, 4.5, 3.5);
+            const float3 forward = useLiveCamera
+                ? normalize(cameraForwardAndNear.xyz)
+                : normalize(float3(0.0, 0.0, 0.5) - cameraPosition);
+            const float3 upHint = useLiveCamera
+                ? normalize(cameraUpAndFar.xyz)
+                : float3(0.0, 0.0, 1.0);
+            const float3 right = normalize(cross(forward, upHint));
             const float3 up = normalize(cross(right, forward));
             const float2 plane = normalized * 2.0 - 1.0;
             const float aspect = float(extent.x) / float(extent.y);
+            const float halfHeight = useLiveCamera
+                ? tan(clamp(cameraPositionAndFov.w, 0.01, 3.13) * 0.5)
+                : 0.52;
             probeRay.origin = cameraPosition;
             probeRay.direction = normalize(
-                forward + right * plane.x * aspect * 0.52 - up * plane.y * 0.52
+                forward + right * plane.x * aspect * halfHeight - up * plane.y * halfHeight
             );
         } else {
             const float2 plane = normalized * 2.2 - 1.1;
             probeRay.origin = float3(plane.x, -plane.y, -2.0);
             probeRay.direction = float3(0.0, 0.0, 1.0);
         }
-        probeRay.min_distance = 0.001;
-        probeRay.max_distance = 100.0;
+        probeRay.min_distance = (cameraOptions & 1u) != 0
+            ? max(cameraForwardAndNear.w, 0.0001)
+            : 0.001;
+        probeRay.max_distance = (cameraOptions & 1u) != 0
+            ? max(cameraUpAndFar.w, probeRay.min_distance + 0.001)
+            : 100.0;
 
         intersector<triangle_data, instancing> triangleIntersector;
         const auto intersection = triangleIntersector.intersect(probeRay, accelerationStructure);
@@ -467,11 +648,28 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 min(majorCell.x, majorCell.y)
             );
             const float distanceFade = clamp(1.15 - gridDistance * 0.045, 0.35, 1.0);
-            const float3 floorColor = float3(0.025, 0.075, 0.13);
-            const float3 minorColor = float3(0.20, 0.48, 0.72) * distanceFade;
-            const float3 majorColor = float3(0.62, 0.82, 1.0) * distanceFade;
-            float3 gridColor = mix(floorColor, minorColor, minorLine * 0.72);
-            gridColor = mix(gridColor, majorColor, majorLine);
+            float3 gridColor;
+            if ((cameraOptions & 4u) != 0) {
+                constexpr sampler materialSampler(
+                    coord::normalized,
+                    address::repeat,
+                    filter::linear,
+                    mip_filter::linear
+                );
+                // Simple Grid's OmniPBR material uses projected world-space
+                // UVs and inputs:texture_scale=(0.5, 0.5).
+                const float2 materialUV = worldPosition.xy * 0.5;
+                gridColor = sceneMaterialTexture.sample(
+                    materialSampler,
+                    materialUV
+                ).rgb;
+            } else {
+                const float3 floorColor = float3(0.025, 0.075, 0.13);
+                const float3 minorColor = float3(0.20, 0.48, 0.72) * distanceFade;
+                const float3 majorColor = float3(0.62, 0.82, 1.0) * distanceFade;
+                gridColor = mix(floorColor, minorColor, minorLine * 0.72);
+                gridColor = mix(gridColor, majorColor, majorLine);
+            }
             const float axisWidth = lineWidth * 1.8;
             const float xAxis = 1.0 - smoothstep(axisWidth, axisWidth * 2.0, abs(worldPosition.y));
             const float yAxis = 1.0 - smoothstep(axisWidth, axisWidth * 2.0, abs(worldPosition.x));
@@ -481,7 +679,333 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         } else if (isaacSceneView && hasTriangleHit) {
             const float shade = clamp(1.25 - intersection.distance * 0.12, 0.35, 1.0);
             const float instanceTint = 0.82 + 0.06 * float(intersection.instance_id % 3);
-            color = float4(float3(0.12, 0.48, 0.95) * shade * instanceTint, 1.0);
+            const uint materialID = intersection.user_instance_id;
+            const uint materialMarker = materialID & 0x00c00000u;
+            const bool hasAuthoredBaseColor = materialMarker == 0x00800000u;
+            const float3 authoredBaseColor = float3(
+                float(materialID & 0xffu) / 255.0,
+                float((materialID >> 8) & 0xffu) / 255.0,
+                float((materialID >> 16) & 0x7fu) / 127.0
+            );
+            float3 resolvedBaseColor = (
+                hasAuthoredBaseColor
+                    ? authoredBaseColor
+                    : float3(0.12, 0.48, 0.95)
+            );
+            uint4 textureIndices = uint4(0xffffffffu);
+            uint textureChannels = 0u;
+            float2 materialUV = float2(0.0);
+            bool canSampleMaterialTextures = false;
+            if (intersection.instance_id < uvInstanceCount
+                && intersection.instance_id < textureInstanceCount) {
+                textureIndices = instanceTextureIndices[intersection.instance_id];
+                textureChannels =
+                    instanceMaterialTextureChannels[intersection.instance_id];
+                const uint4 uvRange = instanceUVRanges[intersection.instance_id];
+                if (intersection.primitive_id < uvRange.y
+                    && uvRange.z == 3u) {
+                    const uint uvIndex = uvRange.x
+                        + intersection.primitive_id * 3u;
+                    const float2 barycentric =
+                        intersection.triangle_barycentric_coord;
+                    const float2 uv = triangleUVs[uvIndex]
+                            * (1.0 - barycentric.x - barycentric.y)
+                        + triangleUVs[uvIndex + 1] * barycentric.x
+                        + triangleUVs[uvIndex + 2] * barycentric.y;
+                    materialUV = float2(uv.x, 1.0 - uv.y);
+                    canSampleMaterialTextures = true;
+                }
+            }
+            constexpr sampler materialSampler(
+                coord::normalized,
+                address::repeat,
+                filter::linear,
+                mip_filter::none
+            );
+            if (canSampleMaterialTextures
+                && textureIndices.x < materialTextureCount) {
+                resolvedBaseColor = materialTextures[textureIndices.x].sample(
+                    materialSampler, materialUV
+                ).rgb;
+            }
+            float roughness = 0.5;
+            float metallic = 0.0;
+            float3 emissiveRadiance = float3(0.0);
+            bool hasMaterialParameters = false;
+            if (intersection.instance_id < materialInstanceCount) {
+                const uint materialOffset = intersection.instance_id * 2u;
+                const float4 parameters =
+                    instanceMaterialParameters[materialOffset];
+                if (parameters.w > 0.5) {
+                    roughness = clamp(parameters.x, 0.0, 1.0);
+                    metallic = clamp(parameters.y, 0.0, 1.0);
+                    const float4 emission =
+                        instanceMaterialParameters[materialOffset + 1u];
+                    emissiveRadiance = clamp(
+                        emission.xyz, float3(0.0), float3(1.0)
+                    ) * clamp(emission.w, 0.0, 1000000.0);
+                    hasMaterialParameters = true;
+                }
+            }
+            if (canSampleMaterialTextures
+                && textureIndices.y < materialTextureCount) {
+                const float4 sampleValue =
+                    materialTextures[textureIndices.y].sample(
+                        materialSampler, materialUV
+                    );
+                roughness = clamp(imb_material_channel(
+                    sampleValue, textureChannels & 0x7u
+                ), 0.0, 1.0);
+                hasMaterialParameters = true;
+            }
+            if (canSampleMaterialTextures
+                && textureIndices.z < materialTextureCount) {
+                const float4 sampleValue =
+                    materialTextures[textureIndices.z].sample(
+                        materialSampler, materialUV
+                    );
+                metallic = clamp(imb_material_channel(
+                    sampleValue, (textureChannels >> 4) & 0x7u
+                ), 0.0, 1.0);
+                hasMaterialParameters = true;
+            }
+            if (canSampleMaterialTextures
+                && textureIndices.w < materialTextureCount) {
+                const float3 emissionTexture = clamp(
+                    materialTextures[textureIndices.w].sample(
+                        materialSampler, materialUV
+                    ).rgb,
+                    float3(0.0),
+                    float3(1.0)
+                );
+                emissiveRadiance *= emissionTexture;
+            }
+            const float3 baseColor = resolvedBaseColor * shade * instanceTint;
+            if ((cameraOptions & (2u | 8u | 16u)) != 0) {
+                const float3 hitPosition =
+                    probeRay.origin + probeRay.direction * intersection.distance;
+                float3 surfaceNormal = normalize(-probeRay.direction);
+                if (intersection.instance_id < normalInstanceCount) {
+                    const uint4 normalRange =
+                        instanceNormalRanges[intersection.instance_id];
+                    if (intersection.primitive_id < normalRange.y) {
+                        const uint normalIndex = normalRange.x
+                            + intersection.primitive_id * normalRange.z;
+                        float3 geometryNormal = triangleNormals[normalIndex].xyz;
+                        if (normalRange.z == 3u) {
+                            const float2 barycentric =
+                                intersection.triangle_barycentric_coord;
+                            geometryNormal =
+                                triangleNormals[normalIndex].xyz
+                                    * (1.0 - barycentric.x - barycentric.y)
+                                + triangleNormals[normalIndex + 1].xyz
+                                    * barycentric.x
+                                + triangleNormals[normalIndex + 2].xyz
+                                    * barycentric.y;
+                        }
+                        if (dot(geometryNormal, geometryNormal) > 0.000001) {
+                            surfaceNormal = normalize(geometryNormal);
+                            // The USD Meshes used by the bounded bridge are
+                            // double-sided. Keep the real face plane while
+                            // orienting its normal toward the incoming ray.
+                            if (dot(surfaceNormal, -probeRay.direction) < 0.0) {
+                                surfaceNormal = -surfaceNormal;
+                            }
+                        }
+                    }
+                }
+                if (canSampleMaterialTextures
+                    && intersection.instance_id < tangentInstanceCount
+                    && intersection.instance_id < textureInstanceCount) {
+                    const uint normalTextureIndex =
+                        instanceNormalTextureIndices[intersection.instance_id];
+                    const uint4 tangentRange =
+                        instanceTangentRanges[intersection.instance_id];
+                    if (normalTextureIndex < materialTextureCount
+                        && intersection.primitive_id < tangentRange.y
+                        && tangentRange.z == 2u) {
+                        const uint tangentIndex = tangentRange.x
+                            + intersection.primitive_id * 2u;
+                        float3 tangent = triangleTangents[tangentIndex].xyz;
+                        float3 bitangent = triangleTangents[tangentIndex + 1u].xyz;
+                        tangent -= surfaceNormal * dot(tangent, surfaceNormal);
+                        const float tangentLengthSquared = dot(tangent, tangent);
+                        if (tangentLengthSquared > 0.000001) {
+                            tangent *= rsqrt(tangentLengthSquared);
+                            bitangent -= surfaceNormal
+                                * dot(bitangent, surfaceNormal);
+                            bitangent -= tangent * dot(bitangent, tangent);
+                            const float bitangentLengthSquared =
+                                dot(bitangent, bitangent);
+                            if (bitangentLengthSquared > 0.000001) {
+                                bitangent *= rsqrt(bitangentLengthSquared);
+                                if (dot(cross(tangent, bitangent), surfaceNormal) < 0.0) {
+                                    bitangent = -bitangent;
+                                }
+                                const float3 tangentNormal =
+                                    materialTextures[normalTextureIndex].sample(
+                                        materialSampler, materialUV
+                                    ).rgb * 2.0 - 1.0;
+                                if (dot(tangentNormal, tangentNormal) > 0.000001) {
+                                    surfaceNormal = normalize(
+                                        tangent * tangentNormal.x
+                                        + bitangent * tangentNormal.y
+                                        + surfaceNormal * tangentNormal.z
+                                    );
+                                    if (dot(surfaceNormal, -probeRay.direction) < 0.0) {
+                                        surfaceNormal = -surfaceNormal;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                float3 illumination = float3(0.18);
+                float3 specularIllumination = float3(0.0);
+                const float3 viewDirection = normalize(-probeRay.direction);
+                const float3 reflectance = mix(
+                    float3(0.04), resolvedBaseColor, metallic
+                );
+                const float specularExponent = mix(
+                    128.0, 4.0, roughness * roughness
+                );
+                const float specularEnergy = mix(1.0, 0.18, roughness);
+                if ((cameraOptions & 2u) != 0) {
+                    const float3 toLight = sphereLightPositionAndIntensity.xyz - hitPosition;
+                    const float lightDistanceSquared = max(dot(toLight, toLight), 0.0001);
+                    const float3 lightDirection = toLight * rsqrt(lightDistanceSquared);
+                    const float diffuse = max(dot(surfaceNormal, lightDirection), 0.0);
+                    float visibility = 1.0;
+                    if (diffuse > 0.0) {
+                        ray shadowRay;
+                        shadowRay.origin = hitPosition + surfaceNormal * 0.002;
+                        shadowRay.direction = lightDirection;
+                        shadowRay.min_distance = 0.001;
+                        shadowRay.max_distance = max(
+                            sqrt(lightDistanceSquared) - 0.004,
+                            shadowRay.min_distance
+                        );
+                        const auto shadowIntersection = triangleIntersector.intersect(
+                            shadowRay,
+                            accelerationStructure
+                        );
+                        visibility = shadowIntersection.type == intersection_type::none
+                            ? 1.0 : 0.0;
+                    }
+                    const float radius = max(sphereLightColorAndRadius.w, 1.0);
+                    const float attenuation = 1.0 / (
+                        1.0 + lightDistanceSquared / (radius * radius * 64.0)
+                    );
+                    const float strength = clamp(
+                        log2(1.0 + max(sphereLightPositionAndIntensity.w, 0.0)) * 0.12,
+                        0.15,
+                        2.5
+                    );
+                    const float3 lightColor = max(
+                        sphereLightColorAndRadius.xyz,
+                        float3(0.0)
+                    );
+                    illumination += lightColor * (0.25 + 0.75 * diffuse * visibility)
+                        * strength * attenuation;
+                    if (hasMaterialParameters && diffuse > 0.0 && visibility > 0.0) {
+                        const float3 halfUnnormalized =
+                            lightDirection + viewDirection;
+                        const float3 halfVector = halfUnnormalized * rsqrt(max(
+                            dot(halfUnnormalized, halfUnnormalized), 0.000001
+                        ));
+                        const float specular = pow(
+                            max(dot(surfaceNormal, halfVector), 0.0),
+                            specularExponent
+                        ) * specularEnergy;
+                        specularIllumination += lightColor * reflectance
+                            * specular * strength * attenuation * visibility;
+                    }
+                }
+                if ((cameraOptions & 8u) != 0) {
+                    // USD DistantLight emits along its transformed local -Z;
+                    // negate that vector for the surface-to-light direction.
+                    const float3 lightDirection = normalize(
+                        -distantLightDirectionAndIntensity.xyz
+                    );
+                    const float angularWrap = clamp(
+                        distantLightColorAndAngle.w / 180.0,
+                        0.0,
+                        1.0
+                    ) * 0.12;
+                    const float diffuse = clamp(
+                        dot(surfaceNormal, lightDirection) + angularWrap,
+                        0.0,
+                        1.0
+                    );
+                    float visibility = 1.0;
+                    if (diffuse > 0.0) {
+                        ray shadowRay;
+                        shadowRay.origin = hitPosition + surfaceNormal * 0.002;
+                        shadowRay.direction = lightDirection;
+                        shadowRay.min_distance = 0.001;
+                        shadowRay.max_distance = 1000000.0;
+                        const auto shadowIntersection = triangleIntersector.intersect(
+                            shadowRay,
+                            accelerationStructure
+                        );
+                        visibility = shadowIntersection.type == intersection_type::none
+                            ? 1.0 : 0.0;
+                    }
+                    const float strength = clamp(
+                        log2(1.0 + max(distantLightDirectionAndIntensity.w, 0.0))
+                            * 0.11,
+                        0.12,
+                        2.5
+                    );
+                    const float3 lightColor = max(
+                        distantLightColorAndAngle.xyz,
+                        float3(0.0)
+                    );
+                    illumination += lightColor
+                        * (0.18 + 0.82 * diffuse * visibility) * strength;
+                    if (hasMaterialParameters && diffuse > 0.0 && visibility > 0.0) {
+                        const float3 halfUnnormalized =
+                            lightDirection + viewDirection;
+                        const float3 halfVector = halfUnnormalized * rsqrt(max(
+                            dot(halfUnnormalized, halfUnnormalized), 0.000001
+                        ));
+                        const float specular = pow(
+                            max(dot(surfaceNormal, halfVector), 0.0),
+                            specularExponent
+                        ) * specularEnergy;
+                        specularIllumination += lightColor * reflectance
+                            * specular * strength * visibility;
+                    }
+                }
+                if ((cameraOptions & 16u) != 0) {
+                    const float strength = clamp(
+                        log2(1.0 + max(domeLightColorAndIntensity.w, 0.0)) * 0.08,
+                        0.10,
+                        2.0
+                    );
+                    illumination += max(
+                        domeLightColorAndIntensity.xyz,
+                        float3(0.0)
+                    ) * strength * 0.55;
+                    if (hasMaterialParameters) {
+                        specularIllumination += max(
+                            domeLightColorAndIntensity.xyz,
+                            float3(0.0)
+                        ) * reflectance * strength
+                            * mix(0.45, 0.08, roughness);
+                    }
+                }
+                const float diffuseWeight = hasMaterialParameters
+                    ? (1.0 - metallic) : 1.0;
+                color = float4(
+                    baseColor * illumination * diffuseWeight
+                        + specularIllumination * shade * instanceTint
+                        + emissiveRadiance,
+                    1.0
+                );
+            } else {
+                color = float4(baseColor + emissiveRadiance, 1.0);
+            }
         } else {
             const uint packed = intersection.type == intersection_type::none ? colors.x : colors.y;
             color = float4(
@@ -502,6 +1026,8 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     private let uiPipeline: any MTLRenderPipelineState
     private let uiSampler: any MTLSamplerState
     private let whiteTexture: any MTLTexture
+    private let sceneMaterialTexture: any MTLTexture
+    private let hasSceneMaterialTexture: Bool
     private let rayTracePipeline: (any MTLComputePipelineState)?
     private let spirvCompiler: SPIRVCrossCompiler?
     private var buffers: [UInt64: any MTLBuffer] = [:]
@@ -523,10 +1049,25 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         } else {
             compiler = nil
         }
-        return try? MetalGPUBackend(device: device, spirvCompiler: compiler)
+        let sceneMaterialTextureURL: URL?
+        if let path = ProcessInfo.processInfo.environment["IMB_SCENE_MATERIAL_TEXTURE"],
+           !path.isEmpty {
+            sceneMaterialTextureURL = URL(fileURLWithPath: path)
+        } else {
+            sceneMaterialTextureURL = nil
+        }
+        return try? MetalGPUBackend(
+            device: device,
+            spirvCompiler: compiler,
+            sceneMaterialTextureURL: sceneMaterialTextureURL
+        )
     }
 
-    public init(device: any MTLDevice, spirvCompiler: SPIRVCrossCompiler? = nil) throws {
+    public init(
+        device: any MTLDevice,
+        spirvCompiler: SPIRVCrossCompiler? = nil,
+        sceneMaterialTextureURL: URL? = nil
+    ) throws {
         guard let queue = device.makeCommandQueue() else {
             throw GPUBackendError.unavailable("Metal command queue creation failed")
         }
@@ -621,6 +1162,33 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             bytesPerRow: 4
         )
         self.whiteTexture = whiteTexture
+        if let sceneMaterialTextureURL {
+            do {
+                let texture = try MTKTextureLoader(device: device).newTexture(
+                    URL: sceneMaterialTextureURL,
+                    options: [
+                        .SRGB: false,
+                        .origin: MTKTextureLoader.Origin.bottomLeft,
+                        .generateMipmaps: true,
+                    ]
+                )
+                texture.label = "IMB real USD OmniPBR diffuse texture"
+                self.sceneMaterialTexture = texture
+                self.hasSceneMaterialTexture = true
+                FileHandle.standardError.write(Data(
+                    "imb-host: loaded real scene material texture \(sceneMaterialTextureURL.path) \(texture.width)x\(texture.height)\n".utf8
+                ))
+            } catch {
+                self.sceneMaterialTexture = whiteTexture
+                self.hasSceneMaterialTexture = false
+                FileHandle.standardError.write(Data(
+                    "imb-host: scene material texture load failed, using analytic fallback: \(error)\n".utf8
+                ))
+            }
+        } else {
+            self.sceneMaterialTexture = whiteTexture
+            self.hasSceneMaterialTexture = false
+        }
         self.spirvCompiler = spirvCompiler
         self.device = device
         self.queue = queue
@@ -633,7 +1201,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
 
     public func createBuffer(id: UInt64, size: UInt64, options: UInt32) throws {
         guard options == 0 else {
-            throw GPUBackendError.unsupported("nonzero Metal buffer options are not defined by IMB protocol 1.10")
+            throw GPUBackendError.unsupported("nonzero Metal buffer options are not defined by the current IMB protocol")
         }
         guard size > 0, size <= UInt64(Int.max), size <= UInt64(device.maxBufferLength) else {
             throw GPUBackendError.outOfBounds
@@ -1042,7 +1610,26 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             type: type,
             requestedSize: requestedSize,
             structure: nil,
-            childStructureIDs: []
+            childStructureIDs: [],
+            localTriangleNormals: nil,
+            localTriangleUVs: nil,
+            localTriangleTangents: nil,
+            worldTriangleNormalBuffer: nil,
+            instanceNormalRangeBuffer: nil,
+            normalInstanceCount: 0,
+            triangleUVBuffer: nil,
+            instanceUVRangeBuffer: nil,
+            uvInstanceCount: 0,
+            instanceTextureIndexBuffer: nil,
+            instanceMaterialTextureChannelBuffer: nil,
+            worldTriangleTangentBuffer: nil,
+            instanceTangentRangeBuffer: nil,
+            tangentInstanceCount: 0,
+            instanceNormalTextureIndexBuffer: nil,
+            materialTextureResourceIDs: [],
+            localMaterialParameters: nil,
+            instanceMaterialParameterBuffer: nil,
+            materialInstanceCount: 0
         )
     }
 
@@ -1079,8 +1666,12 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             let dataBuffer = try requireBuffer(geometry.dataResourceID)
             switch geometry.kind {
             case .triangles:
-                guard geometry.vertexFormat == 1,
-                      geometry.stride >= 12,
+                guard (1...6).contains(geometry.vertexFormat),
+                      geometry.stride >= (geometry.vertexFormat == 6
+                        ? 80 : (geometry.vertexFormat == 5
+                        ? 56 : (geometry.vertexFormat == 4
+                            ? 40 : (geometry.vertexFormat == 3
+                                ? 32 : (geometry.vertexFormat == 2 ? 24 : 12))))),
                       geometry.stride % 4 == 0,
                       geometry.dataOffset <= UInt64(dataBuffer.length)
                 else {
@@ -1103,7 +1694,11 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                     let vertexLength = try stridedRangeLength(
                         count: vertexCount,
                         stride: UInt64(geometry.stride),
-                        elementSize: 12
+                        elementSize: geometry.vertexFormat == 6
+                            ? 80 : (geometry.vertexFormat == 5
+                            ? 56 : (geometry.vertexFormat == 4
+                                ? 40 : (geometry.vertexFormat == 3
+                                    ? 32 : (geometry.vertexFormat == 2 ? 24 : 12))))
                     )
                     try validateRange(
                         offset: geometry.dataOffset,
@@ -1207,6 +1802,33 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         }
         resource.structure = structure
         resource.childStructureIDs = []
+        resource.localTriangleNormals = geometries.count == 1
+            ? try? triangleNormals(for: geometries[0])
+            : nil
+        resource.localTriangleUVs = geometries.count == 1
+            ? try? triangleUVs(for: geometries[0])
+            : nil
+        resource.localTriangleTangents = geometries.count == 1
+            ? try? triangleTangents(for: geometries[0])
+            : nil
+        resource.worldTriangleNormalBuffer = nil
+        resource.instanceNormalRangeBuffer = nil
+        resource.normalInstanceCount = 0
+        resource.triangleUVBuffer = nil
+        resource.instanceUVRangeBuffer = nil
+        resource.uvInstanceCount = 0
+        resource.instanceTextureIndexBuffer = nil
+        resource.instanceMaterialTextureChannelBuffer = nil
+        resource.worldTriangleTangentBuffer = nil
+        resource.instanceTangentRangeBuffer = nil
+        resource.tangentInstanceCount = 0
+        resource.instanceNormalTextureIndexBuffer = nil
+        resource.materialTextureResourceIDs = []
+        resource.localMaterialParameters = geometries.count == 1
+            ? try? materialParameters(for: geometries[0])
+            : nil
+        resource.instanceMaterialParameterBuffer = nil
+        resource.materialInstanceCount = 0
         accelerationStructures[id] = resource
     }
 
@@ -1230,6 +1852,25 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         descriptorBytes.reserveCapacity(instances.count * 68)
         var instancedStructures: [any MTLAccelerationStructure] = []
         instancedStructures.reserveCapacity(instances.count)
+        var worldTriangleNormals: [SIMD4<Float>] = []
+        var instanceNormalRanges: [SIMD4<UInt32>] = []
+        instanceNormalRanges.reserveCapacity(instances.count)
+        var worldTriangleTangents: [SIMD4<Float>] = []
+        var instanceTangentRanges: [SIMD4<UInt32>] = []
+        instanceTangentRanges.reserveCapacity(instances.count)
+        var triangleUVs: [SIMD2<Float>] = []
+        var instanceUVRanges: [SIMD4<UInt32>] = []
+        instanceUVRanges.reserveCapacity(instances.count)
+        var instanceTextureIndices: [SIMD4<UInt32>] = []
+        instanceTextureIndices.reserveCapacity(instances.count)
+        var instanceMaterialTextureChannels: [UInt32] = []
+        instanceMaterialTextureChannels.reserveCapacity(instances.count)
+        var instanceNormalTextureIndices: [UInt32] = []
+        instanceNormalTextureIndices.reserveCapacity(instances.count)
+        var materialTextureResourceIDs: [UInt64] = []
+        var instanceMaterialParameters: [SIMD4<Float>] = []
+        instanceMaterialParameters.reserveCapacity(instances.count * 2)
+        var hasMaterialParameters = false
         for instance in instances {
             guard instance.transformationMatrix.count == 12,
                   instance.transformationMatrix.allSatisfy(\.isFinite),
@@ -1252,6 +1893,122 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             descriptorBytes.appendLittleEndian(UInt32(instancedStructures.count))
             descriptorBytes.appendLittleEndian(instance.userID)
             instancedStructures.append(childStructure)
+            if let parameters = child.localMaterialParameters {
+                instanceMaterialParameters.append(SIMD4<Float>(
+                    parameters.roughness, parameters.metallic, 0, 1
+                ))
+                instanceMaterialParameters.append(SIMD4<Float>(
+                    parameters.emissionColor,
+                    parameters.emissionIntensity
+                ))
+                hasMaterialParameters = true
+            } else {
+                instanceMaterialParameters.append(SIMD4<Float>(0.5, 0, 0, 0))
+                instanceMaterialParameters.append(SIMD4<Float>(0, 0, 0, 0))
+            }
+
+            let normalOffset = worldTriangleNormals.count
+            if let localNormals = child.localTriangleNormals,
+               normalOffset <= Int(UInt32.max),
+               localNormals.values.count <= Int(UInt32.max) - normalOffset,
+               localNormals.normalsPerTriangle > 0,
+               localNormals.values.count
+                    == Int(localNormals.triangleCount * localNormals.normalsPerTriangle) {
+                worldTriangleNormals.append(contentsOf: localNormals.values.map {
+                    transformedNormal($0, by: instance.transformationMatrix)
+                })
+                instanceNormalRanges.append(SIMD4<UInt32>(
+                    UInt32(normalOffset),
+                    localNormals.triangleCount,
+                    localNormals.normalsPerTriangle,
+                    0
+                ))
+            } else {
+                instanceNormalRanges.append(SIMD4<UInt32>(0, 0, 0, 0))
+            }
+
+            let tangentOffset = worldTriangleTangents.count
+            if let localTangents = child.localTriangleTangents,
+               tangentOffset <= Int(UInt32.max),
+               localTangents.values.count <= Int(UInt32.max) - tangentOffset,
+               localTangents.values.count == Int(localTangents.triangleCount) * 2 {
+                worldTriangleTangents.append(contentsOf: localTangents.values.map {
+                    transformedDirection($0, by: instance.transformationMatrix)
+                })
+                instanceTangentRanges.append(SIMD4<UInt32>(
+                    UInt32(tangentOffset), localTangents.triangleCount, 2, 0
+                ))
+            } else {
+                instanceTangentRanges.append(SIMD4<UInt32>(0, 0, 0, 0))
+            }
+
+            let uvOffset = triangleUVs.count
+            if let localUVs = child.localTriangleUVs,
+               uvOffset <= Int(UInt32.max),
+               localUVs.values.count <= Int(UInt32.max) - uvOffset,
+               localUVs.values.count == Int(localUVs.triangleCount) * 3 {
+                triangleUVs.append(contentsOf: localUVs.values)
+                instanceUVRanges.append(SIMD4<UInt32>(
+                    UInt32(uvOffset), localUVs.triangleCount, 3, 0
+                ))
+                let appendTextureIndex = { (textureResourceID: UInt64) -> UInt32 in
+                    guard textureResourceID != 0,
+                          self.images[textureResourceID] != nil
+                    else {
+                        return UInt32.max
+                    }
+                    if let existing = materialTextureResourceIDs.firstIndex(
+                        of: textureResourceID
+                    ) {
+                        return UInt32(existing)
+                    }
+                    guard materialTextureResourceIDs.count < 16 else {
+                        return UInt32.max
+                    }
+                    let textureIndex = UInt32(materialTextureResourceIDs.count)
+                    materialTextureResourceIDs.append(textureResourceID)
+                    return textureIndex
+                }
+                if let descriptor = materialTextureDescriptor(
+                    userID: instance.userID
+                ) {
+                    instanceTextureIndices.append(SIMD4<UInt32>(
+                        appendTextureIndex(descriptor.resourceIDs[0]),
+                        appendTextureIndex(descriptor.resourceIDs[1]),
+                        appendTextureIndex(descriptor.resourceIDs[2]),
+                        appendTextureIndex(descriptor.resourceIDs[3])
+                    ))
+                    instanceMaterialTextureChannels.append(
+                        descriptor.channels.x
+                        | (descriptor.channels.y << 4)
+                        | (descriptor.channels.z << 8)
+                    )
+                    instanceNormalTextureIndices.append(
+                        appendTextureIndex(descriptor.resourceIDs[4])
+                    )
+                } else {
+                    let textureResourceID = UInt64(
+                        instance.userID & 0x003f_ffff
+                    )
+                    let hasLegacyBaseTexture =
+                        instance.userID & 0x00c0_0000 == 0x0040_0000
+                    instanceTextureIndices.append(SIMD4<UInt32>(
+                        hasLegacyBaseTexture
+                            ? appendTextureIndex(textureResourceID)
+                            : UInt32.max,
+                        UInt32.max,
+                        UInt32.max,
+                        UInt32.max
+                    ))
+                    instanceMaterialTextureChannels.append(0)
+                    instanceNormalTextureIndices.append(UInt32.max)
+                }
+            } else {
+                instanceUVRanges.append(SIMD4<UInt32>(0, 0, 0, 0))
+                instanceTextureIndices.append(SIMD4<UInt32>(repeating: UInt32.max))
+                instanceMaterialTextureChannels.append(0)
+                instanceNormalTextureIndices.append(UInt32.max)
+            }
         }
 
         let instanceBuffer = descriptorBytes.withUnsafeBytes { bytes in
@@ -1315,6 +2072,172 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         }
         resource.structure = structure
         resource.childStructureIDs = instances.map(\.accelerationStructureResourceID)
+        if !worldTriangleNormals.isEmpty {
+            resource.worldTriangleNormalBuffer = worldTriangleNormals.withUnsafeBytes { bytes in
+                guard let baseAddress = bytes.baseAddress else {
+                    return nil as (any MTLBuffer)?
+                }
+                return device.makeBuffer(
+                    bytes: baseAddress,
+                    length: bytes.count,
+                    options: .storageModeShared
+                )
+            }
+            resource.instanceNormalRangeBuffer = instanceNormalRanges.withUnsafeBytes { bytes in
+                guard let baseAddress = bytes.baseAddress else {
+                    return nil as (any MTLBuffer)?
+                }
+                return device.makeBuffer(
+                    bytes: baseAddress,
+                    length: bytes.count,
+                    options: .storageModeShared
+                )
+            }
+            guard resource.worldTriangleNormalBuffer != nil,
+                  resource.instanceNormalRangeBuffer != nil
+            else {
+                throw GPUBackendError.unavailable(
+                    "Metal triangle-normal lookup allocation failed"
+                )
+            }
+            resource.normalInstanceCount = UInt32(instanceNormalRanges.count)
+        } else {
+            resource.worldTriangleNormalBuffer = nil
+            resource.instanceNormalRangeBuffer = nil
+            resource.normalInstanceCount = 0
+        }
+        if !worldTriangleTangents.isEmpty {
+            resource.worldTriangleTangentBuffer =
+                worldTriangleTangents.withUnsafeBytes { bytes in
+                    guard let baseAddress = bytes.baseAddress else {
+                        return nil as (any MTLBuffer)?
+                    }
+                    return device.makeBuffer(
+                        bytes: baseAddress,
+                        length: bytes.count,
+                        options: .storageModeShared
+                    )
+                }
+            resource.instanceTangentRangeBuffer =
+                instanceTangentRanges.withUnsafeBytes { bytes in
+                    guard let baseAddress = bytes.baseAddress else {
+                        return nil as (any MTLBuffer)?
+                    }
+                    return device.makeBuffer(
+                        bytes: baseAddress,
+                        length: bytes.count,
+                        options: .storageModeShared
+                    )
+                }
+            guard resource.worldTriangleTangentBuffer != nil,
+                  resource.instanceTangentRangeBuffer != nil
+            else {
+                throw GPUBackendError.unavailable(
+                    "Metal triangle-tangent lookup allocation failed"
+                )
+            }
+            resource.tangentInstanceCount = UInt32(instanceTangentRanges.count)
+        } else {
+            resource.worldTriangleTangentBuffer = nil
+            resource.instanceTangentRangeBuffer = nil
+            resource.tangentInstanceCount = 0
+        }
+        if !triangleUVs.isEmpty, !materialTextureResourceIDs.isEmpty {
+            resource.triangleUVBuffer = triangleUVs.withUnsafeBytes { bytes in
+                guard let baseAddress = bytes.baseAddress else {
+                    return nil as (any MTLBuffer)?
+                }
+                return device.makeBuffer(
+                    bytes: baseAddress,
+                    length: bytes.count,
+                    options: .storageModeShared
+                )
+            }
+            resource.instanceUVRangeBuffer = instanceUVRanges.withUnsafeBytes { bytes in
+                guard let baseAddress = bytes.baseAddress else {
+                    return nil as (any MTLBuffer)?
+                }
+                return device.makeBuffer(
+                    bytes: baseAddress,
+                    length: bytes.count,
+                    options: .storageModeShared
+                )
+            }
+            resource.instanceTextureIndexBuffer = instanceTextureIndices.withUnsafeBytes { bytes in
+                guard let baseAddress = bytes.baseAddress else {
+                    return nil as (any MTLBuffer)?
+                }
+                return device.makeBuffer(
+                    bytes: baseAddress,
+                    length: bytes.count,
+                    options: .storageModeShared
+                )
+            }
+            resource.instanceMaterialTextureChannelBuffer =
+                instanceMaterialTextureChannels.withUnsafeBytes { bytes in
+                    guard let baseAddress = bytes.baseAddress else {
+                        return nil as (any MTLBuffer)?
+                    }
+                    return device.makeBuffer(
+                        bytes: baseAddress,
+                        length: bytes.count,
+                        options: .storageModeShared
+                    )
+                }
+            resource.instanceNormalTextureIndexBuffer =
+                instanceNormalTextureIndices.withUnsafeBytes { bytes in
+                    guard let baseAddress = bytes.baseAddress else {
+                        return nil as (any MTLBuffer)?
+                    }
+                    return device.makeBuffer(
+                        bytes: baseAddress,
+                        length: bytes.count,
+                        options: .storageModeShared
+                    )
+                }
+            guard resource.triangleUVBuffer != nil,
+                  resource.instanceUVRangeBuffer != nil,
+                  resource.instanceTextureIndexBuffer != nil,
+                  resource.instanceMaterialTextureChannelBuffer != nil,
+                  resource.instanceNormalTextureIndexBuffer != nil
+            else {
+                throw GPUBackendError.unavailable(
+                    "Metal triangle-UV lookup allocation failed"
+                )
+            }
+            resource.uvInstanceCount = UInt32(instanceUVRanges.count)
+            resource.materialTextureResourceIDs = materialTextureResourceIDs
+        } else {
+            resource.triangleUVBuffer = nil
+            resource.instanceUVRangeBuffer = nil
+            resource.uvInstanceCount = 0
+            resource.instanceTextureIndexBuffer = nil
+            resource.instanceMaterialTextureChannelBuffer = nil
+            resource.instanceNormalTextureIndexBuffer = nil
+            resource.materialTextureResourceIDs = []
+        }
+        if hasMaterialParameters {
+            resource.instanceMaterialParameterBuffer =
+                instanceMaterialParameters.withUnsafeBytes { bytes in
+                    guard let baseAddress = bytes.baseAddress else {
+                        return nil as (any MTLBuffer)?
+                    }
+                    return device.makeBuffer(
+                        bytes: baseAddress,
+                        length: bytes.count,
+                        options: .storageModeShared
+                    )
+                }
+            guard resource.instanceMaterialParameterBuffer != nil else {
+                throw GPUBackendError.unavailable(
+                    "Metal instance-material lookup allocation failed"
+                )
+            }
+            resource.materialInstanceCount = UInt32(instances.count)
+        } else {
+            resource.instanceMaterialParameterBuffer = nil
+            resource.materialInstanceCount = 0
+        }
         accelerationStructures[id] = resource
     }
 
@@ -1722,6 +2645,10 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         height: UInt32,
         missRGBA8: UInt32,
         hitRGBA8: UInt32,
+        camera: RayCamera?,
+        sphereLight: RaySphereLight?,
+        distantLight: RayDistantLight?,
+        domeLight: RayDomeLight?,
         fenceID: UInt64
     ) throws {
         guard let pipeline = rayTracePipeline, device.supportsRaytracing else {
@@ -1748,10 +2675,262 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         encoder.setComputePipelineState(pipeline)
         encoder.setAccelerationStructure(structure, bufferIndex: 0)
         encoder.setTexture(image.texture, index: 0)
+        encoder.setTexture(sceneMaterialTexture, index: 1)
+        for textureIndex in 0..<16 {
+            let materialTexture: any MTLTexture
+            if textureIndex < acceleration.materialTextureResourceIDs.count,
+               let resource = images[
+                    acceleration.materialTextureResourceIDs[textureIndex]
+               ] {
+                materialTexture = resource.texture
+            } else {
+                materialTexture = whiteTexture
+            }
+            encoder.setTexture(materialTexture, index: 2 + textureIndex)
+            encoder.useResource(materialTexture, usage: .read)
+        }
         var extent = SIMD2<UInt32>(width, height)
         var colors = SIMD2<UInt32>(missRGBA8, hitRGBA8)
+        var cameraPositionAndFov = SIMD4<Float>(
+            camera?.position.x ?? 0,
+            camera?.position.y ?? 0,
+            camera?.position.z ?? 0,
+            camera?.verticalFOVRadians ?? 0
+        )
+        var cameraForwardAndNear = SIMD4<Float>(
+            camera?.forward.x ?? 0,
+            camera?.forward.y ?? 0,
+            camera?.forward.z ?? 0,
+            camera?.nearDistance ?? 0
+        )
+        var cameraUpAndFar = SIMD4<Float>(
+            camera?.up.x ?? 0,
+            camera?.up.y ?? 0,
+            camera?.up.z ?? 0,
+            camera?.farDistance ?? 0
+        )
+        var cameraOptions: UInt32 = (camera == nil ? 0 : 1)
+            | (sphereLight == nil ? 0 : 2)
+            | (hasSceneMaterialTexture ? 4 : 0)
+            | (distantLight == nil ? 0 : 8)
+            | (domeLight == nil ? 0 : 16)
+        var sphereLightPositionAndIntensity = SIMD4<Float>(
+            sphereLight?.position.x ?? 0,
+            sphereLight?.position.y ?? 0,
+            sphereLight?.position.z ?? 0,
+            sphereLight?.intensity ?? 0
+        )
+        var sphereLightColorAndRadius = SIMD4<Float>(
+            sphereLight?.color.x ?? 0,
+            sphereLight?.color.y ?? 0,
+            sphereLight?.color.z ?? 0,
+            sphereLight?.radius ?? 0
+        )
+        var distantLightDirectionAndIntensity = SIMD4<Float>(
+            distantLight?.direction.x ?? 0,
+            distantLight?.direction.y ?? 0,
+            distantLight?.direction.z ?? 0,
+            distantLight?.intensity ?? 0
+        )
+        var distantLightColorAndAngle = SIMD4<Float>(
+            distantLight?.color.x ?? 0,
+            distantLight?.color.y ?? 0,
+            distantLight?.color.z ?? 0,
+            distantLight?.angleDegrees ?? 0
+        )
+        var domeLightColorAndIntensity = SIMD4<Float>(
+            domeLight?.color.x ?? 0,
+            domeLight?.color.y ?? 0,
+            domeLight?.color.z ?? 0,
+            domeLight?.intensity ?? 0
+        )
         encoder.setBytes(&extent, length: MemoryLayout<SIMD2<UInt32>>.size, index: 1)
         encoder.setBytes(&colors, length: MemoryLayout<SIMD2<UInt32>>.size, index: 2)
+        encoder.setBytes(
+            &cameraPositionAndFov,
+            length: MemoryLayout<SIMD4<Float>>.size,
+            index: 3
+        )
+        encoder.setBytes(
+            &cameraForwardAndNear,
+            length: MemoryLayout<SIMD4<Float>>.size,
+            index: 4
+        )
+        encoder.setBytes(
+            &cameraUpAndFar,
+            length: MemoryLayout<SIMD4<Float>>.size,
+            index: 5
+        )
+        encoder.setBytes(&cameraOptions, length: MemoryLayout<UInt32>.size, index: 6)
+        encoder.setBytes(
+            &sphereLightPositionAndIntensity,
+            length: MemoryLayout<SIMD4<Float>>.size,
+            index: 7
+        )
+        encoder.setBytes(
+            &sphereLightColorAndRadius,
+            length: MemoryLayout<SIMD4<Float>>.size,
+            index: 8
+        )
+        encoder.setBytes(
+            &distantLightDirectionAndIntensity,
+            length: MemoryLayout<SIMD4<Float>>.size,
+            index: 9
+        )
+        encoder.setBytes(
+            &distantLightColorAndAngle,
+            length: MemoryLayout<SIMD4<Float>>.size,
+            index: 10
+        )
+        encoder.setBytes(
+            &domeLightColorAndIntensity,
+            length: MemoryLayout<SIMD4<Float>>.size,
+            index: 11
+        )
+        var fallbackNormal = SIMD4<Float>(0, 0, 0, 0)
+        var fallbackRange = SIMD4<UInt32>(0, 0, 0, 0)
+        var normalInstanceCount = acceleration.normalInstanceCount
+        if let normalBuffer = acceleration.worldTriangleNormalBuffer,
+           let rangeBuffer = acceleration.instanceNormalRangeBuffer {
+            encoder.setBuffer(normalBuffer, offset: 0, index: 12)
+            encoder.setBuffer(rangeBuffer, offset: 0, index: 13)
+            encoder.useResource(normalBuffer, usage: .read)
+            encoder.useResource(rangeBuffer, usage: .read)
+        } else {
+            encoder.setBytes(
+                &fallbackNormal,
+                length: MemoryLayout<SIMD4<Float>>.size,
+                index: 12
+            )
+            encoder.setBytes(
+                &fallbackRange,
+                length: MemoryLayout<SIMD4<UInt32>>.size,
+                index: 13
+            )
+            normalInstanceCount = 0
+        }
+        encoder.setBytes(
+            &normalInstanceCount,
+            length: MemoryLayout<UInt32>.size,
+            index: 14
+        )
+        var fallbackUV = SIMD2<Float>(0, 0)
+        var fallbackUVRange = SIMD4<UInt32>(0, 0, 0, 0)
+        var fallbackTextureIndices = SIMD4<UInt32>(repeating: UInt32.max)
+        var fallbackMaterialTextureChannels: UInt32 = 0
+        var fallbackNormalTextureIndex = UInt32.max
+        var uvInstanceCount = acceleration.uvInstanceCount
+        var textureInstanceCount = acceleration.uvInstanceCount
+        var materialTextureCount = UInt32(
+            min(acceleration.materialTextureResourceIDs.count, 16)
+        )
+        if let uvBuffer = acceleration.triangleUVBuffer,
+           let uvRangeBuffer = acceleration.instanceUVRangeBuffer,
+           let textureIndexBuffer = acceleration.instanceTextureIndexBuffer,
+           let textureChannelBuffer =
+               acceleration.instanceMaterialTextureChannelBuffer,
+           let normalTextureIndexBuffer =
+               acceleration.instanceNormalTextureIndexBuffer {
+            encoder.setBuffer(uvBuffer, offset: 0, index: 15)
+            encoder.setBuffer(uvRangeBuffer, offset: 0, index: 16)
+            encoder.setBuffer(textureIndexBuffer, offset: 0, index: 18)
+            encoder.setBuffer(textureChannelBuffer, offset: 0, index: 23)
+            encoder.setBuffer(normalTextureIndexBuffer, offset: 0, index: 27)
+            encoder.useResource(uvBuffer, usage: .read)
+            encoder.useResource(uvRangeBuffer, usage: .read)
+            encoder.useResource(textureIndexBuffer, usage: .read)
+            encoder.useResource(textureChannelBuffer, usage: .read)
+            encoder.useResource(normalTextureIndexBuffer, usage: .read)
+        } else {
+            encoder.setBytes(
+                &fallbackUV,
+                length: MemoryLayout<SIMD2<Float>>.size,
+                index: 15
+            )
+            encoder.setBytes(
+                &fallbackUVRange,
+                length: MemoryLayout<SIMD4<UInt32>>.size,
+                index: 16
+            )
+            encoder.setBytes(
+                &fallbackTextureIndices,
+                length: MemoryLayout<SIMD4<UInt32>>.size,
+                index: 18
+            )
+            encoder.setBytes(
+                &fallbackMaterialTextureChannels,
+                length: MemoryLayout<UInt32>.size,
+                index: 23
+            )
+            encoder.setBytes(
+                &fallbackNormalTextureIndex,
+                length: MemoryLayout<UInt32>.size,
+                index: 27
+            )
+            uvInstanceCount = 0
+            textureInstanceCount = 0
+            materialTextureCount = 0
+        }
+        encoder.setBytes(
+            &uvInstanceCount,
+            length: MemoryLayout<UInt32>.size,
+            index: 17
+        )
+        encoder.setBytes(
+            &textureInstanceCount,
+            length: MemoryLayout<UInt32>.size,
+            index: 19
+        )
+        encoder.setBytes(
+            &materialTextureCount,
+            length: MemoryLayout<UInt32>.size,
+            index: 20
+        )
+        var fallbackMaterialParameters = SIMD4<Float>(0.5, 0, 0, 0)
+        var materialInstanceCount = acceleration.materialInstanceCount
+        if let materialBuffer = acceleration.instanceMaterialParameterBuffer {
+            encoder.setBuffer(materialBuffer, offset: 0, index: 21)
+            encoder.useResource(materialBuffer, usage: .read)
+        } else {
+            encoder.setBytes(
+                &fallbackMaterialParameters,
+                length: MemoryLayout<SIMD4<Float>>.size,
+                index: 21
+            )
+            materialInstanceCount = 0
+        }
+        encoder.setBytes(
+            &materialInstanceCount,
+            length: MemoryLayout<UInt32>.size,
+            index: 22
+        )
+        var fallbackTangent = SIMD4<Float>(0, 0, 0, 0)
+        var fallbackTangentRange = SIMD4<UInt32>(0, 0, 0, 0)
+        var tangentInstanceCount = acceleration.tangentInstanceCount
+        if let tangentBuffer = acceleration.worldTriangleTangentBuffer,
+           let tangentRangeBuffer = acceleration.instanceTangentRangeBuffer {
+            encoder.setBuffer(tangentBuffer, offset: 0, index: 24)
+            encoder.setBuffer(tangentRangeBuffer, offset: 0, index: 25)
+            encoder.useResource(tangentBuffer, usage: .read)
+            encoder.useResource(tangentRangeBuffer, usage: .read)
+        } else {
+            encoder.setBytes(
+                &fallbackTangent,
+                length: MemoryLayout<SIMD4<Float>>.size,
+                index: 24
+            )
+            encoder.setBytes(
+                &fallbackTangentRange,
+                length: MemoryLayout<SIMD4<UInt32>>.size,
+                index: 25
+            )
+            tangentInstanceCount = 0
+        }
+        encoder.setBytes(
+            &tangentInstanceCount,
+            length: MemoryLayout<UInt32>.size,
+            index: 26
+        )
         for childID in acceleration.childStructureIDs {
             guard let child = accelerationStructures[childID]?.structure else {
                 throw GPUBackendError.resourceNotFound(childID)
@@ -1815,6 +2994,78 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         return buffer
     }
 
+    private func materialTextureDescriptor(
+        userID: UInt32
+    ) -> MaterialTextureDescriptor? {
+        guard userID & 0x00c0_0000 == 0x00c0_0000 else { return nil }
+        let descriptorID = UInt64(userID & 0x003f_ffff)
+        guard descriptorID != 0,
+              let buffer = buffers[descriptorID],
+              buffer.length >= 48
+        else {
+            return nil
+        }
+        let prefix = (0..<4).map { index in
+            UInt32(littleEndian: buffer.contents().advanced(by: index * 4)
+                .assumingMemoryBound(to: UInt32.self).pointee)
+        }
+        let version = prefix[1]
+        let wordCount = version == 2 ? 14 : 12
+        guard prefix[0] == 0x314d_424d,
+              version == 1 || version == 2,
+              buffer.length >= wordCount * 4
+        else {
+            return nil
+        }
+        let words = (0..<wordCount).map { index in
+            UInt32(littleEndian: buffer.contents().advanced(by: index * 4)
+                .assumingMemoryBound(to: UInt32.self).pointee)
+        }
+        let flags = words[2]
+        let supportedFlags: UInt32 = version == 2 ? 0x1f : 0x0f
+        guard flags & ~supportedFlags == 0,
+              flags & (version == 2 ? 0x1e : 0x0e) != 0
+        else {
+            return nil
+        }
+        var resourceIDs = stride(
+            from: 4,
+            through: version == 2 ? 12 : 10,
+            by: 2
+        ).map { index in
+            UInt64(words[index]) | (UInt64(words[index + 1]) << 32)
+        }
+        if version == 1 { resourceIDs.append(0) }
+        for index in 0..<5 {
+            let present = flags & (UInt32(1) << UInt32(index)) != 0
+            if present {
+                guard resourceIDs[index] != 0,
+                      images[resourceIDs[index]] != nil
+                else {
+                    return nil
+                }
+            } else if resourceIDs[index] != 0 {
+                return nil
+            }
+        }
+        let packedChannels = words[3]
+        let roughnessChannel = packedChannels & 0x7
+        let metallicChannel = (packedChannels >> 4) & 0x7
+        let emissionChannel = (packedChannels >> 8) & 0x7
+        guard (flags & 2 == 0 || roughnessChannel <= 3),
+              (flags & 4 == 0 || metallicChannel <= 3),
+              (flags & 8 == 0 || emissionChannel == 4)
+        else {
+            return nil
+        }
+        return MaterialTextureDescriptor(
+            resourceIDs: resourceIDs,
+            channels: SIMD4<UInt32>(
+                roughnessChannel, metallicChannel, emissionChannel, 0
+            )
+        )
+    }
+
     private func validateRange(offset: UInt64, length: UInt64, bufferLength: UInt64) throws {
         guard offset <= bufferLength, length <= bufferLength - offset else {
             throw GPUBackendError.outOfBounds
@@ -1832,6 +3083,421 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         let (length, addedOverflow) = span.addingReportingOverflow(elementSize)
         guard !multipliedOverflow, !addedOverflow else { throw GPUBackendError.outOfBounds }
         return length
+    }
+
+    private func triangleNormals(
+        for geometry: PrimitiveAccelerationStructureGeometry
+    ) throws -> TriangleNormalData? {
+        guard geometry.kind == .triangles,
+              (1...6).contains(geometry.vertexFormat)
+        else {
+            return nil
+        }
+        let vertexBuffer = try requireBuffer(geometry.dataResourceID)
+        let indexBuffer = geometry.indexType == 0
+            ? nil : try requireBuffer(geometry.indexResourceID)
+        let transform: [Float]?
+        if geometry.transformResourceID != 0 {
+            let transformBuffer = try requireBuffer(geometry.transformResourceID)
+            try validateRange(
+                offset: geometry.transformOffset,
+                length: 48,
+                bufferLength: UInt64(transformBuffer.length)
+            )
+            transform = (0..<12).map { component in
+                readFloat(
+                    from: transformBuffer,
+                    offset: Int(geometry.transformOffset) + component * 4
+                )
+            }
+        } else {
+            transform = nil
+        }
+
+        var normals: [SIMD4<Float>] = []
+        let normalsPerTriangle: UInt32 = geometry.vertexFormat >= 2 ? 3 : 1
+        normals.reserveCapacity(Int(geometry.primitiveCount * normalsPerTriangle))
+        for triangleIndex in 0..<Int(geometry.primitiveCount) {
+            var points: [SIMD3<Float>] = []
+            points.reserveCapacity(3)
+            var authoredNormals: [SIMD4<Float>] = []
+            if geometry.vertexFormat >= 2 {
+                authoredNormals.reserveCapacity(3)
+            }
+            for corner in 0..<3 {
+                let linearIndex = triangleIndex * 3 + corner
+                let vertexIndex: UInt64
+                switch geometry.indexType {
+                case 0:
+                    vertexIndex = UInt64(linearIndex)
+                case 1:
+                    guard let indexBuffer else { return nil }
+                    let offset = try checkedInt(geometry.indexOffset) + linearIndex * 2
+                    guard offset <= indexBuffer.length - 2 else { return nil }
+                    vertexIndex = UInt64(
+                        indexBuffer.contents().advanced(by: offset)
+                            .assumingMemoryBound(to: UInt16.self).pointee
+                    )
+                case 2:
+                    guard let indexBuffer else { return nil }
+                    let offset = try checkedInt(geometry.indexOffset) + linearIndex * 4
+                    guard offset <= indexBuffer.length - 4 else { return nil }
+                    vertexIndex = UInt64(
+                        indexBuffer.contents().advanced(by: offset)
+                            .assumingMemoryBound(to: UInt32.self).pointee
+                    )
+                default:
+                    return nil
+                }
+                let (strideOffset, overflow) = vertexIndex.multipliedReportingOverflow(
+                    by: UInt64(geometry.stride)
+                )
+                let (vertexOffset, addedOverflow) = geometry.dataOffset
+                    .addingReportingOverflow(strideOffset)
+                guard !overflow, !addedOverflow,
+                      vertexOffset <= UInt64(vertexBuffer.length),
+                      UInt64(vertexBuffer.length) - vertexOffset
+                        >= (geometry.vertexFormat == 6
+                            ? 80 : (geometry.vertexFormat == 5
+                            ? 56 : (geometry.vertexFormat == 4
+                                ? 40 : (geometry.vertexFormat == 3
+                                    ? 32 : (geometry.vertexFormat == 2 ? 24 : 12)))))
+                else {
+                    return nil
+                }
+                let offset = try checkedInt(vertexOffset)
+                var point = SIMD3<Float>(
+                    readFloat(from: vertexBuffer, offset: offset),
+                    readFloat(from: vertexBuffer, offset: offset + 4),
+                    readFloat(from: vertexBuffer, offset: offset + 8)
+                )
+                if let transform {
+                    point = SIMD3<Float>(
+                        transform[0] * point.x + transform[1] * point.y
+                            + transform[2] * point.z + transform[3],
+                        transform[4] * point.x + transform[5] * point.y
+                            + transform[6] * point.z + transform[7],
+                        transform[8] * point.x + transform[9] * point.y
+                            + transform[10] * point.z + transform[11]
+                    )
+                }
+                points.append(point)
+                if geometry.vertexFormat >= 2 {
+                    var normal = SIMD4<Float>(
+                        readFloat(from: vertexBuffer, offset: offset + 12),
+                        readFloat(from: vertexBuffer, offset: offset + 16),
+                        readFloat(from: vertexBuffer, offset: offset + 20),
+                        0
+                    )
+                    if let transform {
+                        normal = transformedNormal(normal, by: transform)
+                    } else {
+                        let lengthSquared = normal.x * normal.x
+                            + normal.y * normal.y + normal.z * normal.z
+                        guard lengthSquared > 0.000000000001,
+                              lengthSquared.isFinite
+                        else {
+                            return nil
+                        }
+                        normal *= 1 / sqrt(lengthSquared)
+                    }
+                    guard normal.x.isFinite, normal.y.isFinite, normal.z.isFinite,
+                          normal.x * normal.x + normal.y * normal.y
+                            + normal.z * normal.z > 0.000001
+                    else {
+                        return nil
+                    }
+                    authoredNormals.append(normal)
+                }
+            }
+            if geometry.vertexFormat >= 2 {
+                guard authoredNormals.count == 3 else { return nil }
+                normals.append(contentsOf: authoredNormals)
+                continue
+            }
+            let edgeA = points[1] - points[0]
+            let edgeB = points[2] - points[0]
+            let cross = SIMD3<Float>(
+                edgeA.y * edgeB.z - edgeA.z * edgeB.y,
+                edgeA.z * edgeB.x - edgeA.x * edgeB.z,
+                edgeA.x * edgeB.y - edgeA.y * edgeB.x
+            )
+            let lengthSquared = cross.x * cross.x + cross.y * cross.y
+                + cross.z * cross.z
+            if lengthSquared > 0.000000000001, lengthSquared.isFinite {
+                let inverseLength = 1 / sqrt(lengthSquared)
+                normals.append(SIMD4<Float>(cross * inverseLength, 0))
+            } else {
+                normals.append(SIMD4<Float>(0, 0, 0, 0))
+            }
+        }
+        return TriangleNormalData(
+            values: normals,
+            triangleCount: geometry.primitiveCount,
+            normalsPerTriangle: normalsPerTriangle
+        )
+    }
+
+    private func triangleUVs(
+        for geometry: PrimitiveAccelerationStructureGeometry
+    ) throws -> TriangleUVData? {
+        guard geometry.kind == .triangles,
+              (3...6).contains(geometry.vertexFormat)
+        else {
+            return nil
+        }
+        let vertexBuffer = try requireBuffer(geometry.dataResourceID)
+        let indexBuffer = geometry.indexType == 0
+            ? nil : try requireBuffer(geometry.indexResourceID)
+        var values: [SIMD2<Float>] = []
+        values.reserveCapacity(Int(geometry.primitiveCount) * 3)
+        for triangleIndex in 0..<Int(geometry.primitiveCount) {
+            for corner in 0..<3 {
+                let linearIndex = triangleIndex * 3 + corner
+                let vertexIndex: UInt64
+                switch geometry.indexType {
+                case 0:
+                    vertexIndex = UInt64(linearIndex)
+                case 1:
+                    guard let indexBuffer else { return nil }
+                    let offset = try checkedInt(geometry.indexOffset) + linearIndex * 2
+                    guard indexBuffer.length >= 2, offset <= indexBuffer.length - 2 else {
+                        return nil
+                    }
+                    vertexIndex = UInt64(
+                        indexBuffer.contents().advanced(by: offset)
+                            .assumingMemoryBound(to: UInt16.self).pointee
+                    )
+                case 2:
+                    guard let indexBuffer else { return nil }
+                    let offset = try checkedInt(geometry.indexOffset) + linearIndex * 4
+                    guard indexBuffer.length >= 4, offset <= indexBuffer.length - 4 else {
+                        return nil
+                    }
+                    vertexIndex = UInt64(
+                        indexBuffer.contents().advanced(by: offset)
+                            .assumingMemoryBound(to: UInt32.self).pointee
+                    )
+                default:
+                    return nil
+                }
+                let (strideOffset, multipliedOverflow) = vertexIndex
+                    .multipliedReportingOverflow(by: UInt64(geometry.stride))
+                let (vertexOffset, addedOverflow) = geometry.dataOffset
+                    .addingReportingOverflow(strideOffset)
+                guard !multipliedOverflow, !addedOverflow,
+                      vertexOffset <= UInt64(vertexBuffer.length),
+                      UInt64(vertexBuffer.length) - vertexOffset >= 32
+                else {
+                    return nil
+                }
+                let offset = try checkedInt(vertexOffset)
+                let uv = SIMD2<Float>(
+                    readFloat(from: vertexBuffer, offset: offset + 24),
+                    readFloat(from: vertexBuffer, offset: offset + 28)
+                )
+                guard uv.x.isFinite, uv.y.isFinite else { return nil }
+                values.append(uv)
+            }
+        }
+        return TriangleUVData(values: values, triangleCount: geometry.primitiveCount)
+    }
+
+    private func materialParameters(
+        for geometry: PrimitiveAccelerationStructureGeometry
+    ) throws -> MaterialParameterData? {
+        guard geometry.kind == .triangles,
+              (4...6).contains(geometry.vertexFormat)
+        else {
+            return nil
+        }
+        let vertexBuffer = try requireBuffer(geometry.dataResourceID)
+        let firstVertexIndex: UInt64
+        switch geometry.indexType {
+        case 0:
+            firstVertexIndex = 0
+        case 1:
+            let indexBuffer = try requireBuffer(geometry.indexResourceID)
+            let offset = try checkedInt(geometry.indexOffset)
+            guard indexBuffer.length >= 2, offset <= indexBuffer.length - 2 else {
+                return nil
+            }
+            firstVertexIndex = UInt64(
+                indexBuffer.contents().advanced(by: offset)
+                    .assumingMemoryBound(to: UInt16.self).pointee
+            )
+        case 2:
+            let indexBuffer = try requireBuffer(geometry.indexResourceID)
+            let offset = try checkedInt(geometry.indexOffset)
+            guard indexBuffer.length >= 4, offset <= indexBuffer.length - 4 else {
+                return nil
+            }
+            firstVertexIndex = UInt64(
+                indexBuffer.contents().advanced(by: offset)
+                    .assumingMemoryBound(to: UInt32.self).pointee
+            )
+        default:
+            return nil
+        }
+        let (strideOffset, multipliedOverflow) = firstVertexIndex
+            .multipliedReportingOverflow(by: UInt64(geometry.stride))
+        let (vertexOffset, addedOverflow) = geometry.dataOffset
+            .addingReportingOverflow(strideOffset)
+        guard !multipliedOverflow, !addedOverflow,
+              vertexOffset <= UInt64(vertexBuffer.length),
+              UInt64(vertexBuffer.length) - vertexOffset
+                >= (geometry.vertexFormat == 6
+                    ? 80 : (geometry.vertexFormat == 5 ? 56 : 40))
+        else {
+            return nil
+        }
+        let offset = try checkedInt(vertexOffset)
+        let roughness = readFloat(from: vertexBuffer, offset: offset + 32)
+        let metallic = readFloat(from: vertexBuffer, offset: offset + 36)
+        guard roughness.isFinite, metallic.isFinite,
+              (0...1).contains(roughness), (0...1).contains(metallic)
+        else {
+            return nil
+        }
+        var emissionColor = SIMD3<Float>(repeating: 0)
+        var emissionIntensity: Float = 0
+        if geometry.vertexFormat >= 5 {
+            emissionColor = SIMD3<Float>(
+                readFloat(from: vertexBuffer, offset: offset + 40),
+                readFloat(from: vertexBuffer, offset: offset + 44),
+                readFloat(from: vertexBuffer, offset: offset + 48)
+            )
+            emissionIntensity = readFloat(
+                from: vertexBuffer, offset: offset + 52
+            )
+            guard emissionColor.x.isFinite, emissionColor.y.isFinite,
+                  emissionColor.z.isFinite, emissionIntensity.isFinite,
+                  (0...1).contains(emissionColor.x),
+                  (0...1).contains(emissionColor.y),
+                  (0...1).contains(emissionColor.z),
+                  (0...1_000_000).contains(emissionIntensity)
+            else {
+                return nil
+            }
+        }
+        return MaterialParameterData(
+            roughness: roughness,
+            metallic: metallic,
+            emissionColor: emissionColor,
+            emissionIntensity: emissionIntensity
+        )
+    }
+
+    private func triangleTangents(
+        for geometry: PrimitiveAccelerationStructureGeometry
+    ) throws -> TriangleTangentData? {
+        guard geometry.kind == .triangles,
+              geometry.vertexFormat == 6,
+              geometry.indexType == 0,
+              geometry.stride >= 80
+        else {
+            return nil
+        }
+        let vertexBuffer = try requireBuffer(geometry.dataResourceID)
+        var values: [SIMD4<Float>] = []
+        values.reserveCapacity(Int(geometry.primitiveCount) * 2)
+        for triangleIndex in 0..<Int(geometry.primitiveCount) {
+            let vertexIndex = UInt64(triangleIndex * 3)
+            let (strideOffset, multipliedOverflow) = vertexIndex
+                .multipliedReportingOverflow(by: UInt64(geometry.stride))
+            let (vertexOffset, addedOverflow) = geometry.dataOffset
+                .addingReportingOverflow(strideOffset)
+            guard !multipliedOverflow, !addedOverflow,
+                  vertexOffset <= UInt64(vertexBuffer.length),
+                  UInt64(vertexBuffer.length) - vertexOffset >= 80
+            else {
+                return nil
+            }
+            let offset = try checkedInt(vertexOffset)
+            var tangent = SIMD4<Float>(
+                readFloat(from: vertexBuffer, offset: offset + 56),
+                readFloat(from: vertexBuffer, offset: offset + 60),
+                readFloat(from: vertexBuffer, offset: offset + 64),
+                0
+            )
+            var bitangent = SIMD4<Float>(
+                readFloat(from: vertexBuffer, offset: offset + 68),
+                readFloat(from: vertexBuffer, offset: offset + 72),
+                readFloat(from: vertexBuffer, offset: offset + 76),
+                0
+            )
+            let tangentLengthSquared = tangent.x * tangent.x
+                + tangent.y * tangent.y + tangent.z * tangent.z
+            let bitangentLengthSquared = bitangent.x * bitangent.x
+                + bitangent.y * bitangent.y + bitangent.z * bitangent.z
+            guard tangentLengthSquared.isFinite,
+                  bitangentLengthSquared.isFinite,
+                  tangentLengthSquared > 0.000000000001,
+                  bitangentLengthSquared > 0.000000000001
+            else {
+                return nil
+            }
+            tangent *= 1 / sqrt(tangentLengthSquared)
+            bitangent *= 1 / sqrt(bitangentLengthSquared)
+            values.append(tangent)
+            values.append(bitangent)
+        }
+        return TriangleTangentData(
+            values: values,
+            triangleCount: geometry.primitiveCount
+        )
+    }
+
+    private func transformedNormal(
+        _ normal: SIMD4<Float>,
+        by transform: [Float]
+    ) -> SIMD4<Float> {
+        guard transform.count == 12 else { return SIMD4<Float>(0, 0, 0, 0) }
+        // Cofactor(A) * n is det(A) * inverse-transpose(A) * n. It preserves
+        // the winding produced by transforming the triangle and avoids a
+        // divide for singular transforms.
+        let x = (transform[5] * transform[10] - transform[6] * transform[9]) * normal.x
+            + (transform[6] * transform[8] - transform[4] * transform[10]) * normal.y
+            + (transform[4] * transform[9] - transform[5] * transform[8]) * normal.z
+        let y = (transform[2] * transform[9] - transform[1] * transform[10]) * normal.x
+            + (transform[0] * transform[10] - transform[2] * transform[8]) * normal.y
+            + (transform[1] * transform[8] - transform[0] * transform[9]) * normal.z
+        let z = (transform[1] * transform[6] - transform[2] * transform[5]) * normal.x
+            + (transform[2] * transform[4] - transform[0] * transform[6]) * normal.y
+            + (transform[0] * transform[5] - transform[1] * transform[4]) * normal.z
+        let lengthSquared = x * x + y * y + z * z
+        guard lengthSquared > 0.000000000001, lengthSquared.isFinite else {
+            return SIMD4<Float>(0, 0, 0, 0)
+        }
+        let inverseLength = 1 / sqrt(lengthSquared)
+        return SIMD4<Float>(x * inverseLength, y * inverseLength, z * inverseLength, 0)
+    }
+
+    private func transformedDirection(
+        _ direction: SIMD4<Float>,
+        by transform: [Float]
+    ) -> SIMD4<Float> {
+        guard transform.count == 12 else { return SIMD4<Float>(0, 0, 0, 0) }
+        let transformed = SIMD4<Float>(
+            transform[0] * direction.x + transform[1] * direction.y
+                + transform[2] * direction.z,
+            transform[4] * direction.x + transform[5] * direction.y
+                + transform[6] * direction.z,
+            transform[8] * direction.x + transform[9] * direction.y
+                + transform[10] * direction.z,
+            0
+        )
+        let lengthSquared = transformed.x * transformed.x
+            + transformed.y * transformed.y + transformed.z * transformed.z
+        guard lengthSquared.isFinite, lengthSquared > 0.000000000001 else {
+            return SIMD4<Float>(0, 0, 0, 0)
+        }
+        return transformed * (1 / sqrt(lengthSquared))
+    }
+
+    private func readFloat(from buffer: any MTLBuffer, offset: Int) -> Float {
+        Float(bitPattern: buffer.contents().advanced(by: offset)
+            .assumingMemoryBound(to: UInt32.self).pointee)
     }
 
     private func writeFrameIfRequested(imageID: UInt64, fenceID: UInt64) throws {
@@ -1865,7 +3531,11 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             }
         }
         let outputPath: String
-        if ProcessInfo.processInfo.environment["IMB_FRAME_OUTPUT_ALL"] == "1" {
+        if ProcessInfo.processInfo.environment["IMB_FRAME_OUTPUT_ALL_LATEST"] == "1" {
+            // Keep one current diagnostic frame per Metal image instead of
+            // writing an unbounded file for every Kit update.
+            outputPath = "\(path).image-\(imageID).ppm"
+        } else if ProcessInfo.processInfo.environment["IMB_FRAME_OUTPUT_ALL"] == "1" {
             outputPath = "\(path).image-\(imageID).fence-\(fenceID).ppm"
         } else {
             outputPath = path
@@ -1902,7 +3572,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     public func submitCompute(pipelineID: UInt64, groupCountX: UInt32, groupCountY: UInt32, groupCountZ: UInt32, bindings: [ComputeBinding], pushConstants: Data, fenceID: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
     public func submitTriangle(imageID: UInt64, clearRGBA8: UInt32, fenceID: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
     public func submitIndexedUI(imageID: UInt64, vertexBufferID: UInt64, indexBufferID: UInt64, vertexBufferOffset: UInt64, indexBufferOffset: UInt64, width: UInt32, height: UInt32, clearRGBA8: UInt32, draws: [IndexedUIDraw], fenceID: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
-    public func submitRayTrace(imageID: UInt64, accelerationStructureID: UInt64, width: UInt32, height: UInt32, missRGBA8: UInt32, hitRGBA8: UInt32, fenceID: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
+    public func submitRayTrace(imageID: UInt64, accelerationStructureID: UInt64, width: UInt32, height: UInt32, missRGBA8: UInt32, hitRGBA8: UInt32, camera: RayCamera?, sphereLight: RaySphereLight?, distantLight: RayDistantLight?, domeLight: RayDomeLight?, fenceID: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
     public func waitFence(id: UInt64) throws -> Bool { throw GPUBackendError.unavailable("Metal is unavailable") }
     public func reset() {}
 }
