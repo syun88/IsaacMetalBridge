@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import math
 import struct
 from collections import deque
 
@@ -72,6 +73,9 @@ class InputForwardingExtension(omni.ext.IExt):
         self._provider = carb.input.acquire_input_provider()
         self._mouse = None
         self._keyboard = None
+        self._navigation_mode = None
+        self._navigation_previous = None
+        self._navigation_error_reported = False
         self._subscription = omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(
             self._on_update, name="isaacmetalbridge.input"
         )
@@ -92,7 +96,122 @@ class InputForwardingExtension(omni.ext.IExt):
         self._provider = None
         self._mouse = None
         self._keyboard = None
+        self._navigation_mode = None
+        self._navigation_previous = None
         self._pending.clear()
+
+    def _apply_navigation(self, mode, delta_x, delta_y, width, height):
+        """Move the active real Kit USD camera for a bridged drag gesture."""
+
+        try:
+            from pxr import Gf, UsdGeom
+            from omni.kit.viewport.utility import get_active_viewport
+            from omni.kit.viewport.utility.camera_state import ViewportCameraState
+
+            viewport = get_active_viewport()
+            if viewport is None:
+                return
+            camera_path = getattr(viewport, "camera_path", None)
+            if callable(camera_path):
+                camera_path = camera_path()
+            if not camera_path:
+                return
+            camera_state = ViewportCameraState(
+                camera_path=str(camera_path), viewport=viewport
+            )
+            position = Gf.Vec3d(camera_state.position_world)
+            target = Gf.Vec3d(camera_state.target_world)
+            offset = position - target
+            distance = offset.GetLength()
+            if not math.isfinite(distance) or distance <= 0.000001:
+                return
+            stage = viewport.stage
+            world_up = camera_state.get_world_camera_up(stage).GetNormalized()
+            viewport_width = max(float(width), 1.0)
+            viewport_height = max(float(height), 1.0)
+
+            if mode == "orbit":
+                # Kit documents a full viewport drag as a 180-degree tumble.
+                yaw_degrees = -float(delta_x) / viewport_width * 180.0
+                yawed_offset = Gf.Rotation(
+                    world_up, yaw_degrees
+                ).TransformDir(offset)
+                forward = (-yawed_offset).GetNormalized()
+                right = Gf.Cross(forward, world_up)
+                if right.GetLength() <= 0.000001:
+                    return
+                right.Normalize()
+                pitch_degrees = -float(delta_y) / viewport_height * 180.0
+                rotated_offset = Gf.Rotation(
+                    right, pitch_degrees
+                ).TransformDir(yawed_offset)
+                camera_state.set_position_world(
+                    target + rotated_offset, True
+                )
+            elif mode == "pan":
+                forward = (target - position).GetNormalized()
+                right = Gf.Cross(forward, world_up)
+                if right.GetLength() <= 0.000001:
+                    return
+                right.Normalize()
+                camera_up = Gf.Cross(right, forward).GetNormalized()
+                usd_camera = UsdGeom.Camera(stage.GetPrimAtPath(camera_path))
+                focal_length = float(usd_camera.GetFocalLengthAttr().Get())
+                vertical_aperture = float(
+                    usd_camera.GetVerticalApertureAttr().Get()
+                )
+                if focal_length <= 0.0 or vertical_aperture <= 0.0:
+                    return
+                vertical_fov = 2.0 * math.atan(
+                    vertical_aperture / (2.0 * focal_length)
+                )
+                visible_height = 2.0 * distance * math.tan(vertical_fov * 0.5)
+                visible_width = visible_height * viewport_width / viewport_height
+                movement = (
+                    right * (-float(delta_x) / viewport_width * visible_width)
+                    + camera_up * (float(delta_y) / viewport_height * visible_height)
+                )
+                camera_state.set_position_world(position + movement, False)
+            self._navigation_error_reported = False
+        except Exception as error:
+            if not self._navigation_error_reported:
+                carb.log_error(
+                    "isaacmetalbridge.input: direct viewport navigation failed: "
+                    f"{error}"
+                )
+                self._navigation_error_reported = True
+
+    def _handle_navigation(self, kind, x, y, modifiers, width, height):
+        """Consume the viewer's explicit Alt-drag navigation modes."""
+
+        alt = (modifiers & 4) != 0
+        if kind == 2 and alt:
+            self._navigation_mode = "orbit"
+            self._navigation_previous = (x, y)
+            return True
+        if kind == 6 and alt:
+            self._navigation_mode = "pan"
+            self._navigation_previous = (x, y)
+            return True
+        if kind == 1 and self._navigation_mode and self._navigation_previous:
+            previous_x, previous_y = self._navigation_previous
+            self._navigation_previous = (x, y)
+            self._apply_navigation(
+                self._navigation_mode,
+                x - previous_x,
+                y - previous_y,
+                width,
+                height,
+            )
+            return True
+        if (
+            (kind == 3 and self._navigation_mode == "orbit")
+            or (kind == 7 and self._navigation_mode == "pan")
+        ):
+            self._navigation_mode = None
+            self._navigation_previous = None
+            return True
+        return False
 
     def _on_update(self, _event) -> None:
         if self._test_reference_url:
@@ -140,9 +259,19 @@ class InputForwardingExtension(omni.ext.IExt):
                         self._pending[-1] = record
                     else:
                         self._pending.append(record)
-            # Kit UI needs press and release to be distributed on separate updates.
-            if self._pending:
-                self._dispatch(self._pending.popleft())
+            # Kit UI needs press and release to be distributed on separate
+            # updates, but delaying every preceding move/scroll/character by
+            # a full render update makes clicks appear unresponsive when a
+            # large Metal TLAS temporarily lowers Full to sub-1 FPS. Drain
+            # non-transition records together and stop after the first button
+            # or key transition. A move+down therefore reaches Kit in one
+            # update while the matching up remains safely queued for the next.
+            transition_kinds = {2, 3, 4, 5, 6, 7, 9, 10}
+            while self._pending:
+                record = self._pending.popleft()
+                self._dispatch(record)
+                if record[2] in transition_kinds:
+                    break
         except FileNotFoundError:
             return
         except Exception as error:
@@ -158,7 +287,10 @@ class InputForwardingExtension(omni.ext.IExt):
             self._mouse = app_window.get_mouse()
             self._keyboard = app_window.get_keyboard()
 
-        if kind in _MOUSE_EVENT_TYPES:
+        navigation_handled = self._handle_navigation(
+            kind, x, y, modifiers, width, height
+        )
+        if kind in _MOUSE_EVENT_TYPES and not navigation_handled:
             if kind == 8:
                 pixel = (delta_x, delta_y)
                 normalized = (

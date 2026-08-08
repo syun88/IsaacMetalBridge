@@ -14,6 +14,8 @@ adapter_log="$(mktemp -t imb-isaac-adapter.XXXXXX)"
 guest_log="$(mktemp -t imb-isaac-guest.XXXXXX)"
 builder_was_running=0
 
+"${script_dir}/cleanup-bridge-containers.sh"
+
 if [[ "$(container builder status 2>/dev/null | awk 'NR == 2 {print $3}')" == "running" ]]; then
     builder_was_running=1
 fi

@@ -13,6 +13,8 @@ container_ppm="${artifact_dir}/imb-metal-triangle-container.ppm"
 container_png="${artifact_dir}/imb-metal-triangle-container.png"
 builder_was_running=0
 
+"${script_dir}/cleanup-bridge-containers.sh"
+
 if [[ "$(container builder status 2>/dev/null | awk 'NR == 2 {print $3}')" == "running" ]]; then
     builder_was_running=1
 fi

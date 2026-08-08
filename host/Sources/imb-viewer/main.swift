@@ -96,10 +96,18 @@ private final class InputEventFileWriter {
     }
 }
 
+private enum PrimaryDragMode: String {
+    case select = "Select"
+    case orbit = "Orbit"
+    case pan = "Pan"
+}
+
 @MainActor
 private final class InteractiveImageView: NSImageView {
     private let inputWriter: InputEventFileWriter?
     private var tracking: NSTrackingArea?
+    private var activePrimaryDragMode: PrimaryDragMode = .select
+    var primaryDragMode: PrimaryDragMode = .select
     var targetPixelSize = NSSize(width: 1_440, height: 900)
 
     init(inputWriter: InputEventFileWriter?) {
@@ -133,7 +141,11 @@ private final class InteractiveImageView: NSImageView {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        sendMouse(.mouseMove, event: event)
+        sendMouse(
+            .mouseMove,
+            event: event,
+            forcedModifiers: activePrimaryDragMode == .select ? 0 : 4
+        )
     }
 
     override func rightMouseDragged(with event: NSEvent) {
@@ -146,11 +158,31 @@ private final class InteractiveImageView: NSImageView {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        sendMouse(.leftMouseDown, event: event)
+        activePrimaryDragMode = primaryDragMode
+        switch activePrimaryDragMode {
+        case .select:
+            sendMouse(.leftMouseDown, event: event)
+        case .orbit:
+            // Kit's TumbleGesture is Alt + LeftButton. Carry Alt in every
+            // synthetic mouse record so the real viewport camera manipulator
+            // receives the documented gesture without requiring a physical
+            // keyboard chord from the native viewer.
+            sendMouse(.leftMouseDown, event: event, forcedModifiers: 4)
+        case .pan:
+            sendMouse(.middleMouseDown, event: event, forcedModifiers: 4)
+        }
     }
 
     override func mouseUp(with event: NSEvent) {
-        sendMouse(.leftMouseUp, event: event)
+        switch activePrimaryDragMode {
+        case .select:
+            sendMouse(.leftMouseUp, event: event)
+        case .orbit:
+            sendMouse(.leftMouseUp, event: event, forcedModifiers: 4)
+        case .pan:
+            sendMouse(.middleMouseUp, event: event, forcedModifiers: 4)
+        }
+        activePrimaryDragMode = .select
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -218,13 +250,17 @@ private final class InteractiveImageView: NSImageView {
         )
     }
 
-    private func sendMouse(_ kind: ViewerInputKind, event: NSEvent) {
+    private func sendMouse(
+        _ kind: ViewerInputKind,
+        event: NSEvent,
+        forcedModifiers: UInt32 = 0
+    ) {
         guard let point = targetPoint(for: event) else { return }
         inputWriter?.append(
             kind: kind,
             x: point.x,
             y: point.y,
-            modifiers: modifierFlags(for: event),
+            modifiers: modifierFlags(for: event) | forcedModifiers,
             targetWidth: UInt32(targetPixelSize.width),
             targetHeight: UInt32(targetPixelSize.height)
         )
@@ -372,6 +408,7 @@ private final class ViewerAppDelegate: NSObject, NSApplicationDelegate {
     private var placeholder: NSTextField?
     private var refreshTimer: Timer?
     private var lastSignature: String?
+    private var primaryDragMode: PrimaryDragMode = .select
 
     init(frameURL: URL, inputURL: URL?, title: String) throws {
         self.frameURL = frameURL
@@ -396,6 +433,7 @@ private final class ViewerAppDelegate: NSObject, NSApplicationDelegate {
             defer: false
         )
         window.title = windowTitle
+        window.subtitle = "Primary drag: \(primaryDragMode.rawValue)"
         window.minSize = NSSize(width: 720, height: 450)
         window.isReleasedWhenClosed = false
         window.backgroundColor = .black
@@ -406,6 +444,7 @@ private final class ViewerAppDelegate: NSObject, NSApplicationDelegate {
         content.wantsLayer = true
         content.layer?.backgroundColor = NSColor.black.cgColor
         let imageView = InteractiveImageView(inputWriter: inputWriter)
+        imageView.primaryDragMode = primaryDragMode
         imageView.translatesAutoresizingMaskIntoConstraints = false
         imageView.imageAlignment = .alignCenter
         imageView.imageScaling = .scaleProportionallyUpOrDown
@@ -447,6 +486,27 @@ private final class ViewerAppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    @objc func selectPrimaryDragMode(_ sender: NSMenuItem) {
+        setPrimaryDragMode(.select, sender: sender)
+    }
+
+    @objc func orbitPrimaryDragMode(_ sender: NSMenuItem) {
+        setPrimaryDragMode(.orbit, sender: sender)
+    }
+
+    @objc func panPrimaryDragMode(_ sender: NSMenuItem) {
+        setPrimaryDragMode(.pan, sender: sender)
+    }
+
+    private func setPrimaryDragMode(_ mode: PrimaryDragMode, sender: NSMenuItem) {
+        primaryDragMode = mode
+        imageView?.primaryDragMode = mode
+        window?.subtitle = "Primary drag: \(mode.rawValue)"
+        for item in sender.menu?.items ?? [] {
+            item.state = item === sender ? .on : .off
+        }
+    }
+
     @objc private func refreshFrame() {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: frameURL.path),
               let modificationDate = attributes[.modificationDate] as? Date,
@@ -468,6 +528,12 @@ do {
     let application = NSApplication.shared
     application.setActivationPolicy(.regular)
 
+    let delegate = try ViewerAppDelegate(
+        frameURL: arguments.frameURL,
+        inputURL: arguments.inputURL,
+        title: arguments.title
+    )
+
     let mainMenu = NSMenu()
     let applicationItem = NSMenuItem()
     mainMenu.addItem(applicationItem)
@@ -478,13 +544,25 @@ do {
         keyEquivalent: "q"
     )
     applicationItem.submenu = applicationMenu
+
+    let navigationItem = NSMenuItem()
+    let navigationMenu = NSMenu(title: "Navigation")
+    let dragModes: [(String, String, Selector, Bool)] = [
+        ("Primary Drag: Select", "1", #selector(ViewerAppDelegate.selectPrimaryDragMode(_:)), true),
+        ("Primary Drag: Orbit", "2", #selector(ViewerAppDelegate.orbitPrimaryDragMode(_:)), false),
+        ("Primary Drag: Pan", "3", #selector(ViewerAppDelegate.panPrimaryDragMode(_:)), false),
+    ]
+    for (title, key, action, selected) in dragModes {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.keyEquivalentModifierMask = [.control, .option]
+        item.target = delegate
+        item.state = selected ? .on : .off
+        navigationMenu.addItem(item)
+    }
+    navigationItem.submenu = navigationMenu
+    mainMenu.addItem(navigationItem)
     application.mainMenu = mainMenu
 
-    let delegate = try ViewerAppDelegate(
-        frameURL: arguments.frameURL,
-        inputURL: arguments.inputURL,
-        title: arguments.title
-    )
     application.delegate = delegate
     application.run()
 } catch {

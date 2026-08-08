@@ -16,13 +16,14 @@ import omni.ext
 import omni.kit.app
 import omni.timeline
 import omni.usd
-from pxr import Gf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
+from pxr import Gf, Tf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 
-_SCENE_HEADER = struct.Struct("<IHHQ32fI")
-_SCENE_MESH_RECORD = struct.Struct("<QII24f23I")
+_SCENE_HEADER = struct.Struct("<IHHQ32fQI")
+_SCENE_TEXTURE_RECORD = struct.Struct("<QIII")
+_SCENE_MESH_RECORD = struct.Struct("<QII24f28I")
 _SCENE_MAGIC = 0x31434D49
-_SCENE_VERSION = 11
+_SCENE_VERSION = 13
 _CAMERA_VALID_PERSPECTIVE = 1
 _SCENE_VALID_SPHERE_LIGHT = 2
 _SCENE_HAS_MESH_MANIFEST = 4
@@ -41,13 +42,39 @@ _MESH_HAS_CONNECTED_BASE_COLOR = 4
 _MESH_HAS_FILE_TEXTURE = 8
 _MESH_HAS_MATERIAL_PARAMETERS = 16
 _MESH_HAS_EMISSION = 32
+_MESH_HAS_ALPHA_CUTOUT = 64
 _TEXTURE_HAS_ROUGHNESS = 1
 _TEXTURE_HAS_METALLIC = 2
 _TEXTURE_HAS_EMISSION = 4
 _TEXTURE_HAS_NORMAL = 8
 _MAX_SCENE_MESHES = 4096
-_MAX_SCENE_GEOMETRY_BYTES = 256 * 1024 * 1024
+_MAX_SCENE_GEOMETRY_BYTES = 320 * 1024 * 1024
+_MAX_SCENE_TEXTURE_BYTES = 128 * 1024 * 1024
 _MAX_SCENE_TEXTURE_DIMENSION = 4096
+_MAX_SCENE_TEXTURE_TRANSPORT_DIMENSION = 512
+_MAX_SCENE_MATERIAL_TEXTURES = 126
+_NO_SCENE_TEXTURE = 0xFFFFFFFF
+
+
+def _scene_flags(sphere_light_path, distant_light_path, dome_light_path):
+    flags = (
+        _CAMERA_VALID_PERSPECTIVE
+        | _SCENE_HAS_MESH_MANIFEST
+        | _SCENE_HAS_MESH_GEOMETRY
+        | _SCENE_HAS_CORNER_NORMALS
+        | _SCENE_HAS_FILE_TEXTURES
+        | _SCENE_HAS_MATERIAL_PARAMETERS
+        | _SCENE_HAS_EMISSION
+        | _SCENE_HAS_PARAMETER_TEXTURES
+        | _SCENE_HAS_NORMAL_TEXTURES
+    )
+    if sphere_light_path:
+        flags |= _SCENE_VALID_SPHERE_LIGHT
+    if distant_light_path:
+        flags |= _SCENE_VALID_DISTANT_LIGHT
+    if dome_light_path:
+        flags |= _SCENE_VALID_DOME_LIGHT
+    return flags
 
 
 def _stage_prims(stage: Usd.Stage):
@@ -60,6 +87,86 @@ def _path_is_at_or_below(path, root_path) -> bool:
     value = str(path)
     root = str(root_path).rstrip("/")
     return value == root or value.startswith(root + "/")
+
+
+def _mesh_material_parts(prim: Usd.Prim, sample_time: Usd.TimeCode):
+    """Return disjoint face groups with their real USD bound materials.
+
+    USD commonly assigns several materials to one Mesh through
+    ``materialBind`` GeomSubsets.  A ray-tracing geometry has one material
+    descriptor in the bridge protocol, so preserve the authored result by
+    emitting one geometry record per subset instead of applying an arbitrary
+    first subset to the whole Mesh.  Faces outside valid subsets retain the
+    direct/ancestor Mesh binding.
+    """
+
+    try:
+        mesh = UsdGeom.Mesh(prim)
+        face_counts = mesh.GetFaceVertexCountsAttr().Get(sample_time) or ()
+        face_count = len(face_counts)
+        mesh_material, _relationship = UsdShade.MaterialBindingAPI(
+            prim
+        ).ComputeBoundMaterial()
+        if not (mesh_material and mesh_material.GetPrim().IsValid()):
+            mesh_material = None
+
+        assigned_faces = set()
+        subset_parts = []
+        for child in prim.GetChildren():
+            if not child.IsA(UsdGeom.Subset):
+                continue
+            subset = UsdGeom.Subset(child)
+            if subset.GetFamilyNameAttr().Get() != "materialBind":
+                continue
+            element_type = subset.GetElementTypeAttr().Get()
+            if element_type not in (None, "", UsdGeom.Tokens.face):
+                continue
+            material, _relationship = UsdShade.MaterialBindingAPI(
+                child
+            ).ComputeBoundMaterial()
+            if not (material and material.GetPrim().IsValid()):
+                continue
+            authored_faces = subset.GetIndicesAttr().Get(sample_time) or ()
+            faces = tuple(
+                sorted(
+                    {
+                        int(face)
+                        for face in authored_faces
+                        if 0 <= int(face) < face_count
+                        and int(face) not in assigned_faces
+                    }
+                )
+            )
+            if not faces:
+                continue
+            assigned_faces.update(faces)
+            subset_parts.append(
+                (
+                    f"/__IMBMaterialSubset_{child.GetName()}",
+                    frozenset(faces),
+                    material,
+                )
+            )
+
+        if not subset_parts:
+            return (("", None, mesh_material),)
+
+        remaining_faces = frozenset(
+            face for face in range(face_count) if face not in assigned_faces
+        )
+        if remaining_faces:
+            return (("", remaining_faces, mesh_material), *subset_parts)
+        return tuple(subset_parts)
+    except Exception:
+        try:
+            material, _relationship = UsdShade.MaterialBindingAPI(
+                prim
+            ).ComputeBoundMaterial()
+            if not (material and material.GetPrim().IsValid()):
+                material = None
+        except Exception:
+            material = None
+        return (("", None, material),)
 
 
 def _scene_mesh_occurrences(
@@ -96,13 +203,18 @@ def _scene_mesh_occurrences(
             for root in embedded_prototype_paths
         ):
             continue
-        yield (
-            prim,
-            str(prim.GetPath()),
-            xform_cache.GetLocalToWorldTransform(prim),
-            prim.IsInstanceProxy(),
-            None,
-        )
+        for material_suffix, included_faces, material in _mesh_material_parts(
+            prim, sample_time
+        ):
+            yield (
+                prim,
+                str(prim.GetPath()) + material_suffix,
+                xform_cache.GetLocalToWorldTransform(prim),
+                prim.IsInstanceProxy(),
+                None,
+                included_faces,
+                material,
+            )
 
     for instancer_prim, instancer, targets in point_instancers:
         try:
@@ -206,13 +318,20 @@ def _scene_mesh_occurrences(
                 world_transform = (
                     relative_transform * instance_transform * instancer_world
                 )
-                yield (
-                    mesh_prim,
-                    synthetic_path,
-                    world_transform,
-                    mesh_prim.IsInstanceProxy(),
-                    f"{instancer_prim.GetPath()}[{instance_index}]",
-                )
+                for (
+                    material_suffix,
+                    included_faces,
+                    material,
+                ) in _mesh_material_parts(mesh_prim, sample_time):
+                    yield (
+                        mesh_prim,
+                        synthetic_path + material_suffix,
+                        world_transform,
+                        mesh_prim.IsInstanceProxy(),
+                        f"{instancer_prim.GetPath()}[{instance_index}]",
+                        included_faces,
+                        material,
+                    )
 
 
 def _fnv1a_64(value: str) -> int:
@@ -253,6 +372,26 @@ def _color3(value) -> tuple[float, float, float] | None:
     if not all(math.isfinite(component) for component in result):
         return None
     return tuple(min(max(component, 0.0), 1.0) for component in result)
+
+
+def _color4(value) -> tuple[float, float, float, float] | None:
+    if value is None:
+        return None
+    try:
+        result = tuple(float(value[index]) for index in range(4))
+    except (IndexError, TypeError, ValueError):
+        return None
+    if not all(math.isfinite(component) for component in result):
+        return None
+    return result
+
+
+def _finite_scalar(value, default: float | None = None) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
 
 
 def _scalar01(value) -> float | None:
@@ -352,6 +491,12 @@ def _bound_material_base_color(material: UsdShade.Material):
         "diffuse_color",
         "base_color",
         "albedo",
+        # The official Simple Warehouse assets use source-asset MDL shaders
+        # instead of a UsdPreviewSurface network.  ColorAlbedo is their
+        # authored constant fallback before AlbedoTexture/MaskSelection are
+        # evaluated by MDL.
+        "ColorAlbedo",
+        "BaseColor",
     )
     try:
         for prim in Usd.PrimRange(material.GetPrim()):
@@ -373,6 +518,173 @@ def _bound_material_base_color(material: UsdShade.Material):
     except Exception:
         return None, False
     return None, False
+
+
+def _supported_surface_shader(shader: UsdShade.Shader) -> bool:
+    """Recognize the bounded Preview/OmniPBR/source-asset MDL subset."""
+
+    try:
+        shader_id = str(shader.GetIdAttr().Get() or "")
+        if shader_id == "UsdPreviewSurface" or "OmniPBR" in shader_id:
+            return True
+        source_asset_attr = shader.GetPrim().GetAttribute("info:mdl:sourceAsset")
+        source_asset = source_asset_attr.Get() if source_asset_attr else None
+        source_path = str(getattr(source_asset, "path", "") or source_asset or "")
+        source_name = source_path.rsplit("/", 1)[-1]
+        if source_name == "OmniPBR.mdl":
+            return True
+        # General MDL execution is deliberately outside this bridge.  Accept
+        # only source-asset shaders that expose the concrete input vocabulary
+        # used by the official Simple Warehouse materials; the helpers below
+        # read those USD-authored values and local assets without executing
+        # the MDL program.
+        if source_name in {
+            "MI_Barcode_0001.mdl",
+            "MI_CeilingA_06b.mdl",
+            "MI_Floor_01.mdl",
+            "MI_FrameA_01.mdl",
+            "MI_LampCeilingA.mdl",
+            "MI_PushcartA_01.mdl",
+            "MI_RackShield_01.mdl",
+            "MI_SignB.mdl",
+            "MI_WallB_01.mdl",
+            "M_AisleSign.mdl",
+            "M_Glow.mdl",
+            "M_WallBoard_01.mdl",
+        }:
+            return True
+        return source_name.endswith(".mdl") and any(
+            shader.GetInput(name)
+            for name in (
+                "ColorAlbedo",
+                "AlbedoTexture",
+                "MainNormalInput",
+                "MergeMapInput",
+            )
+        )
+    except Exception:
+        return False
+
+
+def _shader_source_asset_info(shader: UsdShade.Shader):
+    """Return one MDL source basename and resolved local path."""
+
+    try:
+        source_asset_attr = shader.GetPrim().GetAttribute(
+            "info:mdl:sourceAsset"
+        )
+        source_asset = source_asset_attr.Get() if source_asset_attr else None
+        authored_path = str(getattr(source_asset, "path", "") or "")
+        resolved_path = str(
+            getattr(source_asset, "resolvedPath", "") or ""
+        )
+        if not resolved_path and authored_path:
+            layer = shader.GetPrim().GetStage().GetRootLayer()
+            resolved_path = layer.ComputeAbsolutePath(authored_path)
+        source_name = (resolved_path or authored_path).rsplit("/", 1)[-1]
+        return source_name, resolved_path
+    except Exception:
+        return "", ""
+
+
+def _direct_asset_path(
+    material: UsdShade.Material,
+    shader: UsdShade.Shader,
+    input_name: str,
+):
+    """Resolve an authored texture input without requiring a UV network."""
+
+    try:
+        texture_input = shader.GetInput(input_name)
+        texture_value = texture_input.Get() if texture_input else None
+        if not texture_value:
+            return ""
+        resolved_path = str(
+            getattr(texture_value, "resolvedPath", "") or ""
+        )
+        authored_path = str(getattr(texture_value, "path", "") or "")
+        if not resolved_path and authored_path:
+            root_layer = material.GetPrim().GetStage().GetRootLayer()
+            resolved_path = root_layer.ComputeAbsolutePath(authored_path)
+        return resolved_path
+    except Exception:
+        return ""
+
+
+def _direct_texture_asset_and_primvar(
+    material: UsdShade.Material,
+    shader: UsdShade.Shader,
+    input_name: str,
+):
+    """Resolve one source-asset texture input and its authored UV transform."""
+
+    try:
+        if not _supported_surface_shader(shader):
+            return None
+        texture_input = shader.GetInput(input_name)
+        texture_value = texture_input.Get() if texture_input else None
+        if not texture_value:
+            return None
+        texture_path = str(getattr(texture_value, "resolvedPath", "") or "")
+        authored_path = str(getattr(texture_value, "path", "") or "")
+        if not texture_path and authored_path:
+            root_layer = material.GetPrim().GetStage().GetRootLayer()
+            texture_path = root_layer.ComputeAbsolutePath(authored_path)
+        if not texture_path:
+            return None
+
+        transforms = ()
+        tiling_input = shader.GetInput("MainTiling")
+        tiling = tiling_input.Get() if tiling_input else None
+        if tiling is not None:
+            scale = _float2_or_default(tiling, (1.0, 1.0))
+            if scale is None:
+                return None
+            transforms = ((scale[0], scale[1], 0.0, 0.0, 0.0),)
+        else:
+            texture_scale_input = shader.GetInput("texture_scale")
+            texture_scale = (
+                texture_scale_input.Get() if texture_scale_input else None
+            )
+            scale = _float2_or_default(texture_scale, (1.0, 1.0))
+            u_tiling_input = shader.GetInput("U_Tiling")
+            v_tiling_input = shader.GetInput("V_Tiling")
+            if u_tiling_input:
+                u_tiling = _nonnegative_scalar(u_tiling_input.Get())
+                if u_tiling is not None:
+                    scale = (u_tiling, scale[1])
+            if v_tiling_input:
+                v_tiling = _nonnegative_scalar(v_tiling_input.Get())
+                if v_tiling is not None:
+                    scale = (scale[0], v_tiling)
+            texture_translation_input = shader.GetInput("texture_translate")
+            translation = _float2_or_default(
+                texture_translation_input.Get()
+                if texture_translation_input else None,
+                (0.0, 0.0),
+            )
+            texture_rotation_input = shader.GetInput("texture_rotate")
+            rotation_value = (
+                texture_rotation_input.Get() if texture_rotation_input else None
+            )
+            try:
+                rotation = float(rotation_value or 0.0)
+            except (TypeError, ValueError):
+                return None
+            if (
+                scale is None
+                or translation is None
+                or not math.isfinite(rotation)
+            ):
+                return None
+            if scale != (1.0, 1.0) or translation != (0.0, 0.0) or rotation:
+                transforms = ((
+                    scale[0], scale[1], math.fmod(rotation, 360.0),
+                    translation[0], translation[1],
+                ),)
+        return texture_path, ("st", transforms)
+    except Exception:
+        return None
 
 
 def _texture_asset_and_primvar(
@@ -512,6 +824,18 @@ def _bound_material_file_texture(material: UsdShade.Material):
                 asset = _texture_asset_and_primvar(material, texture_shader)
                 if asset is not None:
                     return asset
+            for direct_name in (
+                "AlbedoTexture",
+                "diffuse_texture",
+                "BaseColor_Texture",
+                "base_color_texture",
+                "albedo_texture",
+            ):
+                direct_asset = _direct_texture_asset_and_primvar(
+                    material, shader, direct_name
+                )
+                if direct_asset is not None:
+                    return direct_asset
     except Exception:
         return None
     return None
@@ -530,8 +854,7 @@ def _bound_material_parameter_texture(
             if not prim.IsA(UsdShade.Shader):
                 continue
             shader = UsdShade.Shader(prim)
-            shader_id = str(shader.GetIdAttr().Get() or "")
-            if shader_id != "UsdPreviewSurface" and "OmniPBR" not in shader_id:
+            if not _supported_surface_shader(shader):
                 continue
             for input_name in input_names:
                 shader_input = shader.GetInput(input_name)
@@ -554,6 +877,46 @@ def _bound_material_parameter_texture(
                         uv_source,
                         4 if color_output else channels[source_name],
                     )
+            requested_names = set(input_names)
+            direct_name = None
+            direct_channel = 4 if color_output else 0
+            if requested_names & {"roughness", "reflection_roughness_constant"}:
+                # Simple Warehouse MergeMapInput follows the authored ORM
+                # convention: occlusion=R, roughness=G, metallic=B.
+                direct_name, direct_channel = "MergeMapInput", 1
+            elif requested_names & {"metallic", "metallic_constant"}:
+                direct_name, direct_channel = "MergeMapInput", 2
+            elif color_output and requested_names & {
+                "normal", "normalmap", "normal_map"
+            }:
+                direct_name, direct_channel = "MainNormalInput", 4
+            direct_candidates = []
+            if direct_name is not None:
+                direct_candidates.append((direct_name, direct_channel))
+            if requested_names & {"roughness", "reflection_roughness_constant"}:
+                direct_candidates.extend((
+                    ("ORM_texture", 1),
+                    ("reflectionroughness_texture", 0),
+                    ("roughness_texture", 0),
+                ))
+            elif requested_names & {"metallic", "metallic_constant"}:
+                direct_candidates.extend((
+                    ("ORM_texture", 2),
+                    ("metallic_texture", 0),
+                ))
+            elif color_output and requested_names & {
+                "normal", "normalmap", "normal_map"
+            }:
+                direct_candidates.extend((
+                    ("normalmap_texture", 4),
+                    ("normal_texture", 4),
+                ))
+            for candidate_name, candidate_channel in direct_candidates:
+                direct_asset = _direct_texture_asset_and_primvar(
+                    material, shader, candidate_name
+                )
+                if direct_asset is not None:
+                    return (*direct_asset, candidate_channel)
     except Exception:
         return None
     return None
@@ -569,8 +932,7 @@ def _bound_material_parameters(material: UsdShade.Material):
             if not prim.IsA(UsdShade.Shader):
                 continue
             shader = UsdShade.Shader(prim)
-            shader_id = str(shader.GetIdAttr().Get() or "")
-            if shader_id != "UsdPreviewSurface" and "OmniPBR" not in shader_id:
+            if not _supported_surface_shader(shader):
                 continue
             roughness = None
             metallic = None
@@ -586,6 +948,17 @@ def _bound_material_parameters(material: UsdShade.Material):
                     metallic = _scalar01(shader_input.Get())
                     if metallic is not None:
                         break
+            if roughness is None:
+                roughness_min_input = shader.GetInput("RoughnessMin")
+                roughness_max_input = shader.GetInput("RoughnessMax")
+                roughness_min = _scalar01(
+                    roughness_min_input.Get() if roughness_min_input else None
+                )
+                roughness_max = _scalar01(
+                    roughness_max_input.Get() if roughness_max_input else None
+                )
+                if roughness_min is not None and roughness_max is not None:
+                    roughness = (roughness_min + roughness_max) * 0.5
             if roughness is not None or metallic is not None:
                 return (
                     roughness if roughness is not None else 0.5,
@@ -611,8 +984,7 @@ def _bound_material_emission(material: UsdShade.Material):
             if not prim.IsA(UsdShade.Shader):
                 continue
             shader = UsdShade.Shader(prim)
-            shader_id = str(shader.GetIdAttr().Get() or "")
-            if shader_id != "UsdPreviewSurface" and "OmniPBR" not in shader_id:
+            if not _supported_surface_shader(shader):
                 continue
             enabled_input = shader.GetInput("enable_emission")
             if enabled_input and enabled_input.Get() is False:
@@ -640,7 +1012,7 @@ def _bound_material_emission(material: UsdShade.Material):
     return None
 
 
-@functools.lru_cache(maxsize=16)
+@functools.lru_cache(maxsize=256)
 def _load_rgba_texture(path: str):
     """Decode a bounded local material asset into tightly packed RGBA8."""
 
@@ -657,10 +1029,455 @@ def _load_rgba_texture(path: str):
             ):
                 return None
             rgba = source.convert("RGBA")
+            if (
+                rgba.width > _MAX_SCENE_TEXTURE_TRANSPORT_DIMENSION
+                or rgba.height > _MAX_SCENE_TEXTURE_TRANSPORT_DIMENSION
+            ):
+                rgba.thumbnail(
+                    (
+                        _MAX_SCENE_TEXTURE_TRANSPORT_DIMENSION,
+                        _MAX_SCENE_TEXTURE_TRANSPORT_DIMENSION,
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
             pixels = rgba.tobytes()
             if len(pixels) != rgba.width * rgba.height * 4:
                 return None
             return rgba.width, rgba.height, pixels
+    except Exception:
+        return None
+
+
+def _srgb_to_linear(value: float) -> float:
+    value = min(max(value, 0.0), 1.0)
+    if value <= 0.04045:
+        return value / 12.92
+    return math.pow((value + 0.055) / 1.055, 2.4)
+
+
+def _linear_to_srgb(value: float) -> int:
+    value = min(max(value, 0.0), 1.0)
+    encoded = (
+        value * 12.92
+        if value <= 0.0031308
+        else 1.055 * math.pow(value, 1.0 / 2.4) - 0.055
+    )
+    return int(round(min(max(encoded, 0.0), 1.0) * 255.0))
+
+
+@functools.lru_cache(maxsize=256)
+def _resized_rgba_texture(path: str, width: int, height: int):
+    decoded = _load_rgba_texture(path)
+    if decoded is None:
+        return None
+    source_width, source_height, pixels = decoded
+    if source_width == width and source_height == height:
+        return pixels
+    try:
+        from PIL import Image
+
+        image = Image.frombytes(
+            "RGBA", (source_width, source_height), pixels
+        )
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+        return image.tobytes()
+    except Exception:
+        return None
+
+
+@functools.lru_cache(maxsize=128)
+def _compose_base_texture(
+    mode: str,
+    albedo_path: str,
+    mask_path: str,
+    color_a: tuple[float, float, float, float],
+    color_b: tuple[float, float, float, float],
+    color_c: tuple[float, float, float, float],
+    scalar: float,
+):
+    """Bake the exact bounded color algebra used by Warehouse MDL assets."""
+
+    albedo = _load_rgba_texture(albedo_path) if albedo_path else None
+    mask = _load_rgba_texture(mask_path) if mask_path else None
+    reference = albedo or mask
+    if reference is None:
+        return None
+    width, height, _pixels = reference
+    albedo_pixels = (
+        _resized_rgba_texture(albedo_path, width, height)
+        if albedo_path
+        else bytes((0, 0, 0, 255)) * (width * height)
+    )
+    mask_pixels = (
+        _resized_rgba_texture(mask_path, width, height)
+        if mask_path
+        else bytes((255, 255, 255, 255)) * (width * height)
+    )
+    if albedo_pixels is None or mask_pixels is None:
+        return None
+
+    output = bytearray(width * height * 4)
+    for offset in range(0, len(output), 4):
+        albedo_linear = tuple(
+            _srgb_to_linear(albedo_pixels[offset + channel] / 255.0)
+            for channel in range(3)
+        )
+        mask_value = tuple(
+            mask_pixels[offset + channel] / 255.0 for channel in range(4)
+        )
+        if mode == "channel-mask":
+            result = tuple(
+                color_a[channel]
+                + (albedo_linear[channel] - color_a[channel])
+                    * mask_value[channel]
+                for channel in range(3)
+            )
+            alpha = 1.0
+        elif mode == "pushcart-mask":
+            result_values = []
+            for channel in range(3):
+                value = color_a[channel] * mask_value[0]
+                value += (color_b[channel] - value) * mask_value[1]
+                value += (color_c[channel] - value) * mask_value[2]
+                value += (albedo_linear[channel] - value) * mask_value[3]
+                result_values.append(value)
+            result = tuple(result_values)
+            alpha = 1.0
+        elif mode == "tint-desaturate":
+            grayscale = (
+                albedo_linear[0] * 0.3
+                + albedo_linear[1] * 0.59
+                + albedo_linear[2] * 0.11
+            )
+            amount = min(max(scalar, 0.0), 1.0)
+            result = tuple(
+                (value + (grayscale - value) * amount) * color_a[channel]
+                for channel, value in enumerate(albedo_linear)
+            )
+            alpha = 1.0
+        elif mode == "multiply-tint":
+            result = tuple(
+                albedo_linear[channel] * color_a[channel]
+                for channel in range(3)
+            )
+            alpha = albedo_pixels[offset + 3] / 255.0
+        elif mode == "alpha-mask":
+            result = albedo_linear
+            # OmniUe4Function::greyscale_texture_lookup replicates the red
+            # channel, and M_WallBoard_01 applies this exact 0.3333 cutout.
+            alpha = 1.0 if mask_value[0] >= 0.3333 else 0.0
+        elif mode == "aisle-sign":
+            # Text is declared gamma_linear while the sign diffuse image is
+            # gamma_srgb. Reproduce the source MDL's per-channel overlay.
+            text_value = tuple(mask_value[channel] for channel in range(3))
+            result_values = []
+            for channel in range(3):
+                text = text_value[channel]
+                diffuse = albedo_linear[channel]
+                inverse_branch = 1.0 - (1.0 - text) * 2.0 * (1.0 - diffuse)
+                multiply_branch = text * 2.0 * diffuse
+                result_values.append(
+                    inverse_branch if text >= 0.5 else multiply_branch
+                )
+            result = tuple(result_values)
+            alpha = 1.0
+        else:
+            return None
+        for channel in range(3):
+            output[offset + channel] = _linear_to_srgb(result[channel])
+        output[offset + 3] = int(round(min(max(alpha, 0.0), 1.0) * 255.0))
+    return width, height, bytes(output)
+
+
+@functools.lru_cache(maxsize=128)
+def _remap_orm_texture(path: str, roughness_min: float, roughness_max: float):
+    decoded = _load_rgba_texture(path)
+    if decoded is None:
+        return None
+    width, height, pixels = decoded
+    output = bytearray(pixels)
+    for offset in range(0, len(output), 4):
+        source = pixels[offset + 1] / 255.0
+        roughness = roughness_min + (roughness_max - roughness_min) * source
+        output[offset + 1] = int(
+            round(min(max(roughness, 0.0), 1.0) * 255.0)
+        )
+    return width, height, bytes(output)
+
+
+@functools.lru_cache(maxsize=128)
+def _reconstruct_normal_texture(
+    path: str, strength: tuple[float, float, float, float]
+):
+    decoded = _load_rgba_texture(path)
+    if decoded is None:
+        return None
+    width, height, pixels = decoded
+    output = bytearray(pixels)
+    for offset in range(0, len(output), 4):
+        x = pixels[offset] / 255.0 * 2.0 - 1.0
+        y = pixels[offset + 1] / 255.0 * 2.0 - 1.0
+        z = math.sqrt(max(1.0 - x * x - y * y, 0.0))
+        x *= strength[0]
+        y *= strength[1]
+        z *= strength[2]
+        length = math.sqrt(x * x + y * y + z * z)
+        if length > 0.000001:
+            x, y, z = x / length, y / length, z / length
+        output[offset] = int(round((min(max(x, -1.0), 1.0) * 0.5 + 0.5) * 255.0))
+        output[offset + 1] = int(round((min(max(y, -1.0), 1.0) * 0.5 + 0.5) * 255.0))
+        output[offset + 2] = int(round((min(max(z, -1.0), 1.0) * 0.5 + 0.5) * 255.0))
+        output[offset + 3] = 255
+    return width, height, bytes(output)
+
+
+def _warehouse_mdl_material_bundle(material: UsdShade.Material):
+    """Normalize the official Simple Warehouse MDL materials into v13 maps.
+
+    This is intentionally a named, bounded source-asset subset.  It evaluates
+    only the concrete color/ORM/normal algebra present in NVIDIA's shipped
+    Simple Warehouse files; it is not a general MDL interpreter.
+    """
+
+    official_names = {
+        "MI_Barcode_0001.mdl",
+        "MI_CeilingA_06b.mdl",
+        "MI_Floor_01.mdl",
+        "MI_FrameA_01.mdl",
+        "MI_LampCeilingA.mdl",
+        "MI_PushcartA_01.mdl",
+        "MI_RackShield_01.mdl",
+        "MI_SignB.mdl",
+        "MI_WallB_01.mdl",
+        "M_AisleSign.mdl",
+        "M_Glow.mdl",
+        "M_WallBoard_01.mdl",
+    }
+    try:
+        shader = None
+        source_name = ""
+        source_path = ""
+        for prim in Usd.PrimRange(material.GetPrim()):
+            if not prim.IsA(UsdShade.Shader):
+                continue
+            candidate = UsdShade.Shader(prim)
+            candidate_name, candidate_path = _shader_source_asset_info(
+                candidate
+            )
+            if candidate_name in official_names:
+                shader = candidate
+                source_name = candidate_name
+                source_path = candidate_path
+                break
+        if shader is None:
+            return None
+
+        source_directory = os.path.dirname(source_path)
+        texture_directory = os.path.join(source_directory, "Textures")
+
+        def input_value(name, default=None):
+            shader_input = shader.GetInput(name)
+            value = shader_input.Get() if shader_input else None
+            return default if value is None else value
+
+        def input_color(name, default):
+            return _color4(input_value(name)) or default
+
+        def input_scalar(name, default):
+            return _finite_scalar(input_value(name), default)
+
+        def input_asset(name, default_name=""):
+            path = _direct_asset_path(material, shader, name)
+            if path:
+                return path
+            return (
+                os.path.join(texture_directory, default_name)
+                if texture_directory and default_name
+                else ""
+            )
+
+        def uv_for(name):
+            direct = _direct_texture_asset_and_primvar(
+                material, shader, name
+            )
+            return direct[1] if direct is not None else ("st", ())
+
+        bundle = {
+            "base_color": None,
+            "material_parameters": None,
+            "material_emission": None,
+            "alpha_cutout": False,
+            "texture_specs": {},
+            "decoded": {},
+        }
+
+        def add_original(kind, path, uv_source, channel):
+            if path and _load_rgba_texture(path) is not None:
+                bundle["texture_specs"][kind] = (
+                    path, uv_source, channel
+                )
+
+        def add_derived(kind, key, uv_source, channel, decoded):
+            if decoded is None:
+                return
+            bundle["texture_specs"][kind] = (key, uv_source, channel)
+            bundle["decoded"][key] = decoded
+
+        if source_name == "M_Glow.mdl":
+            color = input_color(
+                "EmissiveColor", (0.28835, 0.365, 0.365, 1.0)
+            )
+            strength = max(input_scalar("EmissiveStrength", 10.0), 0.0)
+            bundle["base_color"] = (0.0, 0.0, 0.0)
+            bundle["material_parameters"] = (0.5, 0.0)
+            bundle["material_emission"] = (color[:3], strength)
+            return bundle
+
+        if source_name == "MI_SignB.mdl":
+            path = input_asset("TextureSelection", "T_SignsA_D.png")
+            add_original("base", path, uv_for("TextureSelection"), 4)
+            bundle["material_parameters"] = (0.125, 0.0)
+            return bundle
+
+        if source_name == "MI_Barcode_0001.mdl":
+            albedo_path = input_asset("BaseColor_Texture", "0001.png")
+            tint = input_color(
+                "BaseColor_Tint", (1.0, 1.0, 1.0, 1.0)
+            )
+            decoded = _compose_base_texture(
+                "multiply-tint", albedo_path, "", tint,
+                (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0), 0.0,
+            )
+            key = f"imb-derived:barcode:{albedo_path}:{tint}"
+            add_derived(
+                "base", key, uv_for("BaseColor_Texture"), 4, decoded
+            )
+            bundle["alpha_cutout"] = True
+            bundle["material_parameters"] = (
+                min(max(input_scalar("Roughness", 0.3), 0.0), 1.0),
+                min(max(input_scalar("Metallic", 0.05), 0.0), 1.0),
+            )
+            return bundle
+
+        if source_name == "M_AisleSign.mdl":
+            albedo_path = os.path.join(
+                texture_directory, "T_AisleSign_D.png"
+            )
+            text_path = input_asset("Text", "AisleSign_Text_01.png")
+            normal_path = os.path.join(
+                texture_directory, "T_AisleSign_N.png"
+            )
+            orm_path = os.path.join(
+                texture_directory, "T_AisleSign_ORM.png"
+            )
+            decoded = _compose_base_texture(
+                "aisle-sign", albedo_path, text_path,
+                (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0, 0.0), 0.0,
+            )
+            key = f"imb-derived:aisle:{albedo_path}:{text_path}"
+            add_derived("base", key, ("st", ()), 4, decoded)
+            add_original("roughness", orm_path, ("st", ()), 1)
+            add_original("metallic", orm_path, ("st", ()), 2)
+            normal = _reconstruct_normal_texture(
+                normal_path, (1.0, 1.0, 1.0, 1.0)
+            )
+            normal_key = f"imb-derived:normal:{normal_path}:1,1,1"
+            add_derived("normal", normal_key, ("st", ()), 4, normal)
+            bundle["material_parameters"] = (0.5, 0.0)
+            return bundle
+
+        albedo_path = input_asset("AlbedoTexture")
+        normal_path = input_asset("MainNormalInput")
+        orm_path = input_asset("MergeMapInput")
+        base_uv = uv_for("AlbedoTexture")
+        shared_uv = base_uv
+
+        if source_name in {
+            "MI_CeilingA_06b.mdl",
+            "MI_Floor_01.mdl",
+            "MI_FrameA_01.mdl",
+            "MI_WallB_01.mdl",
+        }:
+            mask_path = input_asset("MaskSelection")
+            constant = input_color(
+                "ColorAlbedo", (0.145, 0.145, 0.145, 0.0)
+            )
+            decoded = _compose_base_texture(
+                "channel-mask", albedo_path, mask_path, constant,
+                (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0), 0.0,
+            )
+            key = (
+                f"imb-derived:channel-mask:{albedo_path}:{mask_path}:"
+                f"{constant}"
+            )
+            add_derived("base", key, shared_uv, 4, decoded)
+        elif source_name == "MI_PushcartA_01.mdl":
+            mask_path = input_asset("MaskSelection")
+            body = input_color("Body", (0.128, 0.128, 0.128, 1.0))
+            handle = input_color("Handle", (0.128, 0.128, 0.128, 1.0))
+            cap = input_color("Cap", (0.128, 0.128, 0.128, 1.0))
+            decoded = _compose_base_texture(
+                "pushcart-mask", albedo_path, mask_path,
+                body, handle, cap, 0.0,
+            )
+            key = (
+                f"imb-derived:pushcart:{albedo_path}:{mask_path}:"
+                f"{body}:{handle}:{cap}"
+            )
+            add_derived("base", key, shared_uv, 4, decoded)
+        elif source_name in {
+            "MI_LampCeilingA.mdl", "MI_RackShield_01.mdl"
+        }:
+            tint = input_color(
+                "BaseColor_Tint", (1.0, 1.0, 1.0, 1.0)
+            )
+            desaturation = input_scalar("Desaturation", 0.0)
+            decoded = _compose_base_texture(
+                "tint-desaturate", albedo_path, "", tint,
+                (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0),
+                desaturation,
+            )
+            key = (
+                f"imb-derived:tint:{albedo_path}:{tint}:{desaturation}"
+            )
+            add_derived("base", key, shared_uv, 4, decoded)
+        elif source_name == "M_WallBoard_01.mdl":
+            alpha_path = input_asset("AlphaSelection")
+            decoded = _compose_base_texture(
+                "alpha-mask", albedo_path, alpha_path,
+                (0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0),
+                (0.0, 0.0, 0.0, 0.0), 0.0,
+            )
+            key = f"imb-derived:wallboard:{albedo_path}:{alpha_path}"
+            add_derived("base", key, shared_uv, 4, decoded)
+            bundle["alpha_cutout"] = True
+
+        roughness_min = input_scalar("RoughnessMin", 0.1)
+        roughness_max = input_scalar("RoughnessMax", 0.9)
+        remapped_orm = _remap_orm_texture(
+            orm_path, roughness_min, roughness_max
+        )
+        orm_key = (
+            f"imb-derived:orm:{orm_path}:{roughness_min}:{roughness_max}"
+        )
+        add_derived("roughness", orm_key, shared_uv, 1, remapped_orm)
+        add_derived("metallic", orm_key, shared_uv, 2, remapped_orm)
+
+        normal_strength = input_color(
+            "MainNormalStrenght", (1.0, 1.0, 1.0, 1.0)
+        )
+        reconstructed_normal = _reconstruct_normal_texture(
+            normal_path, normal_strength
+        )
+        normal_key = (
+            f"imb-derived:normal:{normal_path}:{normal_strength}"
+        )
+        add_derived(
+            "normal", normal_key, shared_uv, 4, reconstructed_normal
+        )
+        bundle["material_parameters"] = (0.5, 0.0)
+        return bundle
     except Exception:
         return None
 
@@ -814,8 +1631,30 @@ class StartupStageExtension(omni.ext.IExt):
         self._timeline_autoplay = (
             os.environ.get("IMB_TIMELINE_AUTOPLAY", "0") == "1"
         )
+        self._center_stage_origin = (
+            os.environ.get("IMB_CENTER_STAGE_ORIGIN", "0") == "1"
+        )
+        self._frame_prim_path = os.environ.get("IMB_FRAME_PRIM_PATH", "")
+        self._camera_framed = not self._frame_prim_path
+        self._origin_centered = not self._center_stage_origin
+        self._origin_center_error_reported = False
+        self._startup_reference_url = os.environ.get(
+            "IMB_STARTUP_REFERENCE_URL", ""
+        )
+        self._startup_reference_path = os.environ.get(
+            "IMB_STARTUP_REFERENCE_PATH", "/World/Reference"
+        )
+        self._add_startup_key_light = (
+            os.environ.get("IMB_ADD_STARTUP_KEY_LIGHT", "0") == "1"
+        )
         self._camera_sequence = 0
+        self._static_scene_sequence = 0
         self._last_scene_values = None
+        self._static_scene_cache = None
+        self._static_scene_dirty = True
+        self._scene_notice_key = None
+        self._scene_notice_stage = None
+        self._active_camera_path = ""
         self._camera_error_reported = False
         self._app_ready_updates = 0
         self._camera_subscription = (
@@ -853,6 +1692,20 @@ class StartupStageExtension(omni.ext.IExt):
             carb.log_warn(
                 "isaacmetalbridge.stage: live USD timeline autoplay requested"
             )
+        if self._center_stage_origin:
+            carb.log_warn(
+                "isaacmetalbridge.stage: active viewport will target the XYZ world origin"
+            )
+        if self._frame_prim_path:
+            carb.log_warn(
+                "isaacmetalbridge.stage: active viewport will frame "
+                f"{self._frame_prim_path}"
+            )
+        if self._startup_reference_url:
+            carb.log_warn(
+                "isaacmetalbridge.stage: startup reference requested: "
+                f"{self._startup_reference_url} -> {self._startup_reference_path}"
+            )
         carb.log_warn(
             f"isaacmetalbridge.stage: opening startup stage: {stage_url}"
         )
@@ -864,8 +1717,32 @@ class StartupStageExtension(omni.ext.IExt):
         self._task = None
         self._camera_subscription = None
         self._last_scene_values = None
+        self._static_scene_cache = None
+        self._static_scene_dirty = True
+        if self._scene_notice_key is not None:
+            self._scene_notice_key.Revoke()
+        self._scene_notice_key = None
+        self._scene_notice_stage = None
+        self._active_camera_path = ""
         self._app_ready_updates = 0
         self._layout_restored = False
+        self._camera_framed = False
+        self._origin_centered = False
+
+    def _on_usd_objects_changed(self, notice, _stage) -> None:
+        changed_paths = tuple(notice.GetResyncedPaths()) + tuple(
+            notice.GetChangedInfoOnlyPaths()
+        )
+        if changed_paths and self._active_camera_path:
+            camera_root = self._active_camera_path.rstrip("/")
+            if all(
+                str(path) == camera_root
+                or str(path).startswith(camera_root + "/")
+                or str(path).startswith(camera_root + ".")
+                for path in changed_paths
+            ):
+                return
+        self._static_scene_dirty = True
 
     def _on_update(self, _event) -> None:
         try:
@@ -890,14 +1767,73 @@ class StartupStageExtension(omni.ext.IExt):
             viewport = get_active_viewport()
             if stage is None or viewport is None:
                 return
+            if self._scene_notice_stage is not stage:
+                if self._scene_notice_key is not None:
+                    self._scene_notice_key.Revoke()
+                self._scene_notice_key = Tf.Notice.Register(
+                    Usd.Notice.ObjectsChanged,
+                    self._on_usd_objects_changed,
+                    stage,
+                )
+                self._scene_notice_stage = stage
+                self._static_scene_cache = None
+                self._static_scene_dirty = True
             camera_path = getattr(viewport, "camera_path", None)
             if callable(camera_path):
                 camera_path = camera_path()
             if not camera_path:
                 return
+            self._active_camera_path = str(camera_path)
             camera_prim = stage.GetPrimAtPath(camera_path)
             if not camera_prim.IsValid() or not camera_prim.IsA(UsdGeom.Camera):
                 return
+
+            if not self._camera_framed:
+                frame_prim = stage.GetPrimAtPath(self._frame_prim_path)
+                if not frame_prim.IsValid():
+                    return
+                from omni.kit.viewport.utility import frame_viewport_prims
+
+                frame_viewport_prims(viewport, [self._frame_prim_path])
+                self._camera_framed = True
+                carb.log_warn(
+                    "isaacmetalbridge.stage: active viewport framed real USD prim: "
+                    f"{self._frame_prim_path}"
+                )
+                return
+
+            if not self._origin_centered:
+                try:
+                    # Use Kit's own viewport-camera command path so the USD
+                    # camera, center-of-interest metadata, gizmo, and native
+                    # navigation controller all agree. This is intentionally a
+                    # one-shot retarget: subsequent viewer input is free to
+                    # orbit, pan, and zoom without being overwritten.
+                    from omni.kit.viewport.utility.camera_state import (
+                        ViewportCameraState,
+                    )
+
+                    camera_state = ViewportCameraState(
+                        camera_path=str(camera_path), viewport=viewport
+                    )
+                    camera_state.set_target_world(Gf.Vec3d(0.0, 0.0, 0.0), True)
+                    self._origin_centered = True
+                    self._origin_center_error_reported = False
+                    carb.log_warn(
+                        "isaacmetalbridge.stage: active viewport now targets "
+                        f"XYZ origin (0,0,0): path={camera_path}"
+                    )
+                    # Let TransformPrimCommand finish propagating before the
+                    # camera/scene-state snapshot is serialized.
+                    return
+                except Exception as error:
+                    if not self._origin_center_error_reported:
+                        carb.log_error(
+                            "isaacmetalbridge.stage: failed to center active "
+                            f"viewport on XYZ origin: {error}"
+                        )
+                        self._origin_center_error_reported = True
+                    return
 
             camera = UsdGeom.Camera(camera_prim)
             timeline = omni.timeline.get_timeline_interface()
@@ -941,6 +1877,53 @@ class StartupStageExtension(omni.ext.IExt):
             if not all(math.isfinite(value) for value in camera_values):
                 return
 
+            if timeline.is_playing():
+                # Animated transforms and time-sampled materials can change
+                # without authoring a new USD value or emitting a notice.
+                self._static_scene_dirty = True
+            if self._static_scene_cache is not None and not self._static_scene_dirty:
+                static_scene = self._static_scene_cache
+                scene_values = (
+                    camera_values
+                    + static_scene["sphere_light_values"]
+                    + static_scene["distant_light_values"]
+                    + static_scene["dome_light_values"]
+                    + (static_scene["mesh_payload"],)
+                )
+                if scene_values == self._last_scene_values:
+                    return
+
+                self._camera_sequence += 1
+                payload = _SCENE_HEADER.pack(
+                    _SCENE_MAGIC,
+                    _SCENE_VERSION,
+                    static_scene["flags"],
+                    self._camera_sequence,
+                    *camera_values,
+                    *static_scene["sphere_light_values"],
+                    *static_scene["distant_light_values"],
+                    *static_scene["dome_light_values"],
+                    static_scene["sequence"],
+                    static_scene["mesh_count"],
+                )
+                payload += static_scene["mesh_payload"]
+                temporary_path = f"{self._camera_state_path}.tmp.{os.getpid()}"
+                with open(temporary_path, "wb", buffering=0) as camera_file:
+                    camera_file.write(payload)
+                os.replace(temporary_path, self._camera_state_path)
+                self._last_scene_values = scene_values
+                self._camera_error_reported = False
+                if self._camera_sequence <= 3 or self._camera_sequence % 30 == 0:
+                    carb.log_warn(
+                        "isaacmetalbridge.stage: cached USD scene update published: "
+                        f"sequence={self._camera_sequence} "
+                        f"timeSeconds={timeline_seconds:.4f} "
+                        f"timeCode={time_code_value:.4f} "
+                        f"meshes={static_scene['mesh_count']} "
+                        f"pointInstances={static_scene['point_instance_count']}"
+                    )
+                return
+
             mesh_records = []
             mesh_paths = []
             file_texture_mesh_count = 0
@@ -948,17 +1931,24 @@ class StartupStageExtension(omni.ext.IExt):
             emission_mesh_count = 0
             parameter_texture_count = 0
             normal_texture_count = 0
+            alpha_cutout_mesh_count = 0
             uv_transform_mesh_count = 0
             instance_proxy_mesh_count = 0
             point_instance_mesh_count = 0
             point_instance_keys = set()
             scene_geometry_bytes = 0
+            scene_texture_bytes = 0
+            scene_material_texture_paths = set()
+            scene_texture_indices = {}
+            scene_textures = []
             for (
                 prim,
                 mesh_path,
                 mesh_world_transform,
                 is_instance_proxy,
                 point_instance_key,
+                included_faces,
+                bound_material,
             ) in _scene_mesh_occurrences(stage, xform_cache, sample_time):
                 if len(mesh_records) >= _MAX_SCENE_MESHES:
                     break
@@ -993,7 +1983,14 @@ class StartupStageExtension(omni.ext.IExt):
                     if count < 0 or face_offset + count > len(face_indices):
                         valid_topology = False
                         break
-                    if face_index not in holes and count >= 3:
+                    if (
+                        face_index not in holes
+                        and count >= 3
+                        and (
+                            included_faces is None
+                            or face_index in included_faces
+                        )
+                    ):
                         first = int(face_indices[face_offset])
                         for corner in range(1, count - 1):
                             corner_offsets = (
@@ -1042,9 +2039,12 @@ class StartupStageExtension(omni.ext.IExt):
                 )
                 if (
                     geometry_bytes <= 0
-                    or geometry_bytes > _MAX_SCENE_GEOMETRY_BYTES
+                    or geometry_bytes
+                    > _MAX_SCENE_GEOMETRY_BYTES - _MAX_SCENE_TEXTURE_BYTES
                     or scene_geometry_bytes
-                    > _MAX_SCENE_GEOMETRY_BYTES - geometry_bytes
+                    > _MAX_SCENE_GEOMETRY_BYTES
+                        - _MAX_SCENE_TEXTURE_BYTES
+                        - geometry_bytes
                 ):
                     continue
                 extent = mesh.GetExtentAttr().Get(sample_time)
@@ -1090,10 +2090,9 @@ class StartupStageExtension(omni.ext.IExt):
                 metallic_file_texture = None
                 emission_file_texture = None
                 normal_file_texture = None
+                warehouse_bundle = None
                 try:
-                    material, _relationship = UsdShade.MaterialBindingAPI(
-                        prim
-                    ).ComputeBoundMaterial()
+                    material = bound_material
                     if material and material.GetPrim().IsValid():
                         material_flags |= _MESH_HAS_BOUND_MATERIAL
                         base_color, connected_base_color = (
@@ -1125,6 +2124,29 @@ class StartupStageExtension(omni.ext.IExt):
                             ("normal", "normalmap", "normal_map"),
                             color_output=True,
                         )
+                        warehouse_bundle = _warehouse_mdl_material_bundle(
+                            material
+                        )
+                        if warehouse_bundle is not None:
+                            if warehouse_bundle["alpha_cutout"]:
+                                material_flags |= _MESH_HAS_ALPHA_CUTOUT
+                            if warehouse_bundle["base_color"] is not None:
+                                base_color = warehouse_bundle["base_color"]
+                                connected_base_color = False
+                            if (
+                                warehouse_bundle["material_parameters"]
+                                is not None
+                            ):
+                                material_parameters = warehouse_bundle[
+                                    "material_parameters"
+                                ]
+                            if (
+                                warehouse_bundle["material_emission"]
+                                is not None
+                            ):
+                                material_emission = warehouse_bundle[
+                                    "material_emission"
+                                ]
                 except Exception:
                     # A missing or unsupported binding must not suppress valid
                     # geometry from the scene manifest.
@@ -1158,28 +2180,58 @@ class StartupStageExtension(omni.ext.IExt):
                     material_flags |= _MESH_HAS_EMISSION
                     emission_mesh_count += 1
 
-                texture_specs = []
+                texture_spec_map = {}
                 if file_texture is not None:
-                    texture_specs.append(("base", *file_texture, 4))
+                    texture_spec_map["base"] = (*file_texture, 4)
                 if roughness_file_texture is not None:
-                    texture_specs.append(("roughness", *roughness_file_texture))
+                    texture_spec_map["roughness"] = roughness_file_texture
                 if metallic_file_texture is not None:
-                    texture_specs.append(("metallic", *metallic_file_texture))
+                    texture_spec_map["metallic"] = metallic_file_texture
                 if emission_file_texture is not None:
-                    texture_specs.append(("emission", *emission_file_texture))
+                    texture_spec_map["emission"] = emission_file_texture
                 if normal_file_texture is not None:
-                    texture_specs.append(("normal", *normal_file_texture))
+                    texture_spec_map["normal"] = normal_file_texture
+                predecoded_material_textures = {}
+                if warehouse_bundle is not None:
+                    texture_spec_map.update(
+                        warehouse_bundle["texture_specs"]
+                    )
+                    predecoded_material_textures = warehouse_bundle["decoded"]
+                texture_specs = [
+                    (kind, *texture_spec_map[kind])
+                    for kind in (
+                        "base", "roughness", "metallic", "emission", "normal"
+                    )
+                    if kind in texture_spec_map
+                ]
 
                 decoded_textures = {}
+                decoded_texture_paths = {}
+                texture_indices = {}
                 corner_uv_values = ()
                 if texture_specs:
                     shared_uv_source = texture_specs[0][2]
                     for kind, texture_path, uv_source, channel in texture_specs:
                         if uv_source != shared_uv_source:
                             continue
-                        decoded_texture = _load_rgba_texture(texture_path)
+                        decoded_texture = predecoded_material_textures.get(
+                            texture_path
+                        )
+                        if decoded_texture is None:
+                            decoded_texture = _load_rgba_texture(texture_path)
                         if decoded_texture is not None:
                             decoded_textures[kind] = (*decoded_texture, channel)
+                            decoded_texture_paths[kind] = texture_path
+                    if decoded_textures:
+                        material_texture_paths = set(
+                            decoded_texture_paths.values()
+                        )
+                        if len(
+                            scene_material_texture_paths
+                            | material_texture_paths
+                        ) > _MAX_SCENE_MATERIAL_TEXTURES:
+                            decoded_textures = {}
+                            decoded_texture_paths = {}
                     if decoded_textures:
                         corner_uv_values = _triangulated_corner_uvs(
                             mesh,
@@ -1206,18 +2258,44 @@ class StartupStageExtension(omni.ext.IExt):
                 normal_texture_pixels = b""
                 texture_flags = 0
                 if decoded_textures:
-                    texture_bytes = len(corner_uv_values) * 4 + sum(
-                        len(value[2]) for value in decoded_textures.values()
+                    new_texture_paths = []
+                    new_texture_bytes = 0
+                    for kind, texture_path in decoded_texture_paths.items():
+                        if (
+                            texture_path in scene_texture_indices
+                            or texture_path in new_texture_paths
+                        ):
+                            continue
+                        new_texture_paths.append(texture_path)
+                        new_texture_bytes += len(decoded_textures[kind][2])
+                    texture_bytes = (
+                        len(corner_uv_values) * 4 + new_texture_bytes
                     )
                     if (
-                        texture_bytes
-                        <= _MAX_SCENE_GEOMETRY_BYTES - geometry_bytes
-                        and scene_geometry_bytes
-                        <= _MAX_SCENE_GEOMETRY_BYTES
-                            - geometry_bytes
-                            - texture_bytes
+                        texture_bytes <= _MAX_SCENE_TEXTURE_BYTES
+                        and scene_texture_bytes
+                        <= _MAX_SCENE_TEXTURE_BYTES - texture_bytes
+                        and len(scene_textures) + len(new_texture_paths)
+                        <= _MAX_SCENE_MATERIAL_TEXTURES
                     ):
-                        geometry_bytes += texture_bytes
+                        scene_texture_bytes += texture_bytes
+                        scene_material_texture_paths.update(
+                            decoded_texture_paths.values()
+                        )
+                        for kind, texture_path in decoded_texture_paths.items():
+                            if texture_path not in scene_texture_indices:
+                                width, height, pixels, _channel = (
+                                    decoded_textures[kind]
+                                )
+                                scene_texture_indices[texture_path] = len(
+                                    scene_textures
+                                )
+                                scene_textures.append(
+                                    (texture_path, width, height, pixels)
+                                )
+                            texture_indices[kind] = scene_texture_indices[
+                                texture_path
+                            ]
                         if shared_uv_source[1]:
                             uv_transform_mesh_count += 1
                         if "base" in decoded_textures:
@@ -1288,6 +2366,8 @@ class StartupStageExtension(omni.ext.IExt):
                     if corner_uv_values
                     else b""
                 )
+                if material_flags & _MESH_HAS_ALPHA_CUTOUT:
+                    alpha_cutout_mesh_count += 1
                 mesh_records.append(
                     _SCENE_MESH_RECORD.pack(
                         _fnv1a_64(mesh_path),
@@ -1304,33 +2384,33 @@ class StartupStageExtension(omni.ext.IExt):
                         len(corner_uv_values) // 2,
                         texture_width,
                         texture_height,
-                        len(texture_pixels),
+                        0,
                         texture_flags,
                         roughness_texture_width,
                         roughness_texture_height,
-                        len(roughness_texture_pixels),
+                        0,
                         roughness_texture_channel,
                         metallic_texture_width,
                         metallic_texture_height,
-                        len(metallic_texture_pixels),
+                        0,
                         metallic_texture_channel,
                         emission_texture_width,
                         emission_texture_height,
-                        len(emission_texture_pixels),
+                        0,
                         emission_texture_channel,
                         normal_texture_width,
                         normal_texture_height,
-                        len(normal_texture_pixels),
+                        0,
+                        texture_indices.get("base", _NO_SCENE_TEXTURE),
+                        texture_indices.get("roughness", _NO_SCENE_TEXTURE),
+                        texture_indices.get("metallic", _NO_SCENE_TEXTURE),
+                        texture_indices.get("emission", _NO_SCENE_TEXTURE),
+                        texture_indices.get("normal", _NO_SCENE_TEXTURE),
                     )
                     + vertex_payload
                     + index_payload
                     + normal_payload
                     + uv_payload
-                    + texture_pixels
-                    + roughness_texture_pixels
-                    + metallic_texture_pixels
-                    + emission_texture_pixels
-                    + normal_texture_pixels
                 )
                 if is_instance_proxy:
                     instance_proxy_mesh_count += 1
@@ -1439,7 +2519,51 @@ class StartupStageExtension(omni.ext.IExt):
                     break
                 dome_light_values = (0.0,) * 4
 
-            mesh_payload = b"".join(mesh_records)
+            texture_table_records = [struct.pack("<I", len(scene_textures))]
+            for texture_path, width, height, pixels in scene_textures:
+                texture_table_records.append(
+                    _SCENE_TEXTURE_RECORD.pack(
+                        _fnv1a_64(texture_path),
+                        width,
+                        height,
+                        len(pixels),
+                    )
+                    + pixels
+                )
+            mesh_payload = b"".join(texture_table_records + mesh_records)
+            flags = _scene_flags(
+                sphere_light_path,
+                distant_light_path,
+                dome_light_path,
+            )
+            static_scene_values = (
+                flags,
+                sphere_light_values,
+                distant_light_values,
+                dome_light_values,
+                mesh_payload,
+                len(mesh_records),
+            )
+            if (
+                self._static_scene_cache is not None
+                and self._static_scene_cache["values"] == static_scene_values
+            ):
+                static_scene_sequence = self._static_scene_cache["sequence"]
+            else:
+                self._static_scene_sequence += 1
+                static_scene_sequence = self._static_scene_sequence
+            self._static_scene_cache = {
+                "flags": flags,
+                "sphere_light_values": sphere_light_values,
+                "distant_light_values": distant_light_values,
+                "dome_light_values": dome_light_values,
+                "mesh_payload": mesh_payload,
+                "mesh_count": len(mesh_records),
+                "point_instance_count": len(point_instance_keys),
+                "sequence": static_scene_sequence,
+                "values": static_scene_values,
+            }
+            self._static_scene_dirty = False
             scene_values = (
                 camera_values
                 + sphere_light_values
@@ -1451,23 +2575,6 @@ class StartupStageExtension(omni.ext.IExt):
                 return
 
             self._camera_sequence += 1
-            flags = (
-                _CAMERA_VALID_PERSPECTIVE
-                | _SCENE_HAS_MESH_MANIFEST
-                | _SCENE_HAS_MESH_GEOMETRY
-                | _SCENE_HAS_CORNER_NORMALS
-                | _SCENE_HAS_FILE_TEXTURES
-                | _SCENE_HAS_MATERIAL_PARAMETERS
-                | _SCENE_HAS_EMISSION
-                | _SCENE_HAS_PARAMETER_TEXTURES
-                | _SCENE_HAS_NORMAL_TEXTURES
-            )
-            if sphere_light_path:
-                flags |= _SCENE_VALID_SPHERE_LIGHT
-            if distant_light_path:
-                flags |= _SCENE_VALID_DISTANT_LIGHT
-            if dome_light_path:
-                flags |= _SCENE_VALID_DOME_LIGHT
             payload = _SCENE_HEADER.pack(
                 _SCENE_MAGIC,
                 _SCENE_VERSION,
@@ -1477,6 +2584,7 @@ class StartupStageExtension(omni.ext.IExt):
                 *sphere_light_values,
                 *distant_light_values,
                 *dome_light_values,
+                static_scene_sequence,
                 len(mesh_records),
             )
             payload += mesh_payload
@@ -1489,6 +2597,14 @@ class StartupStageExtension(omni.ext.IExt):
             self._last_scene_values = scene_values
             self._camera_error_reported = False
             if self._camera_sequence == 1:
+                reference_prefix = self._startup_reference_path.rstrip("/") + "/"
+                reference_mesh_count = sum(
+                    1 for path in mesh_paths if path.startswith(reference_prefix)
+                )
+                if len(mesh_paths) <= 24:
+                    mesh_path_sample = mesh_paths
+                else:
+                    mesh_path_sample = mesh_paths[:12] + ["..."] + mesh_paths[-12:]
                 carb.log_warn(
                     "isaacmetalbridge.stage: active Kit camera published: "
                     f"path={camera_path} position=({camera_values[0]:.3f},"
@@ -1539,11 +2655,16 @@ class StartupStageExtension(omni.ext.IExt):
                     f"emissiveMaterials={emission_mesh_count} "
                     f"parameterTextures={parameter_texture_count} "
                     f"normalTextures={normal_texture_count} "
+                    f"alphaCutoutMeshes={alpha_cutout_mesh_count} "
                     f"uvTransforms={uv_transform_mesh_count} "
+                    f"geometryMiB={scene_geometry_bytes / 1048576.0:.1f} "
+                    f"textureMiB={scene_texture_bytes / 1048576.0:.1f} "
+                    f"uniqueTextures={len(scene_material_texture_paths)} "
                     f"instanceProxyMeshes={instance_proxy_mesh_count} "
                     f"pointInstances={len(point_instance_keys)} "
                     f"pointInstanceMeshes={point_instance_mesh_count} "
-                    f"paths=[{','.join(mesh_paths)}]"
+                    f"startupReferenceMeshes={reference_mesh_count} "
+                    f"pathSample=[{','.join(mesh_path_sample)}]"
                 )
             elif self._camera_sequence <= 3 or self._camera_sequence % 30 == 0:
                 carb.log_warn(
@@ -1578,6 +2699,50 @@ class StartupStageExtension(omni.ext.IExt):
                     f"{stage_url}"
                 )
                 return
+
+            if self._startup_reference_url:
+                previous_edit_target = stage.GetEditTarget()
+                try:
+                    # Keep the downloaded NVIDIA background immutable. The
+                    # robot composition belongs in the anonymous session layer
+                    # used for this launch only.
+                    stage.SetEditTarget(stage.GetSessionLayer())
+                    reference_prim = stage.DefinePrim(
+                        self._startup_reference_path, "Xform"
+                    )
+                    if not reference_prim.GetReferences().AddReference(
+                        self._startup_reference_url
+                    ):
+                        raise RuntimeError("USD reference authoring was rejected")
+                    if self._add_startup_key_light:
+                        key_light = UsdLux.SphereLight.Define(
+                            stage, "/World/IsaacMetalBridgeKeyLight"
+                        )
+                        key_light.CreateColorAttr(Gf.Vec3f(1.0, 0.94, 0.84))
+                        key_light.CreateIntensityAttr(45000.0)
+                        key_light.CreateRadiusAttr(0.35)
+                        UsdGeom.Xformable(key_light.GetPrim()).AddTranslateOp().Set(
+                            Gf.Vec3d(2.0, -2.0, 3.0)
+                        )
+                finally:
+                    stage.SetEditTarget(previous_edit_target)
+                # Give USD and Kit a few updates to resolve the remote robot's
+                # referenced visual and physics layers before framing it.
+                app = omni.kit.app.get_app()
+                for _attempt in range(8):
+                    await app.next_update_async()
+                reference_prim = stage.GetPrimAtPath(self._startup_reference_path)
+                child_count = sum(1 for _child in reference_prim.GetChildren())
+                carb.log_warn(
+                    "isaacmetalbridge.stage: real startup reference composed: "
+                    f"path={self._startup_reference_path} children={child_count} "
+                    f"asset={self._startup_reference_url}"
+                )
+                if self._add_startup_key_light:
+                    carb.log_warn(
+                        "isaacmetalbridge.stage: real USD SphereLight composed "
+                        "for robot inspection: /World/IsaacMetalBridgeKeyLight"
+                    )
 
             root_layer = stage.GetRootLayer().identifier
             root_prims = ",".join(prim.GetName() for prim in stage.GetPseudoRoot().GetChildren())

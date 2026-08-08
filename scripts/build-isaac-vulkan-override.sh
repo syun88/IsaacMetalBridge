@@ -7,6 +7,8 @@ output_dir="${IMB_VULKAN_OVERRIDE_OUTPUT:-${repo_root}/build/vulkan-override}"
 builder_image="${IMB_VULKAN_BUILDER_IMAGE:-imb-bridge-build:dev}"
 container_id="imb-vulkan-override-build-$$"
 
+"${script_dir}/cleanup-bridge-containers.sh"
+
 cleanup() {
     container delete --force "${container_id}" >/dev/null 2>&1 || true
 }

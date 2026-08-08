@@ -420,6 +420,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     private struct MaterialTextureDescriptor {
         let resourceIDs: [UInt64]
         let channels: SIMD4<UInt32>
+        let alphaCutout: Bool
     }
 
     private struct AccelerationStructureResource {
@@ -546,6 +547,24 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         return value.a;
     }
 
+    float3 imb_srgb_to_linear(float3 encoded)
+    {
+        encoded = clamp(encoded, float3(0.0), float3(1.0));
+        const float3 low = encoded / 12.92;
+        const float3 high = pow(
+            (encoded + 0.055) / 1.055, float3(2.4)
+        );
+        return select(high, low, encoded <= 0.04045);
+    }
+
+    float3 imb_linear_to_srgb(float3 linear)
+    {
+        linear = max(linear, float3(0.0));
+        const float3 low = linear * 12.92;
+        const float3 high = 1.055 * pow(linear, float3(1.0 / 2.4)) - 0.055;
+        return clamp(select(high, low, linear <= 0.0031308), 0.0, 1.0);
+    }
+
     kernel void imb_trace_probe(
         instance_acceleration_structure accelerationStructure [[buffer(0)]],
         constant uint2 &extent [[buffer(1)]],
@@ -575,14 +594,21 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         const device uint4 *instanceTangentRanges [[buffer(25)]],
         constant uint &tangentInstanceCount [[buffer(26)]],
         const device uint *instanceNormalTextureIndices [[buffer(27)]],
+        constant uint &rayPixelStep [[buffer(28)]],
         texture2d<float, access::write> output [[texture(0)]],
         texture2d<float, access::sample> sceneMaterialTexture [[texture(1)]],
-        array<texture2d<float, access::sample>, 16> materialTextures [[texture(2)]],
+        array<texture2d<float, access::sample>, 126> materialTextures [[texture(2)]],
         uint2 threadID [[thread_position_in_grid]])
     {
-        if (threadID.x >= extent.x || threadID.y >= extent.y) return;
+        const uint pixelStep = max(rayPixelStep, 1u);
+        const uint2 pixelOrigin = threadID * pixelStep;
+        if (pixelOrigin.x >= extent.x || pixelOrigin.y >= extent.y) return;
 
-        const float2 normalized = (float2(threadID) + 0.5) / float2(extent);
+        const float2 samplePixel = min(
+            float2(pixelOrigin) + float(pixelStep) * 0.5,
+            float2(extent) - 0.5
+        );
+        const float2 normalized = samplePixel / float2(extent);
         const bool isaacSceneView = colors.y == 0xffe08c30 || colors.y == 0xffe08c31;
         const bool simpleGridView = colors.y == 0xffe08c31;
         ray probeRay;
@@ -621,13 +647,74 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             : 100.0;
 
         intersector<triangle_data, instancing> triangleIntersector;
-        const auto intersection = triangleIntersector.intersect(probeRay, accelerationStructure);
+        constexpr sampler materialSampler(
+            coord::normalized,
+            address::repeat,
+            filter::linear,
+            mip_filter::none
+        );
+        auto intersection = triangleIntersector.intersect(
+            probeRay, accelerationStructure
+        );
+        bool acceptedTriangleHit = false;
+        // Metal's triangle intersector returns the nearest geometric hit.  For
+        // the explicitly tagged Warehouse masked materials, sample the baked
+        // opacity and continue the same ray past transparent triangles.  This
+        // reproduces their binary 0.3333 MDL opacity mask without treating all
+        // unrelated texture alpha channels as transparency.
+        for (uint alphaLayer = 0u; alphaLayer < 64u; ++alphaLayer) {
+            if (intersection.type == intersection_type::none) break;
+            bool rejectCutout = false;
+            if (intersection.instance_id < uvInstanceCount
+                && intersection.instance_id < textureInstanceCount) {
+                const uint candidateChannels =
+                    instanceMaterialTextureChannels[intersection.instance_id];
+                const uint4 candidateTextures =
+                    instanceTextureIndices[intersection.instance_id];
+                const uint4 candidateUVRange =
+                    instanceUVRanges[intersection.instance_id];
+                if ((candidateChannels & 0x80000000u) != 0u
+                    && candidateTextures.x < materialTextureCount
+                    && intersection.primitive_id < candidateUVRange.y
+                    && candidateUVRange.z == 3u) {
+                    const uint candidateUVIndex = candidateUVRange.x
+                        + intersection.primitive_id * 3u;
+                    const float2 candidateBarycentric =
+                        intersection.triangle_barycentric_coord;
+                    const float2 candidateUV =
+                        triangleUVs[candidateUVIndex]
+                            * (1.0 - candidateBarycentric.x
+                                - candidateBarycentric.y)
+                        + triangleUVs[candidateUVIndex + 1u]
+                            * candidateBarycentric.x
+                        + triangleUVs[candidateUVIndex + 2u]
+                            * candidateBarycentric.y;
+                    const float candidateAlpha =
+                        materialTextures[candidateTextures.x].sample(
+                            materialSampler,
+                            float2(candidateUV.x, 1.0 - candidateUV.y)
+                        ).a;
+                    rejectCutout = candidateAlpha < 0.3333;
+                }
+            }
+            if (!rejectCutout) {
+                acceptedTriangleHit = true;
+                break;
+            }
+            const float nextMinimum = intersection.distance + max(
+                0.0001, intersection.distance * 0.000001
+            );
+            probeRay.min_distance = min(nextMinimum, probeRay.max_distance);
+            intersection = triangleIntersector.intersect(
+                probeRay, accelerationStructure
+            );
+        }
         float4 color;
         float gridDistance = INFINITY;
         if (simpleGridView && probeRay.direction.z < -0.0001) {
             gridDistance = -probeRay.origin.z / probeRay.direction.z;
         }
-        const bool hasTriangleHit = intersection.type != intersection_type::none;
+        const bool hasTriangleHit = acceptedTriangleHit;
         const bool hasGridHit = simpleGridView
             && gridDistance >= probeRay.min_distance
             && gridDistance <= probeRay.max_distance
@@ -659,10 +746,12 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 // Simple Grid's OmniPBR material uses projected world-space
                 // UVs and inputs:texture_scale=(0.5, 0.5).
                 const float2 materialUV = worldPosition.xy * 0.5;
-                gridColor = sceneMaterialTexture.sample(
-                    materialSampler,
-                    materialUV
-                ).rgb;
+                gridColor = imb_srgb_to_linear(
+                    sceneMaterialTexture.sample(
+                        materialSampler,
+                        materialUV
+                    ).rgb
+                );
             } else {
                 const float3 floorColor = float3(0.025, 0.075, 0.13);
                 const float3 minorColor = float3(0.20, 0.48, 0.72) * distanceFade;
@@ -677,15 +766,16 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             gridColor = mix(gridColor, float3(0.18, 0.74, 0.32), yAxis);
             color = float4(gridColor, 1.0);
         } else if (isaacSceneView && hasTriangleHit) {
-            const float shade = clamp(1.25 - intersection.distance * 0.12, 0.35, 1.0);
-            const float instanceTint = 0.82 + 0.06 * float(intersection.instance_id % 3);
             const uint materialID = intersection.user_instance_id;
             const uint materialMarker = materialID & 0x00c00000u;
             const bool hasAuthoredBaseColor = materialMarker == 0x00800000u;
             const float3 authoredBaseColor = float3(
                 float(materialID & 0xffu) / 255.0,
                 float((materialID >> 8) & 0xffu) / 255.0,
-                float((materialID >> 16) & 0x7fu) / 127.0
+                // The upper two bits are the inline-color marker.  Blue uses
+                // the remaining six bits so it can never impersonate the
+                // material-descriptor marker.
+                float((materialID >> 16) & 0x3fu) / 63.0
             );
             float3 resolvedBaseColor = (
                 hasAuthoredBaseColor
@@ -716,17 +806,13 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                     canSampleMaterialTextures = true;
                 }
             }
-            constexpr sampler materialSampler(
-                coord::normalized,
-                address::repeat,
-                filter::linear,
-                mip_filter::none
-            );
             if (canSampleMaterialTextures
                 && textureIndices.x < materialTextureCount) {
-                resolvedBaseColor = materialTextures[textureIndices.x].sample(
-                    materialSampler, materialUV
-                ).rgb;
+                resolvedBaseColor = imb_srgb_to_linear(
+                    materialTextures[textureIndices.x].sample(
+                        materialSampler, materialUV
+                    ).rgb
+                );
             }
             float roughness = 0.5;
             float metallic = 0.0;
@@ -772,15 +858,17 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             if (canSampleMaterialTextures
                 && textureIndices.w < materialTextureCount) {
                 const float3 emissionTexture = clamp(
-                    materialTextures[textureIndices.w].sample(
-                        materialSampler, materialUV
-                    ).rgb,
+                    imb_srgb_to_linear(
+                        materialTextures[textureIndices.w].sample(
+                            materialSampler, materialUV
+                        ).rgb
+                    ),
                     float3(0.0),
                     float3(1.0)
                 );
                 emissiveRadiance *= emissionTexture;
             }
-            const float3 baseColor = resolvedBaseColor * shade * instanceTint;
+            const float3 baseColor = resolvedBaseColor;
             if ((cameraOptions & (2u | 8u | 16u)) != 0) {
                 const float3 hitPosition =
                     probeRay.origin + probeRay.direction * intersection.distance;
@@ -876,7 +964,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                     const float3 lightDirection = toLight * rsqrt(lightDistanceSquared);
                     const float diffuse = max(dot(surfaceNormal, lightDirection), 0.0);
                     float visibility = 1.0;
-                    if (diffuse > 0.0) {
+                    if (diffuse > 0.0 && (cameraOptions & 32u) != 0) {
                         ray shadowRay;
                         shadowRay.origin = hitPosition + surfaceNormal * 0.002;
                         shadowRay.direction = lightDirection;
@@ -938,7 +1026,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         1.0
                     );
                     float visibility = 1.0;
-                    if (diffuse > 0.0) {
+                    if (diffuse > 0.0 && (cameraOptions & 32u) != 0) {
                         ray shadowRay;
                         shadowRay.origin = hitPosition + surfaceNormal * 0.002;
                         shadowRay.direction = lightDirection;
@@ -999,7 +1087,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                     ? (1.0 - metallic) : 1.0;
                 color = float4(
                     baseColor * illumination * diffuseWeight
-                        + specularIllumination * shade * instanceTint
+                        + specularIllumination
                         + emissiveRadiance,
                     1.0
                 );
@@ -1015,7 +1103,17 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 float((packed >> 24) & 0xff)
             ) / 255.0;
         }
-        output.write(color, threadID);
+        if (hasGridHit || (isaacSceneView && hasTriangleHit)) {
+            color.rgb = imb_linear_to_srgb(color.rgb);
+        }
+        for (uint offsetY = 0; offsetY < pixelStep; ++offsetY) {
+            for (uint offsetX = 0; offsetX < pixelStep; ++offsetX) {
+                const uint2 outputPixel = pixelOrigin + uint2(offsetX, offsetY);
+                if (outputPixel.x < extent.x && outputPixel.y < extent.y) {
+                    output.write(color, outputPixel);
+                }
+            }
+        }
     }
     """
 
@@ -1038,6 +1136,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     private var commandBuffers: [UInt64: any MTLCommandBuffer] = [:]
     private var frameImages: [UInt64: UInt64] = [:]
     private var frameOutputDisabledAfterError = false
+    private var rayQualityReported = false
 
     public static func makeDefault() -> MetalGPUBackend? {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -1270,6 +1369,16 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             return .r16Unorm
         case 5:
             return .rgba16Unorm
+        case 6:
+            guard let format = MTLPixelFormat(rawValue: 135) else {
+                throw GPUBackendError.unsupported("Metal BC3_sRGB is unavailable")
+            }
+            return format
+        case 7:
+            guard let format = MTLPixelFormat(rawValue: 142) else {
+                throw GPUBackendError.unsupported("Metal BC5_RGUnorm is unavailable")
+            }
+            return format
         default:
             throw GPUBackendError.unsupported("unsupported sparse image format \(format)")
         }
@@ -1395,7 +1504,12 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         descriptor.arrayLength = Int(arrayLayers)
         descriptor.sampleCount = 1
         descriptor.storageMode = .private
-        descriptor.usage = [.shaderRead, .shaderWrite]
+        // Block-compressed formats are sampleable but not writable in either
+        // Vulkan or Metal. Advertising shaderWrite makes Metal reject the
+        // descriptor even though sparse BC residency itself is supported.
+        descriptor.usage = (format == 3 || format == 6 || format == 7)
+            ? [.shaderRead]
+            : [.shaderRead, .shaderWrite]
         guard let texture = heap.makeTexture(descriptor: descriptor) else {
             throw GPUBackendError.unavailable(
                 "Metal failed to create a \(width)x\(height) sparse texture"
@@ -1962,7 +2076,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                     ) {
                         return UInt32(existing)
                     }
-                    guard materialTextureResourceIDs.count < 16 else {
+                    guard materialTextureResourceIDs.count < 126 else {
                         return UInt32.max
                     }
                     let textureIndex = UInt32(materialTextureResourceIDs.count)
@@ -1982,6 +2096,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         descriptor.channels.x
                         | (descriptor.channels.y << 4)
                         | (descriptor.channels.z << 8)
+                        | (descriptor.alphaCutout ? 0x8000_0000 : 0)
                     )
                     instanceNormalTextureIndices.append(
                         appendTextureIndex(descriptor.resourceIDs[4])
@@ -2256,17 +2371,141 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         guard let image = images[id] else {
             throw GPUBackendError.resourceNotFound(id)
         }
-        let bytesPerRow = image.width * 4
-        guard data.count == bytesPerRow * image.height else {
+        let blockWidth: Int
+        let blockHeight: Int
+        let blockBytes: Int
+        switch image.format {
+        case 1, 2:
+            (blockWidth, blockHeight, blockBytes) = (1, 1, 4)
+        case 3, 6, 7:
+            (blockWidth, blockHeight, blockBytes) = (4, 4, 16)
+        case 4:
+            (blockWidth, blockHeight, blockBytes) = (1, 1, 2)
+        case 5:
+            (blockWidth, blockHeight, blockBytes) = (1, 1, 8)
+        default:
+            throw GPUBackendError.unsupported("unsupported Metal image upload format \(image.format)")
+        }
+
+        struct UploadPlan {
+            let tightOffset: Int
+            let stagingOffset: Int
+            let rowBytes: Int
+            let rowPitch: Int
+            let rowCount: Int
+            let width: Int
+            let height: Int
+            let mipLevel: Int
+            let slice: Int
+        }
+        // minimumTextureBufferAlignment(for:) asserts inside Metal for BC
+        // pixel formats. Buffer-to-texture blits use Metal's 256-byte row and
+        // offset alignment for those compressed blocks.
+        let alignment = blockWidth > 1 || blockHeight > 1
+            ? 256
+            : max(
+                1,
+                device.minimumTextureBufferAlignment(for: image.texture.pixelFormat)
+            )
+        let align = { (value: Int) -> Int in
+            ((value + alignment - 1) / alignment) * alignment
+        }
+        var plans: [UploadPlan] = []
+        var tightOffset = 0
+        var stagingSize = 0
+        for slice in 0..<image.arrayLayers {
+            var width = image.width
+            var height = image.height
+            for mipLevel in 0..<image.mipLevels {
+                let rowBytes = ((width + blockWidth - 1) / blockWidth) * blockBytes
+                let rowCount = (height + blockHeight - 1) / blockHeight
+                let tightByteCount = rowBytes * rowCount
+                let stagingOffset = align(stagingSize)
+                let rowPitch = align(rowBytes)
+                plans.append(UploadPlan(
+                    tightOffset: tightOffset,
+                    stagingOffset: stagingOffset,
+                    rowBytes: rowBytes,
+                    rowPitch: rowPitch,
+                    rowCount: rowCount,
+                    width: width,
+                    height: height,
+                    mipLevel: mipLevel,
+                    slice: slice
+                ))
+                tightOffset += tightByteCount
+                stagingSize = stagingOffset + rowPitch * rowCount
+                width = max(1, width / 2)
+                height = max(1, height / 2)
+            }
+        }
+        guard data.count == tightOffset else {
             throw GPUBackendError.outOfBounds
         }
+
+        if !image.sparse, image.mipLevels == 1, image.arrayLayers == 1,
+           blockWidth == 1, blockHeight == 1 {
+            data.withUnsafeBytes { source in
+                guard let baseAddress = source.baseAddress else { return }
+                image.texture.replace(
+                    region: MTLRegionMake2D(0, 0, image.width, image.height),
+                    mipmapLevel: 0,
+                    withBytes: baseAddress,
+                    bytesPerRow: plans[0].rowBytes
+                )
+            }
+            return
+        }
+
+        guard stagingSize > 0,
+              let staging = device.makeBuffer(
+                  length: stagingSize,
+                  options: .storageModeShared
+              )
+        else {
+            throw GPUBackendError.unavailable("Metal image upload buffer allocation failed")
+        }
         data.withUnsafeBytes { source in
-            guard let baseAddress = source.baseAddress else { return }
-            image.texture.replace(
-                region: MTLRegionMake2D(0, 0, image.width, image.height),
-                mipmapLevel: 0,
-                withBytes: baseAddress,
-                bytesPerRow: bytesPerRow
+            guard let sourceBase = source.baseAddress else { return }
+            let destinationBase = staging.contents()
+            for plan in plans {
+                for row in 0..<plan.rowCount {
+                    memcpy(
+                        destinationBase.advanced(by: plan.stagingOffset + row * plan.rowPitch),
+                        sourceBase.advanced(by: plan.tightOffset + row * plan.rowBytes),
+                        plan.rowBytes
+                    )
+                }
+            }
+        }
+        guard let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeBlitCommandEncoder()
+        else {
+            throw GPUBackendError.unavailable("Metal image upload command creation failed")
+        }
+        for plan in plans {
+            encoder.copy(
+                from: staging,
+                sourceOffset: plan.stagingOffset,
+                sourceBytesPerRow: plan.rowPitch,
+                sourceBytesPerImage: plan.rowPitch * plan.rowCount,
+                sourceSize: MTLSize(
+                    width: plan.width,
+                    height: plan.height,
+                    depth: 1
+                ),
+                to: image.texture,
+                destinationSlice: plan.slice,
+                destinationLevel: plan.mipLevel,
+                destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+            )
+        }
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if commandBuffer.status == .error {
+            throw GPUBackendError.unavailable(
+                "Metal image upload failed: \(commandBuffer.error?.localizedDescription ?? "unknown error")"
             )
         }
     }
@@ -2676,7 +2915,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         encoder.setAccelerationStructure(structure, bufferIndex: 0)
         encoder.setTexture(image.texture, index: 0)
         encoder.setTexture(sceneMaterialTexture, index: 1)
-        for textureIndex in 0..<16 {
+        for textureIndex in 0..<126 {
             let materialTexture: any MTLTexture
             if textureIndex < acceleration.materialTextureResourceIDs.count,
                let resource = images[
@@ -2714,6 +2953,56 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             | (hasSceneMaterialTexture ? 4 : 0)
             | (distantLight == nil ? 0 : 8)
             | (domeLight == nil ? 0 : 16)
+        let shadowMode = ProcessInfo.processInfo.environment[
+            "IMB_RAY_SHADOWS"
+        ]?.lowercased() ?? "always"
+        let shadowInstanceLimit = Int(
+            ProcessInfo.processInfo.environment[
+                "IMB_RAY_SHADOW_INSTANCE_LIMIT"
+            ] ?? "256"
+        ) ?? 256
+        let tracesHardShadows: Bool
+        switch shadowMode {
+        case "1", "on", "true", "always":
+            tracesHardShadows = true
+        case "0", "off", "false", "never":
+            tracesHardShadows = false
+        default:
+            tracesHardShadows = acceleration.childStructureIDs.count
+                <= max(shadowInstanceLimit, 0)
+        }
+        if tracesHardShadows {
+            cameraOptions |= 32
+        }
+        let pixelStepMode = ProcessInfo.processInfo.environment[
+            "IMB_RAY_PIXEL_STEP"
+        ]?.lowercased() ?? "1"
+        let requestedPixelStep = Int(pixelStepMode)
+        let rayPixelStepValue: Int
+        if let requestedPixelStep {
+            rayPixelStepValue = min(max(requestedPixelStep, 1), 8)
+        } else if pixelStepMode == "adaptive" {
+            if acceleration.childStructureIDs.count > 512 {
+                rayPixelStepValue = 4
+            } else if acceleration.childStructureIDs.count > 256 {
+                rayPixelStepValue = 2
+            } else {
+                rayPixelStepValue = 1
+            }
+        } else {
+            rayPixelStepValue = 1
+        }
+        var rayPixelStep = UInt32(rayPixelStepValue)
+        if !rayQualityReported {
+            let message = "imb-host: Metal ray quality hardShadows="
+                + "\(tracesHardShadows) mode=\(shadowMode) "
+                + "pixelStep=\(rayPixelStepValue) "
+                + "pixelStepMode=\(pixelStepMode) "
+                + "instances=\(acceleration.childStructureIDs.count) "
+                + "adaptiveLimit=\(max(shadowInstanceLimit, 0))\n"
+            FileHandle.standardError.write(Data(message.utf8))
+            rayQualityReported = true
+        }
         var sphereLightPositionAndIntensity = SIMD4<Float>(
             sphereLight?.position.x ?? 0,
             sphereLight?.position.y ?? 0,
@@ -2822,7 +3111,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         var uvInstanceCount = acceleration.uvInstanceCount
         var textureInstanceCount = acceleration.uvInstanceCount
         var materialTextureCount = UInt32(
-            min(acceleration.materialTextureResourceIDs.count, 16)
+            min(acceleration.materialTextureResourceIDs.count, 126)
         )
         if let uvBuffer = acceleration.triangleUVBuffer,
            let uvRangeBuffer = acceleration.instanceUVRangeBuffer,
@@ -2931,6 +3220,11 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             length: MemoryLayout<UInt32>.size,
             index: 26
         )
+        encoder.setBytes(
+            &rayPixelStep,
+            length: MemoryLayout<UInt32>.size,
+            index: 28
+        )
         for childID in acceleration.childStructureIDs {
             guard let child = accelerationStructures[childID]?.structure else {
                 throw GPUBackendError.resourceNotFound(childID)
@@ -2939,8 +3233,12 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         }
         let threadWidth = pipeline.threadExecutionWidth
         let threadHeight = max(1, min(pipeline.maxTotalThreadsPerThreadgroup / threadWidth, 8))
+        let dispatchWidth = (Int(width) + rayPixelStepValue - 1)
+            / rayPixelStepValue
+        let dispatchHeight = (Int(height) + rayPixelStepValue - 1)
+            / rayPixelStepValue
         encoder.dispatchThreads(
-            MTLSize(width: Int(width), height: Int(height), depth: 1),
+            MTLSize(width: dispatchWidth, height: dispatchHeight, depth: 1),
             threadsPerThreadgroup: MTLSize(width: threadWidth, height: threadHeight, depth: 1)
         )
         encoder.endEncoding()
@@ -3022,9 +3320,9 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 .assumingMemoryBound(to: UInt32.self).pointee)
         }
         let flags = words[2]
-        let supportedFlags: UInt32 = version == 2 ? 0x1f : 0x0f
+        let supportedFlags: UInt32 = version == 2 ? 0x3f : 0x0f
         guard flags & ~supportedFlags == 0,
-              flags & (version == 2 ? 0x1e : 0x0e) != 0
+              flags & (version == 2 ? 0x3e : 0x0e) != 0
         else {
             return nil
         }
@@ -3062,7 +3360,8 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             resourceIDs: resourceIDs,
             channels: SIMD4<UInt32>(
                 roughnessChannel, metallicChannel, emissionChannel, 0
-            )
+            ),
+            alphaCutout: flags & 0x20 != 0
         )
     }
 

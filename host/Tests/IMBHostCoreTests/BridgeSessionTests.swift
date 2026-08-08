@@ -30,6 +30,8 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     private var fences: Set<UInt64> = []
     private var computePipelines: Set<UInt64> = []
     private var accelerationStructures: Set<UInt64> = []
+    private(set) var lastImageWriteID: UInt64?
+    private(set) var lastImageWriteData: Data?
     private(set) var lastRayCamera: RayCamera?
     private(set) var lastRaySphereLight: RaySphereLight?
     private(set) var lastRayDistantLight: RayDistantLight?
@@ -62,15 +64,15 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         textureType: UInt32,
         sampleCount: UInt32
     ) throws -> SparseImageProperties {
-        guard (format >= 1 && format <= 5),
+        guard (format >= 1 && format <= 7),
               textureType == 1,
               sampleCount == 1
         else {
             throw GPUBackendError.unsupported("invalid test sparse image query")
         }
         return SparseImageProperties(
-            tileWidth: (format == 3 || format == 4) ? 128 : 64,
-            tileHeight: format == 5 ? 32 : (format == 4 ? 64 : (format == 3 ? 128 : 64)),
+            tileWidth: (format == 3 || format == 4 || format == 6 || format == 7) ? 128 : 64,
+            tileHeight: format == 5 ? 32 : (format == 4 ? 64 : ((format == 3 || format == 6 || format == 7) ? 128 : 64)),
             tileDepth: 1,
             tileSizeBytes: 16_384
         )
@@ -88,12 +90,31 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         textureType: UInt32
     ) throws {
         guard virtualSize > 0, width > 0, height > 0,
-              (format >= 1 && format <= 5),
+              (format >= 1 && format <= 7),
               mipLevels > 0, arrayLayers > 0, sampleCount == 1, textureType == 1
         else {
             throw GPUBackendError.unsupported("invalid test sparse image")
         }
-        images[id] = Image(width: Int(width), height: Int(height), pixels: Data())
+        let blockWidth = (format == 3 || format == 6 || format == 7) ? 4 : 1
+        let blockHeight = blockWidth
+        let blockBytes = (format == 3 || format == 6 || format == 7)
+            ? 16
+            : (format == 4 ? 2 : (format == 5 ? 8 : 4))
+        var mipWidth = Int(width)
+        var mipHeight = Int(height)
+        var layerBytes = 0
+        for _ in 0..<mipLevels {
+            layerBytes += ((mipWidth + blockWidth - 1) / blockWidth)
+                * ((mipHeight + blockHeight - 1) / blockHeight)
+                * blockBytes
+            mipWidth = max(1, mipWidth / 2)
+            mipHeight = max(1, mipHeight / 2)
+        }
+        images[id] = Image(
+            width: Int(width),
+            height: Int(height),
+            pixels: Data(repeating: 0, count: layerBytes * Int(arrayLayers))
+        )
     }
 
     func updateSparseImageMapping(
@@ -206,6 +227,8 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         }
         image.pixels = data
         images[id] = image
+        lastImageWriteID = id
+        lastImageWriteData = data
     }
 
     func readBuffer(id: UInt64, offset: UInt64, length: UInt64) throws -> Data {
@@ -329,6 +352,8 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         fences.removeAll()
         computePipelines.removeAll()
         accelerationStructures.removeAll()
+        lastImageWriteID = nil
+        lastImageWriteData = nil
     }
 }
 
@@ -415,6 +440,75 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     let pong = session.handle(request(.ping, id: 3, payload: bytes)).response
     #expect(pong.header.messageType == MessageType.pong.rawValue)
     #expect(pong.payload == bytes)
+}
+
+@Test func compressedSparseImageFormatsReachTheMetalBackend() throws {
+    for (index, format) in [UInt32(6), UInt32(7)].enumerated() {
+        let backend = TestGPUBackend()
+        let session = BridgeSession(metal: testMetal, backend: backend)
+        negotiate(session)
+        var query = Data()
+        query.appendLittleEndian(format)
+        query.appendLittleEndian(UInt32(1))
+        query.appendLittleEndian(UInt32(1))
+        query.appendLittleEndian(UInt32(0))
+        let queried = session.handle(request(
+            .querySparseImageProperties,
+            id: UInt64(10 + index),
+            payload: query
+        )).response
+        #expect(queried.header.messageType == MessageType.querySparseImageProperties.rawValue)
+        #expect(try queried.payload.readLittleEndian(at: 0) as UInt32 == 128)
+        #expect(try queried.payload.readLittleEndian(at: 4) as UInt32 == 128)
+
+        var create = Data()
+        create.appendLittleEndian(UInt64(4096))
+        create.appendLittleEndian(UInt32(2))
+        create.appendLittleEndian(UInt32(1))
+        create.appendLittleEndian(UInt32(16))
+        create.appendLittleEndian(UInt32(16))
+        create.appendLittleEndian(format)
+        create.appendLittleEndian(UInt32(1))
+        create.appendLittleEndian(UInt32(1))
+        create.appendLittleEndian(UInt32(1))
+        create.appendLittleEndian(UInt32(1))
+        create.appendLittleEndian(UInt32(0))
+        let created = session.handle(request(
+            .createResource,
+            id: UInt64(20 + index),
+            payload: create
+        )).response
+        #expect(created.header.messageType == MessageType.createResource.rawValue)
+        #expect(created.header.resourceID != 0)
+
+        let pixels = Data((0..<256).map { UInt8(($0 + index) & 0xff) })
+        for chunkIndex in 0..<2 {
+            let offset = chunkIndex * 128
+            var write = Data()
+            write.appendLittleEndian(UInt64(offset))
+            write.appendLittleEndian(UInt32(128))
+            write.appendLittleEndian(UInt32(0))
+            write.append(pixels.subdata(in: offset..<(offset + 128)))
+            let written = session.handle(request(
+                .writeResource,
+                id: UInt64(30 + index * 10 + chunkIndex),
+                resourceID: created.header.resourceID,
+                payload: write
+            )).response
+            #expect(written.header.messageType == MessageType.writeResource.rawValue)
+            if chunkIndex == 0 {
+                #expect(backend.lastImageWriteID == nil)
+            }
+        }
+        #expect(backend.lastImageWriteID == created.header.resourceID)
+        #expect(backend.lastImageWriteData == pixels)
+        let destroyed = session.handle(request(
+            .destroyResource,
+            id: UInt64(50 + index),
+            resourceID: created.header.resourceID
+        )).response
+        #expect(destroyed.header.messageType == MessageType.destroyResource.rawValue)
+    }
 }
 
 @Test func invalidMagicAndHandshakeRequiredAreRejected() throws {

@@ -167,8 +167,10 @@ private func appendUIVertex(
             mask: 0xff,
             intersectionFunctionTableOffset: 0,
             // Bit 23 marks a scene-state material color; low RGB fields encode
-            // full red (R8, G8, B7) for the Metal intersection shader.
-            userID: 0x0080_00ff,
+            // half red (R8, G8, B7) for the Metal intersection shader. Keep
+            // headroom so this probe can distinguish direct lighting without
+            // relying on the old non-physical distance/instance tint.
+            userID: 0x0080_0080,
             accelerationStructureResourceID: 2
         )]
     )
@@ -264,6 +266,51 @@ private func appendUIVertex(
     #expect(unlitCenter[0] > unlitCenter[1])
     #expect(unlitCenter[0] > unlitCenter[2])
 
+    // Inline scene colors share Metal's 24-bit user ID with a two-bit kind
+    // marker.  Use a neutral 0.7 gray whose blue component sets the old
+    // collision bit: it must remain an inline color instead of being mistaken
+    // for a material-texture descriptor and falling back to cyan.
+    try backend.createAccelerationStructure(id: 22, type: 0, requestedSize: 4096)
+    try backend.buildInstanceAccelerationStructure(
+        id: 22,
+        buildFlags: 0x4,
+        instances: [InstanceAccelerationStructureInstance(
+            transformationMatrix: [
+                1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, 0,
+            ],
+            options: 0,
+            mask: 0xff,
+            intersectionFunctionTableOffset: 0,
+            // R8=179, G8=179, B6=44 with marker 10 in bits 23...22.
+            userID: 0x00ac_b3b3,
+            accelerationStructureResourceID: 2
+        )]
+    )
+    try backend.createImage(id: 23, width: 64, height: 64, format: 1, options: 0)
+    try backend.submitRayTrace(
+        imageID: 23,
+        accelerationStructureID: 22,
+        width: 64,
+        height: 64,
+        missRGBA8: 0xff00_0000,
+        hitRGBA8: 0xffe0_8c30,
+        camera: liveCamera,
+        sphereLight: nil,
+        distantLight: nil,
+        domeLight: nil,
+        fenceID: 15
+    )
+    #expect(try backend.waitFence(id: 15))
+    let neutralCenter = Array(
+        try backend.readImage(id: 23)[center..<(center + 4)]
+    )
+    #expect(abs(Int(neutralCenter[0]) - Int(neutralCenter[1])) <= 2)
+    #expect(abs(Int(neutralCenter[1]) - Int(neutralCenter[2])) <= 2)
+    #expect(neutralCenter[0] > 180)
+    #expect(neutralCenter[3] == 255)
+
     try backend.createImage(id: 7, width: 64, height: 64, format: 1, options: 0)
     try backend.submitRayTrace(
         imageID: 7,
@@ -329,7 +376,7 @@ private func appendUIVertex(
             options: 0,
             mask: 0xff,
             intersectionFunctionTableOffset: 0,
-            userID: 0x0080_00ff,
+            userID: 0x0080_0080,
             accelerationStructureResourceID: 2
         )]
     )
@@ -356,6 +403,7 @@ private func appendUIVertex(
     let rotatedCenter = Array(try backend.readImage(id: 21)[center..<(center + 4)])
     #expect(rotatedCenter[0] > 0)
     #expect(rotatedCenter[0] < distantCenter[0])
+    try backend.destroyAccelerationStructure(id: 22)
     try backend.destroyAccelerationStructure(id: 20)
     try backend.destroyAccelerationStructure(id: 3)
     try backend.destroyAccelerationStructure(id: 2)
@@ -540,6 +588,144 @@ private func appendUIVertex(
     // high U and screen-right samples the red texel at low U.
     #expect(screenLeft[1] > screenLeft[0])
     #expect(screenRight[0] > screenRight[1])
+}
+
+@Test func metalRayShadingSkipsTaggedAlphaCutoutHit() throws {
+    let backend = try #require(MetalGPUBackend.makeDefault())
+    #expect(backend.supportsRayDispatch)
+
+    // Transparent red front material. MBM1 v2 flag bit 5 marks only this
+    // material as a binary 0.3333 alpha cutout.
+    try backend.createImage(id: 110, width: 1, height: 1, format: 1, options: 0)
+    try backend.writeImage(id: 110, data: Data([255, 0, 0, 0]))
+    try backend.createBuffer(id: 111, size: 96, options: 0)
+    var frontVertices = Data()
+    for position: SIMD3<Float> in [
+        SIMD3<Float>(-1, -1, 0),
+        SIMD3<Float>(1, -1, 0),
+        SIMD3<Float>(0, 1, 0),
+    ] {
+        for value in [
+            position.x, position.y, position.z,
+            0, 0, -1,
+            0.5, 0.5,
+        ] {
+            appendFloat(value, to: &frontVertices)
+        }
+    }
+    try backend.writeBuffer(id: 111, offset: 0, data: frontVertices)
+    try backend.createAccelerationStructure(id: 112, type: 1, requestedSize: 4096)
+    try backend.buildPrimitiveAccelerationStructure(
+        id: 112,
+        buildFlags: 0x4,
+        geometries: [PrimitiveAccelerationStructureGeometry(
+            kind: .triangles,
+            flags: 1,
+            dataResourceID: 111,
+            dataOffset: 0,
+            primitiveCount: 1,
+            stride: 32,
+            vertexFormat: 3
+        )]
+    )
+    try backend.createBuffer(id: 113, size: 56, options: 0)
+    var cutoutDescriptor = Data()
+    for word: UInt32 in [
+        0x314d_424d, 2, 0x21, 0,
+        110, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+    ] {
+        cutoutDescriptor.appendLittleEndian(word)
+    }
+    try backend.writeBuffer(id: 113, offset: 0, data: cutoutDescriptor)
+
+    // Opaque green triangle behind the transparent front triangle.
+    try backend.createBuffer(id: 114, size: 36, options: 0)
+    var backVertices = Data()
+    for position: SIMD3<Float> in [
+        SIMD3<Float>(-1, -1, 0.25),
+        SIMD3<Float>(1, -1, 0.25),
+        SIMD3<Float>(0, 1, 0.25),
+    ] {
+        for value in [position.x, position.y, position.z] {
+            appendFloat(value, to: &backVertices)
+        }
+    }
+    try backend.writeBuffer(id: 114, offset: 0, data: backVertices)
+    try backend.createAccelerationStructure(id: 115, type: 1, requestedSize: 4096)
+    try backend.buildPrimitiveAccelerationStructure(
+        id: 115,
+        buildFlags: 0x4,
+        geometries: [PrimitiveAccelerationStructureGeometry(
+            kind: .triangles,
+            flags: 1,
+            dataResourceID: 114,
+            dataOffset: 0,
+            primitiveCount: 1,
+            stride: 12,
+            vertexFormat: 1
+        )]
+    )
+
+    let identity: [Float] = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+    ]
+    try backend.createAccelerationStructure(id: 116, type: 0, requestedSize: 4096)
+    try backend.buildInstanceAccelerationStructure(
+        id: 116,
+        buildFlags: 0x4,
+        instances: [
+            InstanceAccelerationStructureInstance(
+                transformationMatrix: identity,
+                options: 0,
+                mask: 0xff,
+                intersectionFunctionTableOffset: 0,
+                userID: 0x00c0_0000 | 113,
+                accelerationStructureResourceID: 112
+            ),
+            InstanceAccelerationStructureInstance(
+                transformationMatrix: identity,
+                options: 0,
+                mask: 0xff,
+                intersectionFunctionTableOffset: 0,
+                userID: 0x0080_ff00,
+                accelerationStructureResourceID: 115
+            ),
+        ]
+    )
+    try backend.createImage(id: 117, width: 64, height: 64, format: 1, options: 0)
+    try backend.submitRayTrace(
+        imageID: 117,
+        accelerationStructureID: 116,
+        width: 64,
+        height: 64,
+        missRGBA8: 0xff00_0000,
+        hitRGBA8: 0xffe0_8c30,
+        camera: RayCamera(
+            position: SIMD3<Float>(0, 0, -2),
+            forward: SIMD3<Float>(0, 0, 1),
+            up: SIMD3<Float>(0, 1, 0),
+            verticalFOVRadians: 0.9,
+            nearDistance: 0.01,
+            farDistance: 100
+        ),
+        sphereLight: nil,
+        distantLight: nil,
+        domeLight: nil,
+        fenceID: 118
+    )
+    #expect(try backend.waitFence(id: 118))
+    let center = (32 * 64 + 32) * 4
+    let pixel = Array(try backend.readImage(id: 117)[center..<(center + 4)])
+    #expect(pixel[1] > 240)
+    #expect(pixel[0] < 10)
+    #expect(pixel[2] < 10)
+    #expect(pixel[3] == 255)
 }
 
 @Test func metalRayShadingUsesRoughnessAndMetallic() throws {

@@ -15,16 +15,23 @@ vulkan_ppm="${artifact_dir}/imb-vulkan-triangle.ppm"
 vulkan_png="${artifact_dir}/imb-vulkan-triangle.png"
 builder_was_running=0
 
+"${script_dir}/cleanup-bridge-containers.sh"
+
 if [[ "$(container builder status 2>/dev/null | awk 'NR == 2 {print $3}')" == "running" ]]; then
     builder_was_running=1
 fi
 
 cleanup() {
+    exit_status=$?
     container delete --force "${container_id}" >/dev/null 2>&1 || true
     if [[ "${builder_was_running}" -eq 0 ]]; then
         container builder stop >/dev/null 2>&1 || true
     fi
-    find "${adapter_log}" "${guest_log}" -delete >/dev/null 2>&1 || true
+    if [[ "${exit_status}" -eq 0 ]]; then
+        find "${adapter_log}" "${guest_log}" -delete >/dev/null 2>&1 || true
+    else
+        echo "test-vulkan-icd: preserved failure logs adapter=${adapter_log} guest=${guest_log}" >&2
+    fi
 }
 trap cleanup EXIT
 
@@ -97,6 +104,12 @@ if ! grep -F 'VULKAN_COMPUTE input=[1,2,3,4] addend=5 output=[6,7,8,9] backend=M
     sed -n '1,240p' "${guest_log}" >&2
     exit 1
 fi
+if ! grep -F 'VULKAN_MEMORY_BUDGET usage=' "${guest_log}" >/dev/null \
+    || ! grep -F 'live_allocations=passed' "${guest_log}" >/dev/null; then
+    echo "test-vulkan-icd: Vulkan memory budget still reports zero live GPU usage" >&2
+    sed -n '1,240p' "${guest_log}" >&2
+    exit 1
+fi
 
 if ! grep -F 'VULKAN_RASTER triangle=64x64 format=RGBA8' "${guest_log}" >/dev/null; then
     echo "test-vulkan-icd: Vulkan raster did not complete through the Metal bridge" >&2
@@ -138,6 +151,13 @@ if ! grep -F 'VULKAN_SPARSE_IMAGE format=RGBA8 tile=128x128 map=passed unmap=pas
     sed -n '1,240p' "${guest_log}" >&2
     exit 1
 fi
+for sparse_format in BC3_SRGB BC5_UNORM; do
+    if ! grep -E "VULKAN_SPARSE_IMAGE format=${sparse_format} tile=[1-9][0-9]*x[1-9][0-9]* map=passed upload=passed unmap=passed backend=Metal" "${guest_log}" >/dev/null; then
+        echo "test-vulkan-icd: Vulkan ${sparse_format} sparse image data did not upload, map, and unmap through Metal" >&2
+        sed -n '1,260p' "${guest_log}" >&2
+        exit 1
+    fi
+done
 if ! grep -F 'VULKAN_IMAGE_READBACK format=RGBA16 mips=4 bytes=680 buffer_to_image=passed image_to_buffer=passed' "${guest_log}" >/dev/null; then
     echo "test-vulkan-icd: Vulkan RGBA16 mip upload/readback did not pass" >&2
     sed -n '1,240p' "${guest_log}" >&2

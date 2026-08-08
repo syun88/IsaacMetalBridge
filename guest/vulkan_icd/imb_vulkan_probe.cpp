@@ -2,11 +2,13 @@
 
 #include "texel_add_spv.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -132,6 +134,7 @@ int main(int argc, char** argv) {
         const char* requiredDeviceExtensions[] = {
             VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
             VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+            VK_EXT_MEMORY_BUDGET_EXTENSION_NAME,
             VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
             VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
             VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
@@ -405,12 +408,236 @@ int main(int argc, char** argv) {
         sparseTileBind.memory = VK_NULL_HANDLE;
         require(vkQueueBindSparse(queue, 1, &sparseQueueBind, VK_NULL_HANDLE), "vkQueueBindSparse(unmap)");
         vkDestroyImage(device, sparseImage, nullptr);
-        vkFreeMemory(device, sparseMemory, nullptr);
         std::cout
             << "VULKAN_SPARSE_IMAGE format=RGBA8 tile="
             << sparseFormatProperties.imageGranularity.width << "x"
             << sparseFormatProperties.imageGranularity.height
             << " map=passed unmap=passed backend=Metal\n";
+
+        const std::array<std::pair<VkFormat, const char*>, 2> compressedSparseFormats{{
+            {VK_FORMAT_BC3_SRGB_BLOCK, "BC3_SRGB"},
+            {VK_FORMAT_BC5_UNORM_BLOCK, "BC5_UNORM"},
+        }};
+        for (const auto& [format, label] : compressedSparseFormats) {
+            VkSparseImageFormatProperties compressedProperties{};
+            std::uint32_t compressedPropertyCount = 1;
+            vkGetPhysicalDeviceSparseImageFormatProperties(
+                physicalDevices[0],
+                format,
+                VK_IMAGE_TYPE_2D,
+                VK_SAMPLE_COUNT_1_BIT,
+                VK_IMAGE_USAGE_SAMPLED_BIT,
+                VK_IMAGE_TILING_OPTIMAL,
+                &compressedPropertyCount,
+                &compressedProperties
+            );
+            if (compressedPropertyCount != 1
+                || compressedProperties.imageGranularity.width == 0
+                || compressedProperties.imageGranularity.height == 0) {
+                throw std::runtime_error(
+                    std::string("IMB did not expose Metal sparse properties for ") + label
+                );
+            }
+
+            VkImageCreateInfo compressedInfo = sparseImageInfo;
+            compressedInfo.format = format;
+            compressedInfo.extent = {
+                compressedProperties.imageGranularity.width,
+                compressedProperties.imageGranularity.height,
+                1,
+            };
+            VkImage compressedImage = VK_NULL_HANDLE;
+            require(
+                vkCreateImage(device, &compressedInfo, nullptr, &compressedImage),
+                "vkCreateImage(sparse compressed Metal)"
+            );
+            VkMemoryRequirements compressedMemoryRequirements{};
+            vkGetImageMemoryRequirements(
+                device, compressedImage, &compressedMemoryRequirements
+            );
+            if (compressedMemoryRequirements.alignment
+                    > sparseMemoryInfo.allocationSize
+                || (compressedMemoryRequirements.memoryTypeBits
+                    & (1U << memoryTypeIndex)) == 0) {
+                throw std::runtime_error(
+                    std::string("IMB returned invalid sparse memory requirements for ")
+                    + label
+                );
+            }
+
+            VkSparseImageMemoryBind compressedBind{};
+            compressedBind.subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            compressedBind.subresource.mipLevel = 0;
+            compressedBind.subresource.arrayLayer = 0;
+            compressedBind.extent = compressedProperties.imageGranularity;
+            compressedBind.memory = sparseMemory;
+            VkSparseImageMemoryBindInfo compressedBindInfo{};
+            compressedBindInfo.image = compressedImage;
+            compressedBindInfo.bindCount = 1;
+            compressedBindInfo.pBinds = &compressedBind;
+            VkBindSparseInfo compressedQueueBind{};
+            compressedQueueBind.sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO;
+            compressedQueueBind.imageBindCount = 1;
+            compressedQueueBind.pImageBinds = &compressedBindInfo;
+            require(
+                vkQueueBindSparse(
+                    queue, 1, &compressedQueueBind, VK_NULL_HANDLE
+                ),
+                "vkQueueBindSparse(compressed map)"
+            );
+
+            const VkDeviceSize compressedBytes =
+                static_cast<VkDeviceSize>((compressedInfo.extent.width + 3) / 4)
+                * ((compressedInfo.extent.height + 3) / 4) * 16;
+            VkBufferCreateInfo compressedBufferInfo{};
+            compressedBufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            compressedBufferInfo.size = compressedBytes;
+            compressedBufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            compressedBufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            VkBuffer compressedBuffer = VK_NULL_HANDLE;
+            require(
+                vkCreateBuffer(
+                    device,
+                    &compressedBufferInfo,
+                    nullptr,
+                    &compressedBuffer
+                ),
+                "vkCreateBuffer(compressed upload)"
+            );
+            VkMemoryRequirements compressedBufferRequirements{};
+            vkGetBufferMemoryRequirements(
+                device,
+                compressedBuffer,
+                &compressedBufferRequirements
+            );
+            VkMemoryAllocateInfo compressedBufferMemoryInfo{};
+            compressedBufferMemoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            compressedBufferMemoryInfo.allocationSize =
+                compressedBufferRequirements.size;
+            compressedBufferMemoryInfo.memoryTypeIndex = memoryTypeIndex;
+            VkDeviceMemory compressedBufferMemory = VK_NULL_HANDLE;
+            require(
+                vkAllocateMemory(
+                    device,
+                    &compressedBufferMemoryInfo,
+                    nullptr,
+                    &compressedBufferMemory
+                ),
+                "vkAllocateMemory(compressed upload)"
+            );
+            require(
+                vkBindBufferMemory(
+                    device,
+                    compressedBuffer,
+                    compressedBufferMemory,
+                    0
+                ),
+                "vkBindBufferMemory(compressed upload)"
+            );
+            void* compressedMapped = nullptr;
+            require(
+                vkMapMemory(
+                    device,
+                    compressedBufferMemory,
+                    0,
+                    compressedBytes,
+                    0,
+                    &compressedMapped
+                ),
+                "vkMapMemory(compressed upload)"
+            );
+            std::memset(
+                compressedMapped,
+                format == VK_FORMAT_BC3_SRGB_BLOCK ? 0x5a : 0xa5,
+                static_cast<std::size_t>(compressedBytes)
+            );
+            vkUnmapMemory(device, compressedBufferMemory);
+
+            VkCommandPoolCreateInfo compressedPoolInfo{};
+            compressedPoolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            compressedPoolInfo.queueFamilyIndex = 0;
+            VkCommandPool compressedPool = VK_NULL_HANDLE;
+            require(
+                vkCreateCommandPool(device, &compressedPoolInfo, nullptr, &compressedPool),
+                "vkCreateCommandPool(compressed upload)"
+            );
+            VkCommandBufferAllocateInfo compressedCommandInfo{};
+            compressedCommandInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            compressedCommandInfo.commandPool = compressedPool;
+            compressedCommandInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            compressedCommandInfo.commandBufferCount = 1;
+            VkCommandBuffer compressedCommand = VK_NULL_HANDLE;
+            require(
+                vkAllocateCommandBuffers(device, &compressedCommandInfo, &compressedCommand),
+                "vkAllocateCommandBuffers(compressed upload)"
+            );
+            VkCommandBufferBeginInfo compressedBegin{};
+            compressedBegin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            require(
+                vkBeginCommandBuffer(compressedCommand, &compressedBegin),
+                "vkBeginCommandBuffer(compressed upload)"
+            );
+            VkBufferImageCopy compressedCopy{};
+            compressedCopy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            compressedCopy.imageSubresource.layerCount = 1;
+            compressedCopy.imageExtent = compressedInfo.extent;
+            vkCmdCopyBufferToImage(
+                compressedCommand,
+                compressedBuffer,
+                compressedImage,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1,
+                &compressedCopy
+            );
+            require(
+                vkEndCommandBuffer(compressedCommand),
+                "vkEndCommandBuffer(compressed upload)"
+            );
+            VkFenceCreateInfo compressedFenceInfo{};
+            compressedFenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            VkFence compressedFence = VK_NULL_HANDLE;
+            require(
+                vkCreateFence(device, &compressedFenceInfo, nullptr, &compressedFence),
+                "vkCreateFence(compressed upload)"
+            );
+            VkSubmitInfo compressedSubmit{};
+            compressedSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            compressedSubmit.commandBufferCount = 1;
+            compressedSubmit.pCommandBuffers = &compressedCommand;
+            require(
+                vkQueueSubmit(queue, 1, &compressedSubmit, compressedFence),
+                "vkQueueSubmit(compressed upload)"
+            );
+            require(
+                vkWaitForFences(
+                    device,
+                    1,
+                    &compressedFence,
+                    VK_TRUE,
+                    UINT64_MAX
+                ),
+                "vkWaitForFences(compressed upload)"
+            );
+            vkDestroyFence(device, compressedFence, nullptr);
+            vkDestroyCommandPool(device, compressedPool, nullptr);
+            vkDestroyBuffer(device, compressedBuffer, nullptr);
+            vkFreeMemory(device, compressedBufferMemory, nullptr);
+
+            compressedBind.memory = VK_NULL_HANDLE;
+            require(
+                vkQueueBindSparse(
+                    queue, 1, &compressedQueueBind, VK_NULL_HANDLE
+                ),
+                "vkQueueBindSparse(compressed unmap)"
+            );
+            vkDestroyImage(device, compressedImage, nullptr);
+            std::cout
+                << "VULKAN_SPARSE_IMAGE format=" << label << " tile="
+                << compressedProperties.imageGranularity.width << "x"
+                << compressedProperties.imageGranularity.height
+                << " map=passed upload=passed unmap=passed backend=Metal\n";
+        }
+        vkFreeMemory(device, sparseMemory, nullptr);
 
         const auto getMemoryFd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
             vkGetDeviceProcAddr(device, "vkGetMemoryFdKHR")
@@ -492,6 +719,22 @@ int main(int argc, char** argv) {
         VkDeviceMemory memory = VK_NULL_HANDLE;
         require(vkAllocateMemory(device, &memoryInfo, nullptr, &memory), "vkAllocateMemory");
         require(vkBindBufferMemory(device, buffer, memory, 0), "vkBindBufferMemory");
+
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT memoryBudget{};
+        memoryBudget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+        VkPhysicalDeviceMemoryProperties2 memoryProperties2{};
+        memoryProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+        memoryProperties2.pNext = &memoryBudget;
+        vkGetPhysicalDeviceMemoryProperties2(physicalDevices[0], &memoryProperties2);
+        if (memoryProperties2.memoryProperties.memoryHeapCount != 1
+            || memoryBudget.heapBudget[0] == 0
+            || memoryBudget.heapUsage[0] < memoryInfo.allocationSize
+            || memoryBudget.heapUsage[0] > memoryBudget.heapBudget[0]) {
+            throw std::runtime_error("IMB memory budget did not report live Vulkan allocation usage");
+        }
+        std::cout << "VULKAN_MEMORY_BUDGET usage=" << memoryBudget.heapUsage[0]
+                  << " budget=" << memoryBudget.heapBudget[0]
+                  << " live_allocations=passed\n";
 
         void* mapped = nullptr;
         require(vkMapMemory(device, memory, 0, bufferSize, 0, &mapped), "vkMapMemory(input)");

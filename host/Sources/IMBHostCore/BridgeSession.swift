@@ -18,12 +18,20 @@ public final class BridgeSession: @unchecked Sendable {
         let width: UInt32
         let height: UInt32
         let format: UInt32
+        let mipLevels: UInt32
+        let arrayLayers: UInt32
+    }
+
+    private struct ImageUpload {
+        var data: Data
+        var nextOffset: UInt64
     }
 
     private let metal: MetalCapabilities
     private let backend: (any BridgeGPUBackend)?
     private var negotiated = false
     private var resources: [UInt64: Resource] = [:]
+    private var imageUploads: [UInt64: ImageUpload] = [:]
     private var fences: Set<UInt64> = []
     private var fenceResources: [UInt64: Set<UInt64>] = [:]
     private var nextResourceID: UInt64 = 1
@@ -45,6 +53,45 @@ public final class BridgeSession: @unchecked Sendable {
     }
 
     public var resourceCount: Int { resources.count }
+
+    private func tightlyPackedImageSize(_ resource: Resource) -> UInt64? {
+        guard resource.kind == 2, resource.width > 0, resource.height > 0,
+              resource.mipLevels > 0, resource.arrayLayers > 0
+        else { return nil }
+        let blockWidth: UInt64
+        let blockHeight: UInt64
+        let blockBytes: UInt64
+        switch resource.format {
+        case 1, 2:
+            (blockWidth, blockHeight, blockBytes) = (1, 1, 4)
+        case 3, 6, 7:
+            (blockWidth, blockHeight, blockBytes) = (4, 4, 16)
+        case 4:
+            (blockWidth, blockHeight, blockBytes) = (1, 1, 2)
+        case 5:
+            (blockWidth, blockHeight, blockBytes) = (1, 1, 8)
+        default:
+            return nil
+        }
+        var width = UInt64(resource.width)
+        var height = UInt64(resource.height)
+        var layerBytes: UInt64 = 0
+        for _ in 0..<resource.mipLevels {
+            let blocksX = (width + blockWidth - 1) / blockWidth
+            let blocksY = (height + blockHeight - 1) / blockHeight
+            let (blockCount, blockOverflow) = blocksX.multipliedReportingOverflow(by: blocksY)
+            let (mipBytes, byteOverflow) = blockCount.multipliedReportingOverflow(by: blockBytes)
+            let (nextLayerBytes, addOverflow) = layerBytes.addingReportingOverflow(mipBytes)
+            guard !blockOverflow, !byteOverflow, !addOverflow else { return nil }
+            layerBytes = nextLayerBytes
+            width = max(1, width / 2)
+            height = max(1, height / 2)
+        }
+        let (totalBytes, overflow) = layerBytes.multipliedReportingOverflow(
+            by: UInt64(resource.arrayLayers)
+        )
+        return overflow ? nil : totalBytes
+    }
 
     public func handle(_ frame: Frame) -> SessionResult {
         let header = frame.header
@@ -154,7 +201,9 @@ public final class BridgeSession: @unchecked Sendable {
                         options: options,
                         width: 0,
                         height: 0,
-                        format: 0
+                        format: 0,
+                        mipLevels: 1,
+                        arrayLayers: 1
                     )
                 case 2:
                     guard let width: UInt32 = try? frame.payload.readLittleEndian(at: 16),
@@ -163,6 +212,8 @@ public final class BridgeSession: @unchecked Sendable {
                     else {
                         return failure(frame, .invalidPayload, "invalid image resource")
                     }
+                    var resourceMipLevels: UInt32 = 1
+                    var resourceArrayLayers: UInt32 = 1
                     if options == 0 {
                         guard frame.payload.count == 32,
                               let reserved: UInt32 = try? frame.payload.readLittleEndian(at: 28),
@@ -200,8 +251,9 @@ public final class BridgeSession: @unchecked Sendable {
                               height > 0,
                               width <= 16_384,
                               height <= 16_384,
-                              (format >= 1 && format <= 5),
+                              (format >= 1 && format <= 7),
                               mipLevels > 0,
+                              mipLevels <= 32,
                               arrayLayers > 0,
                               sampleCount == 1,
                               textureType == 1,
@@ -222,6 +274,8 @@ public final class BridgeSession: @unchecked Sendable {
                             sampleCount: sampleCount,
                             textureType: textureType
                         )
+                        resourceMipLevels = mipLevels
+                        resourceArrayLayers = arrayLayers
                     }
                     resource = Resource(
                         size: size,
@@ -229,7 +283,9 @@ public final class BridgeSession: @unchecked Sendable {
                         options: options,
                         width: width,
                         height: height,
-                        format: format
+                        format: format,
+                        mipLevels: resourceMipLevels,
+                        arrayLayers: resourceArrayLayers
                     )
                 default:
                     return failure(frame, .invalidPayload, "unknown resource kind \(kind)")
@@ -329,7 +385,9 @@ public final class BridgeSession: @unchecked Sendable {
                 options: 0,
                 width: 0,
                 height: 0,
-                format: 0
+                format: 0,
+                mipLevels: 1,
+                arrayLayers: 1
             )
             nextResourceID += 1
             return success(frame, type: .createComputePipeline, resourceID: id)
@@ -364,7 +422,9 @@ public final class BridgeSession: @unchecked Sendable {
                 options: 0,
                 width: 0,
                 height: 0,
-                format: accelerationStructureType
+                format: accelerationStructureType,
+                mipLevels: 1,
+                arrayLayers: 1
             )
             nextResourceID += 1
             return success(frame, type: .createAccelerationStructure, resourceID: id)
@@ -544,6 +604,7 @@ public final class BridgeSession: @unchecked Sendable {
             } catch {
                 return backendFailure(frame, error)
             }
+            imageUploads.removeValue(forKey: header.resourceID)
             resources.removeValue(forKey: header.resourceID)
             return success(frame, type: .destroyResource, resourceID: header.resourceID)
 
@@ -565,10 +626,40 @@ public final class BridgeSession: @unchecked Sendable {
                 if resource.kind == 1 {
                     try backend.writeBuffer(id: header.resourceID, offset: offset, data: data)
                 } else {
-                    guard offset == 0, UInt64(length) == resource.size else {
-                        return failure(frame, .outOfBounds, "image upload requires the complete tightly packed image")
+                    guard let tightSize = tightlyPackedImageSize(resource),
+                          tightSize <= UInt64(Int.max),
+                          tightSize <= resource.size,
+                          offset <= tightSize,
+                          UInt64(length) <= tightSize - offset
+                    else {
+                        return failure(frame, .outOfBounds, "image upload exceeds the tightly packed mip data")
                     }
-                    try backend.writeImage(id: header.resourceID, data: data)
+                    var upload: ImageUpload
+                    if offset == 0 {
+                        upload = ImageUpload(
+                            data: Data(count: Int(tightSize)),
+                            nextOffset: 0
+                        )
+                    } else if let pending = imageUploads[header.resourceID] {
+                        upload = pending
+                    } else {
+                        return failure(frame, .outOfBounds, "image upload must begin at offset zero")
+                    }
+                    guard upload.nextOffset == offset else {
+                        return failure(frame, .outOfBounds, "image upload chunks must be contiguous")
+                    }
+                    let endOffset = offset + UInt64(length)
+                    upload.data.replaceSubrange(
+                        Int(offset)..<Int(endOffset),
+                        with: data
+                    )
+                    upload.nextOffset = endOffset
+                    if endOffset == tightSize {
+                        try backend.writeImage(id: header.resourceID, data: upload.data)
+                        imageUploads.removeValue(forKey: header.resourceID)
+                    } else {
+                        imageUploads[header.resourceID] = upload
+                    }
                 }
             } catch {
                 return backendFailure(frame, error)

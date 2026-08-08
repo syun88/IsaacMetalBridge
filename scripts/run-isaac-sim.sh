@@ -10,6 +10,8 @@ source_image="${IMB_ISAAC_IMAGE:-nvcr.io/nvidia/isaac-sim:6.0.1}"
 derived_image="${IMB_ISAAC_BRIDGE_IMAGE:-imb-isaac-sim:6.0.1-dev}"
 simple_grid_url="https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.0/Isaac/Environments/Grid/default_environment.usd"
 simple_grid_texture_base_url="https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/6.0/Isaac/Environments/Grid/Materials/Textures"
+warehouse_asset_path="/opt/imb-assets/Isaac/Environments/Simple_Warehouse/warehouse.usd"
+franka_asset_path="/opt/imb-assets/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
 simple_grid_texture_names=(
     "Wireframe_blue.png"
     "WireframeBlur_blue.png"
@@ -32,7 +34,8 @@ show_window=0
 demo_scene=0
 animate_demo=0
 simple_grid=0
-enable_ros2=0
+robot_warehouse=0
+ros2_flag_seen=0
 viewer_pid=""
 frame_output="${IMB_FRAME_OUTPUT:-}"
 input_output=""
@@ -59,7 +62,8 @@ builder_was_running=0
 usage() {
     cat <<'USAGE'
 usage: run-isaac-sim.sh [--experience base|full] [--quit-after FRAMES]
-                        [--window] [--demo-scene [--animate-demo]|--simple-grid]
+                        [--window]
+                        [--demo-scene [--animate-demo]|--simple-grid|--robot-warehouse]
                         [--camera-sensor-output FILE]
                         [--physics-smoke-output FILE]
                         [--ros2] [--keep-container] [--no-build]
@@ -68,6 +72,8 @@ usage: run-isaac-sim.sh [--experience base|full] [--quit-after FRAMES]
 Kit runs inside the Linux VM and --window displays its real UI frames in a
 native macOS window. Both the base and full Isaac Sim experiences are
 available. Full startup uses a targeted ARM virtual-counter compatibility shim.
+The Full experience always enables and validates the bundled ROS 2 Jazzy
+bridge. --ros2 is retained as a compatibility no-op.
 USAGE
 }
 
@@ -107,6 +113,10 @@ while [[ $# -gt 0 ]]; do
             simple_grid=1
             shift
             ;;
+        --robot-warehouse)
+            robot_warehouse=1
+            shift
+            ;;
         --camera-sensor-output)
             [[ $# -ge 2 && -n "$2" ]] || { usage >&2; exit 2; }
             camera_sensor_output="$2"
@@ -118,7 +128,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --ros2)
-            enable_ros2=1
+            ros2_flag_seen=1
             shift
             ;;
         --help|-h)
@@ -141,8 +151,9 @@ if [[ "${experience}" != "base" && "${experience}" != "full" ]]; then
     echo "run-isaac-sim: experience must be base or full" >&2
     exit 2
 fi
-if [[ "${demo_scene}" -eq 1 && "${simple_grid}" -eq 1 ]]; then
-    echo "run-isaac-sim: --demo-scene and --simple-grid are mutually exclusive" >&2
+selected_scene_count=$((demo_scene + simple_grid + robot_warehouse))
+if [[ "${selected_scene_count}" -gt 1 ]]; then
+    echo "run-isaac-sim: --demo-scene, --simple-grid, and --robot-warehouse are mutually exclusive" >&2
     exit 2
 fi
 if [[ "${animate_demo}" -eq 1 && "${demo_scene}" -ne 1 ]]; then
@@ -150,8 +161,9 @@ if [[ "${animate_demo}" -eq 1 && "${demo_scene}" -ne 1 ]]; then
     exit 2
 fi
 if [[ -n "${camera_sensor_output}" \
-    && "${demo_scene}" -ne 1 && "${simple_grid}" -ne 1 ]]; then
-    echo "run-isaac-sim: --camera-sensor-output requires --demo-scene or --simple-grid" >&2
+    && "${demo_scene}" -ne 1 && "${simple_grid}" -ne 1 \
+    && "${robot_warehouse}" -ne 1 ]]; then
+    echo "run-isaac-sim: --camera-sensor-output requires an explicit scene option" >&2
     exit 2
 fi
 if [[ -n "${physics_smoke_output}" && "${demo_scene}" -ne 1 ]]; then
@@ -171,7 +183,7 @@ if [[ ! "${camera_sensor_width}" =~ ^[0-9]+$ \
     echo "run-isaac-sim: IMB_CAMERA_SENSOR_WIDTH/HEIGHT must be integers in 16..8192" >&2
     exit 2
 fi
-if [[ "${enable_ros2}" -eq 1 && "${experience}" != "full" ]]; then
+if [[ "${ros2_flag_seen}" -eq 1 && "${experience}" != "full" ]]; then
     echo "run-isaac-sim: --ros2 currently requires --experience full" >&2
     exit 2
 fi
@@ -203,6 +215,14 @@ for required_command in "${required_commands[@]}"; do
         exit 1
     fi
 done
+
+# A prior crash or interrupted terminal must not leave an old bridge VM to be
+# confused with this run. The helper is deliberately scoped to `imb-*` IDs and
+# never deletes Apple container's buildkit service or unrelated containers.
+"${script_dir}/cleanup-bridge-containers.sh"
+# A caller may choose a nonstandard ID. That explicit ID is still owned by this
+# invocation, so remove an older container with the same name before creation.
+container delete --force "${container_id}" >/dev/null 2>&1 || true
 
 if [[ "$(container builder status 2>/dev/null | awk 'NR == 2 {print $3}')" == "running" ]]; then
     builder_was_running=1
@@ -307,7 +327,8 @@ elif ! container image inspect "${derived_image}" >/dev/null 2>&1; then
 fi
 
 mkdir -p "${runtime_dir}"
-if [[ "${demo_scene}" -eq 1 || "${simple_grid}" -eq 1 ]]; then
+if [[ "${demo_scene}" -eq 1 || "${simple_grid}" -eq 1 \
+    || "${robot_warehouse}" -eq 1 ]]; then
     camera_dir="${runtime_dir}/${container_id}-camera"
     camera_state_output="${camera_dir}/state.bin"
     mkdir -p "${camera_dir}"
@@ -417,27 +438,17 @@ if [[ "${simple_grid}" -eq 1 ]]; then
     done
     scene_material_texture="${simple_grid_texture_directory}/Wireframe_blue.png"
 fi
+if [[ "${robot_warehouse}" -eq 1 ]]; then
+    echo "run-isaac-sim: caching the requested NVIDIA robot and warehouse dependency trees"
+    "${script_dir}/cache-isaac-robot-warehouse.sh" "${derived_image}"
+fi
 
 entrypoint="/isaac-sim/kit/kit"
 kit_args=("/isaac-sim/apps/isaacsim.exp.base.kit" "--no-window")
 if [[ "${experience}" == "full" ]]; then
     entrypoint="/isaac-sim/isaac-sim.sh"
     kit_args=("--no-window")
-    if [[ "${enable_ros2}" -eq 0 ]]; then
-        # NVIDIA's bundled Jazzy directory contains global copies of libraries
-        # such as spdlog/crypto. Exposing the whole directory during early Full
-        # startup currently trips a Carbonite TaskGroup ABI assertion on ARM.
-        # Keep the stable Full path isolated unless ROS2 is explicitly tested,
-        # and clear Full's Linux default bridge setting so app.setup does not
-        # briefly load a bridge that cannot resolve libament_index_cpp.so.
-        kit_args+=(
-            "--no-ros-env"
-            "--/isaac/startup/ros_bridge_extension="
-            "--/isaac/startup/ros_sim_control_extension=false"
-        )
-    else
-        echo "run-isaac-sim: enabling NVIDIA bundled ROS 2 Jazzy/FastDDS environment (experimental)"
-    fi
+    echo "run-isaac-sim: enabling NVIDIA bundled ROS 2 Jazzy/FastDDS environment"
 fi
 if [[ -n "${quit_after}" ]]; then
     kit_args+=(
@@ -459,6 +470,8 @@ if [[ "${demo_scene}" -eq 1 ]]; then
     startup_stage="/opt/imb-scenes/metal-ray-scene.usda"
 elif [[ "${simple_grid}" -eq 1 ]]; then
     startup_stage="/opt/imb-grid/default_environment.usd"
+elif [[ "${robot_warehouse}" -eq 1 ]]; then
+    startup_stage="${warehouse_asset_path}"
 fi
 if [[ -n "${startup_stage}" ]]; then
     # isaacsim.exp.base.kit creates an empty stage and its legacy
@@ -486,6 +499,8 @@ if [[ "${demo_scene}" -eq 1 ]]; then
     fi
 elif [[ "${simple_grid}" -eq 1 ]]; then
     echo "run-isaac-sim: opening cached NVIDIA Simple Grid during Kit startup"
+elif [[ "${robot_warehouse}" -eq 1 ]]; then
+    echo "run-isaac-sim: opening NVIDIA Simple Warehouse and composing the real Franka Panda asset"
 elif [[ "${#extra_args[@]}" -gt 0 ]]; then
     echo "run-isaac-sim: additional Kit arguments supplied verbatim; use --demo-scene or --simple-grid for supported stage selection"
 else
@@ -547,7 +562,21 @@ if [[ "${simple_grid}" -eq 1 ]]; then
     container_mount_args+=(
         --mount "type=bind,source=$(dirname "${simple_grid_cache}"),target=/opt/imb-grid,readonly"
     )
-    container_env_args+=(--env "IMB_VULKAN_SCENE_GRID=1")
+    container_env_args+=(
+        --env "IMB_VULKAN_SCENE_GRID=1"
+        --env "IMB_CENTER_STAGE_ORIGIN=1"
+    )
+fi
+if [[ "${robot_warehouse}" -eq 1 ]]; then
+    container_mount_args+=(
+        --mount "type=bind,source=${repo_root}/build/runtime/assets/robot-warehouse,target=/opt/imb-assets,readonly"
+    )
+    container_env_args+=(
+        --env "IMB_STARTUP_REFERENCE_URL=${franka_asset_path}"
+        --env "IMB_STARTUP_REFERENCE_PATH=/World/Franka"
+        --env "IMB_FRAME_PRIM_PATH=/World/Franka"
+        --env "IMB_ADD_STARTUP_KEY_LIGHT=1"
+    )
 fi
 if [[ -n "${startup_stage}" ]]; then
     container_env_args+=(
@@ -833,6 +862,18 @@ if ! container logs "${container_id}" 2>&1 | grep -F 'app ready' >/dev/null; the
 fi
 
 echo "run-isaac-sim: real Isaac Sim reported app ready through the Apple/Metal bridge"
+if [[ "${experience}" == "full" ]]; then
+    full_log="$(container logs "${container_id}" 2>&1 || true)"
+    if ! grep -F '[ext: isaacsim.ros2.core-' <<<"${full_log}" >/dev/null \
+        || ! grep -F '[ext: isaacsim.ros2.bridge-' <<<"${full_log}" >/dev/null \
+        || ! grep -F 'Attempting to load internal rclpy for ROS Distro: jazzy' \
+            <<<"${full_log}" >/dev/null; then
+        echo "run-isaac-sim: Full reached app ready without a verified ROS 2 Jazzy bridge startup" >&2
+        tail -n 240 <<<"${full_log}" >&2
+        exit 1
+    fi
+    echo "run-isaac-sim: ROS 2 Jazzy core, internal rclpy, and bridge startup verified"
+fi
 if [[ -n "${camera_sensor_output}" ]]; then
     if [[ ! -s "${camera_sensor_staged_output}" \
         || ! -s "${camera_sensor_staged_output}.json" ]]; then
