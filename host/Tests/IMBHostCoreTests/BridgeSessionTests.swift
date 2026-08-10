@@ -22,6 +22,7 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     private struct Image {
         let width: Int
         let height: Int
+        let depth: Int
         var pixels: Data
     }
 
@@ -32,6 +33,7 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     private var accelerationStructures: Set<UInt64> = []
     private(set) var lastImageWriteID: UInt64?
     private(set) var lastImageWriteData: Data?
+    private(set) var lastImageOptions: UInt32?
     private(set) var lastRayCamera: RayCamera?
     private(set) var lastRaySphereLight: RaySphereLight?
     private(set) var lastRayDistantLight: RayDistantLight?
@@ -48,15 +50,21 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     }
 
     func createImage(id: UInt64, width: UInt32, height: UInt32, format: UInt32, options: UInt32) throws {
-        guard width > 0, height > 0, (format == 1 || format == 2), options == 0 else {
+        let depth = ImageOption.decodedDepth(from: options) ?? (options == 0 ? 1 : 0)
+        guard width > 0, height > 0, depth > 0,
+              (format == 1 || format == 2 || format == 8),
+              options == 0 || ImageOption.decodedDepth(from: options) != nil
+        else {
             throw GPUBackendError.unsupported("invalid test image")
         }
-        let byteCount = Int(width) * Int(height) * 4
+        let byteCount = Int(width) * Int(height) * Int(depth) * 4
         images[id] = Image(
             width: Int(width),
             height: Int(height),
+            depth: Int(depth),
             pixels: Data(repeating: 0, count: byteCount)
         )
+        lastImageOptions = options
     }
 
     func querySparseImageProperties(
@@ -113,6 +121,7 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         images[id] = Image(
             width: Int(width),
             height: Int(height),
+            depth: 1,
             pixels: Data(repeating: 0, count: layerBytes * Int(arrayLayers))
         )
     }
@@ -142,11 +151,12 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         guard images.removeValue(forKey: id) != nil else { throw GPUBackendError.resourceNotFound(id) }
     }
 
-    func createComputePipeline(id: UInt64, spirv: Data, entryPoint: String) throws {
+    func createComputePipeline(id: UInt64, spirv: Data, entryPoint: String) throws -> UInt32 {
         guard spirv.count >= 4, entryPoint == "main" else {
             throw GPUBackendError.unsupported("invalid test compute pipeline")
         }
         computePipelines.insert(id)
+        return ComputePipelineFlag.softwareFP64ExecutionRequired
     }
 
     func destroyComputePipeline(id: UInt64) throws {
@@ -165,7 +175,10 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         guard computePipelines.contains(pipelineID),
               groupCountX > 0, groupCountY > 0, groupCountZ > 0,
               bindings.allSatisfy({
-                  ($0.kind == .bufferRead || $0.kind == .bufferReadWrite
+                  if $0.kind == .sampler {
+                      return $0.resourceID == 0
+                  }
+                  return ($0.kind == .bufferRead || $0.kind == .bufferReadWrite
                       || $0.kind == .texelBufferRead || $0.kind == .texelBufferReadWrite)
                       ? buffers[$0.resourceID] != nil
                       : images[$0.resourceID] != nil
@@ -355,6 +368,10 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         lastImageWriteID = nil
         lastImageWriteData = nil
     }
+}
+
+private func packedFloatPair(_ low: Float, _ high: Float) -> UInt64 {
+    UInt64(low.bitPattern) | (UInt64(high.bitPattern) << 32)
 }
 
 private func request(
@@ -552,6 +569,56 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     #expect(try errorCode(duplicate) == ErrorCode.resourceNotFound.rawValue)
 }
 
+@Test func ordinary3DImageUsesEncodedDepthAndTightResourceIO() throws {
+    let backend = TestGPUBackend()
+    let session = BridgeSession(metal: testMetal, backend: backend)
+    negotiate(session)
+    let options = try #require(ImageOption.encodedTexture3D(depth: 2))
+
+    var create = Data()
+    create.appendLittleEndian(UInt64(2 * 2 * 2 * 4))
+    create.appendLittleEndian(UInt32(2))
+    create.appendLittleEndian(options)
+    create.appendLittleEndian(UInt32(2))
+    create.appendLittleEndian(UInt32(2))
+    create.appendLittleEndian(UInt32(1))
+    create.appendLittleEndian(UInt32(0))
+    let created = session.handle(request(
+        .createResource,
+        id: 20,
+        payload: create
+    )).response
+    #expect(created.header.messageType == MessageType.createResource.rawValue)
+    #expect(created.header.resourceID != 0)
+    #expect(backend.lastImageOptions == options)
+
+    let voxels = Data((0..<32).map(UInt8.init))
+    var write = Data()
+    write.appendLittleEndian(UInt64(0))
+    write.appendLittleEndian(UInt32(voxels.count))
+    write.appendLittleEndian(UInt32(0))
+    write.append(voxels)
+    let written = session.handle(request(
+        .writeResource,
+        id: 21,
+        resourceID: created.header.resourceID,
+        payload: write
+    )).response
+    #expect(written.header.messageType == MessageType.writeResource.rawValue)
+    #expect(backend.lastImageWriteData == voxels)
+
+    var read = Data()
+    read.appendLittleEndian(UInt64(0))
+    read.appendLittleEndian(UInt64(voxels.count))
+    let readBack = session.handle(request(
+        .readResource,
+        id: 22,
+        resourceID: created.header.resourceID,
+        payload: read
+    )).response
+    #expect(readBack.payload == voxels)
+}
+
 @Test func spirvComputePipelineLifecycleAndValidation() throws {
     let session = BridgeSession(metal: testMetal, backend: TestGPUBackend())
     negotiate(session)
@@ -566,6 +633,10 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     let created = session.handle(request(.createComputePipeline, id: 2, payload: create)).response
     #expect(created.header.messageType == MessageType.createComputePipeline.rawValue)
     #expect(created.header.resourceID != 0)
+    #expect(
+        try created.payload.readLittleEndian(at: 0) as UInt32
+            == ComputePipelineFlag.softwareFP64ExecutionRequired
+    )
     #expect(session.resourceCount == 1)
 
     let destroyed = session.handle(
@@ -660,6 +731,59 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
         request(.destroyResource, id: 9, resourceID: pipeline.header.resourceID)
     ).response
     #expect(destroyedPipeline.header.messageType == MessageType.destroyResource.rawValue)
+}
+
+@Test func computeDispatchAcceptsInlineVulkanSamplerState() throws {
+    let session = BridgeSession(metal: testMetal, backend: TestGPUBackend())
+    negotiate(session)
+
+    var pipelineCreate = Data()
+    pipelineCreate.appendLittleEndian(UInt32(4))
+    pipelineCreate.appendLittleEndian(UInt32(4))
+    pipelineCreate.appendLittleEndian(UInt32(0))
+    pipelineCreate.appendLittleEndian(UInt32(0))
+    pipelineCreate.appendLittleEndian(UInt32(0x0723_0203))
+    pipelineCreate.append(Data("main".utf8))
+    let pipeline = session.handle(
+        request(.createComputePipeline, id: 2, payload: pipelineCreate)
+    ).response
+
+    var command = Data()
+    command.appendLittleEndian(UInt16(5))
+    command.appendLittleEndian(UInt16(0))
+    command.appendLittleEndian(UInt32(0))
+    command.appendLittleEndian(UInt32(1))
+    command.appendLittleEndian(UInt32(1))
+    command.appendLittleEndian(UInt32(1))
+    command.appendLittleEndian(UInt32(1))
+    command.appendLittleEndian(UInt32(0))
+    command.appendLittleEndian(UInt32(0))
+    command.appendLittleEndian(UInt32(7))
+    command.appendLittleEndian(UInt32(3))
+    command.appendLittleEndian(UInt32(0))
+    command.appendLittleEndian(ComputeBindingKind.sampler.rawValue)
+    // Linear min/mag/mip, mirrored repeat on U/V/W.
+    command.appendLittleEndian(UInt32(1 | 2 | 4 | (1 << 3) | (1 << 6) | (1 << 9)))
+    command.appendLittleEndian(UInt32(0))
+    command.appendLittleEndian(UInt64(0))
+    command.appendLittleEndian(packedFloatPair(0, 16))
+    command.appendLittleEndian(packedFloatPair(0, 1))
+    #expect(command.count == 80)
+
+    let submitted = session.handle(request(
+        .submitCommand,
+        id: 3,
+        resourceID: pipeline.header.resourceID,
+        payload: command
+    )).response
+    #expect(submitted.header.messageType == MessageType.submitCommand.rawValue)
+
+    let waited = session.handle(request(
+        .waitFence,
+        id: 4,
+        resourceID: submitted.header.resourceID
+    )).response
+    #expect(try waited.payload.readLittleEndian(at: 0) as UInt32 == 1)
 }
 
 @Test func primitiveAccelerationStructureLifecycleAndValidation() throws {

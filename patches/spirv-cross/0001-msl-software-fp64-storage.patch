@@ -1,0 +1,35 @@
+From: IsaacMetalBridge
+Subject: [PATCH] MSL: expose binary64 through a software ABI type
+
+Apple GPU families do not provide native MSL double arithmetic.  Keep the
+SPIR-V type's eight-byte layout and name it spvDouble so the bridge can inject
+an IEEE-754 storage wrapper which rounds to float only during arithmetic.
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index c5a9d433..27b61e50 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -17153,7 +17153,9 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
+ 		type_name = "float";
+ 		break;
+ 	case SPIRType::Double:
+-		type_name = "double"; // Currently unsupported
++		// Metal has no native double. The caller injects a software type which
++		// preserves the eight-byte buffer ABI and lowers arithmetic to float.
++		type_name = "spvDouble";
+ 		break;
+ 	case SPIRType::BFloat16:
+ 		if (!msl_options.supports_msl_version(3, 1))
+@@ -18897,7 +18899,11 @@ uint32_t CompilerMSL::get_declared_type_alignment_msl(TypeID type_id, const SPIR
+ 		SPIRV_CROSS_THROW("Querying alignment of opaque object.");
+ 
+ 	case SPIRType::Double:
+-		SPIRV_CROSS_THROW("double types are not supported in buffers in MSL.");
++		// Keep the source binary64 ABI for the caller's software MSL type.
++		if (is_packed)
++			return type.width / 8;
++		return (type.width / 8) * ((row_major && type.columns > 1) ? type.columns :
++		                           (type.vecsize == 3 ? 4 : type.vecsize));
+ 
+ 	case SPIRType::Struct:
+ 	{

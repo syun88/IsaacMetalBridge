@@ -10,7 +10,7 @@ extern "C" {
 
 #define IMB_PROTOCOL_MAGIC UINT32_C(0x31424d49) /* little-endian bytes: I M B 1 */
 #define IMB_PROTOCOL_VERSION_MAJOR UINT16_C(1)
-#define IMB_PROTOCOL_VERSION_MINOR UINT16_C(13)
+#define IMB_PROTOCOL_VERSION_MINOR UINT16_C(14)
 #define IMB_PROTOCOL_HEADER_SIZE UINT32_C(32)
 #define IMB_PROTOCOL_MAX_PAYLOAD UINT32_C(16777216)
 
@@ -92,12 +92,22 @@ enum imb_image_format {
     IMB_IMAGE_FORMAT_R16_UNORM = 4,
     IMB_IMAGE_FORMAT_RGBA16_UNORM = 5,
     IMB_IMAGE_FORMAT_BC3_SRGB = 6,
-    IMB_IMAGE_FORMAT_BC5_UNORM = 7
+    IMB_IMAGE_FORMAT_BC5_UNORM = 7,
+    IMB_IMAGE_FORMAT_RGBA8_UINT = 8
 };
 
 enum imb_image_options {
     IMB_IMAGE_OPTION_NONE = 0,
-    IMB_IMAGE_OPTION_SPARSE = 1u << 0
+    IMB_IMAGE_OPTION_SPARSE = 1u << 0,
+    /*
+     * Ordinary 3D images retain the 32-byte CREATE_RESOURCE payload.  Bit 1
+     * selects a 3D Metal texture and the upper 16 bits carry VkExtent3D.depth.
+     * Sparse resources keep their existing extended payload and may not set
+     * these fields.
+     */
+    IMB_IMAGE_OPTION_3D = 1u << 1,
+    IMB_IMAGE_OPTION_DEPTH_SHIFT = 16,
+    IMB_IMAGE_OPTION_DEPTH_MASK = 0xffffu << IMB_IMAGE_OPTION_DEPTH_SHIFT
 };
 
 enum imb_texture_type {
@@ -124,7 +134,40 @@ enum imb_compute_binding_kind {
     IMB_COMPUTE_BINDING_TEXTURE_READ = 3,
     IMB_COMPUTE_BINDING_TEXTURE_READ_WRITE = 4,
     IMB_COMPUTE_BINDING_TEXEL_BUFFER_READ = 5,
-    IMB_COMPUTE_BINDING_TEXEL_BUFFER_READ_WRITE = 6
+    IMB_COMPUTE_BINDING_TEXEL_BUFFER_READ_WRITE = 6,
+    /* Inline VkSamplerCreateInfo state; this binding has no resource ID. */
+    IMB_COMPUTE_BINDING_SAMPLER = 7
+};
+
+/*
+ * IMB_COMPUTE_BINDING_SAMPLER keeps the fixed 48-byte binding record:
+ *
+ * format bits:
+ *   0 magFilter, 1 minFilter, 2 mipmapMode,
+ *   3..5 addressModeU, 6..8 addressModeV, 9..11 addressModeW,
+ *   12 anisotropyEnable, 13 compareEnable, 14..16 compareOp,
+ *   17 unnormalizedCoordinates, 18..20 borderColor.
+ * resource_id: zero.
+ * offset: low/high float32 bits are minLod/maxLod.
+ * length: low/high float32 bits are mipLodBias/maxAnisotropy.
+ */
+#define IMB_COMPUTE_SAMPLER_MAG_FILTER_SHIFT UINT32_C(0)
+#define IMB_COMPUTE_SAMPLER_MIN_FILTER_SHIFT UINT32_C(1)
+#define IMB_COMPUTE_SAMPLER_MIPMAP_MODE_SHIFT UINT32_C(2)
+#define IMB_COMPUTE_SAMPLER_ADDRESS_U_SHIFT UINT32_C(3)
+#define IMB_COMPUTE_SAMPLER_ADDRESS_V_SHIFT UINT32_C(6)
+#define IMB_COMPUTE_SAMPLER_ADDRESS_W_SHIFT UINT32_C(9)
+#define IMB_COMPUTE_SAMPLER_ANISOTROPY_ENABLE_SHIFT UINT32_C(12)
+#define IMB_COMPUTE_SAMPLER_COMPARE_ENABLE_SHIFT UINT32_C(13)
+#define IMB_COMPUTE_SAMPLER_COMPARE_OP_SHIFT UINT32_C(14)
+#define IMB_COMPUTE_SAMPLER_UNNORMALIZED_SHIFT UINT32_C(17)
+#define IMB_COMPUTE_SAMPLER_BORDER_COLOR_SHIFT UINT32_C(18)
+#define IMB_COMPUTE_SAMPLER_OPTIONS_MASK UINT32_C(0x001fffff)
+
+enum imb_compute_pipeline_flags {
+    IMB_COMPUTE_PIPELINE_FLAG_NONE = 0,
+    /* The translated entry point evaluates values through software binary64. */
+    IMB_COMPUTE_PIPELINE_FLAG_SOFTWARE_FP64_EXECUTION_REQUIRED = 1u << 0
 };
 
 enum imb_trace_rays_options {
@@ -380,7 +423,7 @@ typedef struct imb_compute_binding_payload {
     uint32_t binding;
     uint32_t array_element;
     uint32_t kind;
-    /* Vulkan VkFormat for texel-buffer kinds; zero for other resources. */
+    /* VkFormat for texel buffers; packed sampler options for sampler kind. */
     uint32_t format;
     uint32_t reserved;
     uint64_t resource_id;

@@ -32,7 +32,12 @@ int main() {
     static_assert(sizeof(imb_write_resource_payload) == 16);
     static_assert(sizeof(imb_read_resource_payload) == 16);
 
-    require(IMB_PROTOCOL_VERSION_MAJOR == 1 && IMB_PROTOCOL_VERSION_MINOR == 13, "unexpected protocol version");
+    require(IMB_PROTOCOL_VERSION_MAJOR == 1 && IMB_PROTOCOL_VERSION_MINOR == 14, "unexpected protocol version");
+    require(IMB_IMAGE_OPTION_3D == 2, "unexpected ordinary 3D image option");
+    require(IMB_IMAGE_OPTION_DEPTH_SHIFT == 16, "unexpected ordinary image depth shift");
+    require(IMB_IMAGE_OPTION_DEPTH_MASK == 0xffff0000U, "unexpected ordinary image depth mask");
+    require(IMB_COMPUTE_BINDING_SAMPLER == 7, "unexpected sampler binding kind");
+    require(IMB_COMPUTE_SAMPLER_OPTIONS_MASK == 0x001fffff, "unexpected sampler option mask");
     require((IMB_CAP_METAL_COMPUTE & IMB_CAP_RESOURCE_IO) == 0, "capability bits overlap");
     require((IMB_CAP_METAL_IMAGE & IMB_CAP_METAL_RASTER) == 0, "raster capability bits overlap");
     require((IMB_CAP_METAL_RASTER & IMB_CAP_METAL_UI_RASTER) == 0, "UI raster capability bits overlap");

@@ -3,7 +3,7 @@ import Foundation
 public enum IMBProtocol {
     public static let magic: UInt32 = 0x3142_4d49
     public static let major: UInt16 = 1
-    public static let minor: UInt16 = 13
+    public static let minor: UInt16 = 14
     public static let headerSize = 32
     public static let maxPayloadLength = 16 * 1024 * 1024
     public static let responseFlag: UInt16 = 1
@@ -47,6 +47,31 @@ public enum ErrorCode: UInt32, Sendable {
     case backendUnavailable = 11
     case outOfBounds = 12
     case gpuFailure = 13
+}
+
+public enum ComputePipelineFlag {
+    public static let softwareFP64ExecutionRequired: UInt32 = 1 << 0
+}
+
+public enum ImageOption {
+    public static let sparse: UInt32 = 1 << 0
+    public static let texture3D: UInt32 = 1 << 1
+    public static let depthShift: UInt32 = 16
+    public static let depthMask: UInt32 = 0xffff << depthShift
+    public static let texture3DMask: UInt32 = texture3D | depthMask
+
+    public static func encodedTexture3D(depth: UInt32) -> UInt32? {
+        guard depth > 0, depth <= 0xffff else { return nil }
+        return texture3D | (depth << depthShift)
+    }
+
+    public static func decodedDepth(from options: UInt32) -> UInt32? {
+        guard options & ~texture3DMask == 0,
+              options & texture3D != 0
+        else { return nil }
+        let depth = (options & depthMask) >> depthShift
+        return depth > 0 ? depth : nil
+    }
 }
 
 public enum Capability: UInt64, Sendable {

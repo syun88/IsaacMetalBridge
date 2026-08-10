@@ -7,6 +7,7 @@ spirv_cross_commit="6c09849fe88c48eaed08413aa022aaa136a3a057"
 source_dir="${IMB_SPIRV_CROSS_SOURCE:-${repo_root}/build/dependencies/spirv-cross-src}"
 build_dir="${IMB_SPIRV_CROSS_BUILD:-${repo_root}/build/dependencies/spirv-cross-build}"
 output="${IMB_SPIRV_CROSS_OUTPUT:-${repo_root}/build/tools/spirv-cross}"
+patch_dir="${repo_root}/patches/spirv-cross"
 
 for required_command in git cmake; do
     if ! command -v "${required_command}" >/dev/null 2>&1; then
@@ -26,7 +27,18 @@ if [[ "$(git -C "${source_dir}" rev-parse HEAD 2>/dev/null || true)" != "${spirv
     git -C "${source_dir}" checkout --detach "${spirv_cross_commit}"
 fi
 
-cmake -S "${source_dir}" -B "${build_dir}" \
+for patch_file in "${patch_dir}"/*.patch; do
+    [[ -f "${patch_file}" ]] || continue
+    if git -C "${source_dir}" apply --reverse --check "${patch_file}" >/dev/null 2>&1; then
+        continue
+    fi
+    git -C "${source_dir}" apply --check "${patch_file}"
+    git -C "${source_dir}" apply "${patch_file}"
+done
+
+# --fresh prevents a stale ignored build tree from retaining a different
+# temporary source checkout in CMAKE_HOME_DIRECTORY.
+cmake --fresh -S "${source_dir}" -B "${build_dir}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DSPIRV_CROSS_CLI=ON \
     -DSPIRV_CROSS_ENABLE_TESTS=OFF \

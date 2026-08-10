@@ -22,6 +22,26 @@ private func appendUIVertex(
     data.appendLittleEndian(rgba8)
 }
 
+@Test func metalOrdinary3DImageRoundTripsEveryDepthSlice() throws {
+    let backend = try #require(MetalGPUBackend.makeDefault())
+    let options = try #require(ImageOption.encodedTexture3D(depth: 2))
+    try backend.createImage(
+        id: 200,
+        width: 2,
+        height: 2,
+        format: 1,
+        options: options
+    )
+    let voxels = Data([
+        255, 0, 0, 255, 0, 255, 0, 255,
+        0, 0, 255, 255, 255, 255, 0, 255,
+        16, 32, 48, 64, 80, 96, 112, 128,
+        144, 160, 176, 192, 208, 224, 240, 255,
+    ])
+    try backend.writeImage(id: 200, data: voxels)
+    #expect(try backend.readImage(id: 200) == voxels)
+}
+
 @Test func metalIndexedUIFillsAKnownRectangle() throws {
     let backend = try #require(MetalGPUBackend.makeDefault())
     try backend.createBuffer(id: 1, size: 80, options: 0)

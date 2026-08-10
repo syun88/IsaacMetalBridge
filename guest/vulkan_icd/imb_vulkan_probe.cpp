@@ -738,9 +738,19 @@ int main(int argc, char** argv) {
 
         void* mapped = nullptr;
         require(vkMapMemory(device, memory, 0, bufferSize, 0, &mapped), "vkMapMemory(input)");
+        void* remapped = nullptr;
+        require(
+            vkMapMemory(device, memory, 0, bufferSize, 0, &remapped),
+            "vkMapMemory(identical persistent remap)"
+        );
+        if (remapped != mapped) {
+            throw std::runtime_error("identical persistent remap returned a different pointer");
+        }
         const std::uint32_t input[] = {1, 2, 3, 4};
         std::memcpy(mapped, input, sizeof(input));
         vkUnmapMemory(device, memory);
+        vkUnmapMemory(device, memory);
+        std::cout << "VULKAN_PERSISTENT_REMAP identical_range=passed references=2\n";
 
         VkDescriptorSetLayoutBinding layoutBinding{};
         layoutBinding.binding = 0;
@@ -1703,6 +1713,146 @@ int main(int argc, char** argv) {
         vkFreeMemory(device, mipBufferMemory, nullptr);
         std::cout
             << "VULKAN_IMAGE_READBACK format=RGBA16 mips=4 bytes=680"
+            << " buffer_to_image=passed image_to_buffer=passed\n";
+
+        constexpr std::uint32_t volumeWidth = 2;
+        constexpr std::uint32_t volumeHeight = 2;
+        constexpr std::uint32_t volumeDepth = 2;
+        constexpr VkDeviceSize volumeBytes =
+            volumeWidth * volumeHeight * volumeDepth * 4;
+        VkBufferCreateInfo volumeBufferInfo{};
+        volumeBufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        volumeBufferInfo.size = volumeBytes;
+        volumeBufferInfo.usage =
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        volumeBufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkBuffer volumeBuffer = VK_NULL_HANDLE;
+        require(
+            vkCreateBuffer(device, &volumeBufferInfo, nullptr, &volumeBuffer),
+            "vkCreateBuffer(3D image transfer)"
+        );
+        VkMemoryRequirements volumeBufferRequirements{};
+        vkGetBufferMemoryRequirements(device, volumeBuffer, &volumeBufferRequirements);
+        VkMemoryAllocateInfo volumeBufferMemoryInfo{};
+        volumeBufferMemoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        volumeBufferMemoryInfo.allocationSize = volumeBufferRequirements.size;
+        volumeBufferMemoryInfo.memoryTypeIndex = memoryTypeIndex;
+        VkDeviceMemory volumeBufferMemory = VK_NULL_HANDLE;
+        require(
+            vkAllocateMemory(device, &volumeBufferMemoryInfo, nullptr, &volumeBufferMemory),
+            "vkAllocateMemory(3D image transfer buffer)"
+        );
+        require(
+            vkBindBufferMemory(device, volumeBuffer, volumeBufferMemory, 0),
+            "vkBindBufferMemory(3D image transfer)"
+        );
+        void* volumeMapped = nullptr;
+        require(
+            vkMapMemory(device, volumeBufferMemory, 0, volumeBytes, 0, &volumeMapped),
+            "vkMapMemory(3D image upload)"
+        );
+        for (std::uint32_t index = 0; index < volumeBytes; ++index) {
+            static_cast<std::uint8_t*>(volumeMapped)[index] =
+                static_cast<std::uint8_t>(index + 1);
+        }
+        vkUnmapMemory(device, volumeBufferMemory);
+
+        VkImageCreateInfo volumeImageInfo{};
+        volumeImageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        volumeImageInfo.imageType = VK_IMAGE_TYPE_3D;
+        volumeImageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+        volumeImageInfo.extent = {volumeWidth, volumeHeight, volumeDepth};
+        volumeImageInfo.mipLevels = 1;
+        volumeImageInfo.arrayLayers = 1;
+        volumeImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        volumeImageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        volumeImageInfo.usage =
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        volumeImageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        volumeImageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImage volumeImage = VK_NULL_HANDLE;
+        require(
+            vkCreateImage(device, &volumeImageInfo, nullptr, &volumeImage),
+            "vkCreateImage(3D transfer)"
+        );
+        VkMemoryRequirements volumeImageRequirements{};
+        vkGetImageMemoryRequirements(device, volumeImage, &volumeImageRequirements);
+        VkMemoryAllocateInfo volumeImageMemoryInfo{};
+        volumeImageMemoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        volumeImageMemoryInfo.allocationSize = volumeImageRequirements.size;
+        volumeImageMemoryInfo.memoryTypeIndex = memoryTypeIndex;
+        VkDeviceMemory volumeImageMemory = VK_NULL_HANDLE;
+        require(
+            vkAllocateMemory(device, &volumeImageMemoryInfo, nullptr, &volumeImageMemory),
+            "vkAllocateMemory(3D image)"
+        );
+        require(
+            vkBindImageMemory(device, volumeImage, volumeImageMemory, 0),
+            "vkBindImageMemory(3D image)"
+        );
+
+        VkCommandBuffer volumeCommand = VK_NULL_HANDLE;
+        require(
+            vkAllocateCommandBuffers(device, &commandAllocateInfo, &volumeCommand),
+            "vkAllocateCommandBuffers(3D image)"
+        );
+        require(
+            vkBeginCommandBuffer(volumeCommand, &beginInfo),
+            "vkBeginCommandBuffer(3D image)"
+        );
+        VkBufferImageCopy volumeRegion{};
+        volumeRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        volumeRegion.imageSubresource.layerCount = 1;
+        volumeRegion.imageExtent = {volumeWidth, volumeHeight, volumeDepth};
+        vkCmdCopyBufferToImage(
+            volumeCommand,
+            volumeBuffer,
+            volumeImage,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &volumeRegion
+        );
+        vkCmdFillBuffer(volumeCommand, volumeBuffer, 0, VK_WHOLE_SIZE, 0);
+        vkCmdCopyImageToBuffer(
+            volumeCommand,
+            volumeImage,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            volumeBuffer,
+            1,
+            &volumeRegion
+        );
+        require(vkEndCommandBuffer(volumeCommand), "vkEndCommandBuffer(3D image)");
+        VkFence volumeFence = VK_NULL_HANDLE;
+        require(vkCreateFence(device, &fenceInfo, nullptr, &volumeFence), "vkCreateFence(3D image)");
+        VkSubmitInfo volumeSubmit{};
+        volumeSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        volumeSubmit.commandBufferCount = 1;
+        volumeSubmit.pCommandBuffers = &volumeCommand;
+        require(vkQueueSubmit(queue, 1, &volumeSubmit, volumeFence), "vkQueueSubmit(3D image)");
+        require(
+            vkWaitForFences(device, 1, &volumeFence, VK_TRUE, UINT64_MAX),
+            "vkWaitForFences(3D image)"
+        );
+        volumeMapped = nullptr;
+        require(
+            vkMapMemory(device, volumeBufferMemory, 0, volumeBytes, 0, &volumeMapped),
+            "vkMapMemory(3D image readback)"
+        );
+        for (std::uint32_t index = 0; index < volumeBytes; ++index) {
+            if (static_cast<const std::uint8_t*>(volumeMapped)[index]
+                != static_cast<std::uint8_t>(index + 1)) {
+                throw std::runtime_error("IMB 3D image depth-slice transfer mismatch");
+            }
+        }
+        vkUnmapMemory(device, volumeBufferMemory);
+        vkDestroyFence(device, volumeFence, nullptr);
+        vkFreeCommandBuffers(device, commandPool, 1, &volumeCommand);
+        vkDestroyImage(device, volumeImage, nullptr);
+        vkFreeMemory(device, volumeImageMemory, nullptr);
+        vkDestroyBuffer(device, volumeBuffer, nullptr);
+        vkFreeMemory(device, volumeBufferMemory, nullptr);
+        std::cout
+            << "VULKAN_IMAGE_3D format=RGBA8 extent=2x2x2 bytes=32"
             << " buffer_to_image=passed image_to_buffer=passed\n";
 
         constexpr std::uint32_t imageWidth = 64;

@@ -17,6 +17,7 @@ public final class BridgeSession: @unchecked Sendable {
         let options: UInt32
         let width: UInt32
         let height: UInt32
+        let depth: UInt32
         let format: UInt32
         let mipLevels: UInt32
         let arrayLayers: UInt32
@@ -62,7 +63,7 @@ public final class BridgeSession: @unchecked Sendable {
         let blockHeight: UInt64
         let blockBytes: UInt64
         switch resource.format {
-        case 1, 2:
+        case 1, 2, 8:
             (blockWidth, blockHeight, blockBytes) = (1, 1, 4)
         case 3, 6, 7:
             (blockWidth, blockHeight, blockBytes) = (4, 4, 16)
@@ -75,17 +76,21 @@ public final class BridgeSession: @unchecked Sendable {
         }
         var width = UInt64(resource.width)
         var height = UInt64(resource.height)
+        var depth = UInt64(resource.depth)
         var layerBytes: UInt64 = 0
         for _ in 0..<resource.mipLevels {
             let blocksX = (width + blockWidth - 1) / blockWidth
             let blocksY = (height + blockHeight - 1) / blockHeight
-            let (blockCount, blockOverflow) = blocksX.multipliedReportingOverflow(by: blocksY)
+            let blocksZ = depth
+            let (xyBlockCount, xyOverflow) = blocksX.multipliedReportingOverflow(by: blocksY)
+            let (blockCount, blockOverflow) = xyBlockCount.multipliedReportingOverflow(by: blocksZ)
             let (mipBytes, byteOverflow) = blockCount.multipliedReportingOverflow(by: blockBytes)
             let (nextLayerBytes, addOverflow) = layerBytes.addingReportingOverflow(mipBytes)
-            guard !blockOverflow, !byteOverflow, !addOverflow else { return nil }
+            guard !xyOverflow, !blockOverflow, !byteOverflow, !addOverflow else { return nil }
             layerBytes = nextLayerBytes
             width = max(1, width / 2)
             height = max(1, height / 2)
+            depth = max(1, depth / 2)
         }
         let (totalBytes, overflow) = layerBytes.multipliedReportingOverflow(
             by: UInt64(resource.arrayLayers)
@@ -201,6 +206,7 @@ public final class BridgeSession: @unchecked Sendable {
                         options: options,
                         width: 0,
                         height: 0,
+                        depth: 1,
                         format: 0,
                         mipLevels: 1,
                         arrayLayers: 1
@@ -214,22 +220,26 @@ public final class BridgeSession: @unchecked Sendable {
                     }
                     var resourceMipLevels: UInt32 = 1
                     var resourceArrayLayers: UInt32 = 1
-                    if options == 0 {
+                    var resourceDepth: UInt32 = 1
+                    if options == 0 || ImageOption.decodedDepth(from: options) != nil {
+                        let depth = ImageOption.decodedDepth(from: options) ?? 1
                         guard frame.payload.count == 32,
                               let reserved: UInt32 = try? frame.payload.readLittleEndian(at: 28),
                               width > 0,
                               height > 0,
+                              depth > 0,
                               width <= 4096,
                               height <= 4096,
-                              (format == 1 || format == 2),
+                              depth <= 4096,
+                              (format == 1 || format == 2 || format == 8),
                               reserved == 0,
-                              size == UInt64(width) * UInt64(height) * 4,
+                              size == UInt64(width) * UInt64(height) * UInt64(depth) * 4,
                               size <= UInt64(IMBProtocol.maxPayloadLength)
                         else {
                             return failure(
                                 frame,
                                 .invalidPayload,
-                                "invalid option-free RGBA8/BGRA8 image resource"
+                                "invalid ordinary 2D/3D RGBA8/BGRA8 image resource"
                             )
                         }
                         try backend.createImage(
@@ -239,8 +249,9 @@ public final class BridgeSession: @unchecked Sendable {
                             format: format,
                             options: options
                         )
+                        resourceDepth = depth
                     } else {
-                        guard options == 1,
+                        guard options == ImageOption.sparse,
                               frame.payload.count == 48,
                               let mipLevels: UInt32 = try? frame.payload.readLittleEndian(at: 28),
                               let arrayLayers: UInt32 = try? frame.payload.readLittleEndian(at: 32),
@@ -283,6 +294,7 @@ public final class BridgeSession: @unchecked Sendable {
                         options: options,
                         width: width,
                         height: height,
+                        depth: resourceDepth,
                         format: format,
                         mipLevels: resourceMipLevels,
                         arrayLayers: resourceArrayLayers
@@ -374,8 +386,13 @@ public final class BridgeSession: @unchecked Sendable {
                 return failure(frame, .invalidPayload, "invalid SPIR-V magic or UTF-8 compute entry point")
             }
             let id = nextResourceID
+            let pipelineFlags: UInt32
             do {
-                try backend.createComputePipeline(id: id, spirv: spirv, entryPoint: entryPoint)
+                pipelineFlags = try backend.createComputePipeline(
+                    id: id,
+                    spirv: spirv,
+                    entryPoint: entryPoint
+                )
             } catch {
                 return backendFailure(frame, error)
             }
@@ -385,12 +402,20 @@ public final class BridgeSession: @unchecked Sendable {
                 options: 0,
                 width: 0,
                 height: 0,
+                depth: 1,
                 format: 0,
                 mipLevels: 1,
                 arrayLayers: 1
             )
             nextResourceID += 1
-            return success(frame, type: .createComputePipeline, resourceID: id)
+            var responsePayload = Data()
+            responsePayload.appendLittleEndian(pipelineFlags)
+            return success(
+                frame,
+                type: .createComputePipeline,
+                resourceID: id,
+                payload: responsePayload
+            )
 
         case .createAccelerationStructure:
             guard frame.header.resourceID == 0,
@@ -422,6 +447,7 @@ public final class BridgeSession: @unchecked Sendable {
                 options: 0,
                 width: 0,
                 height: 0,
+                depth: 1,
                 format: accelerationStructureType,
                 mipLevels: 1,
                 arrayLayers: 1
@@ -1067,8 +1093,7 @@ public final class BridgeSession: @unchecked Sendable {
                           let resourceOffset: UInt64 = try? frame.payload.readLittleEndian(at: offset + 32),
                           let length: UInt64 = try? frame.payload.readLittleEndian(at: offset + 40),
                           reserved == 0,
-                          descriptorSet < 32,
-                          let resource = resources[resourceID]
+                          descriptorSet < 32
                     else {
                         return failure(frame, .invalidPayload, "invalid compute binding \(index)")
                     }
@@ -1079,6 +1104,9 @@ public final class BridgeSession: @unchecked Sendable {
                     switch kind {
                     case .bufferRead, .bufferReadWrite,
                          .texelBufferRead, .texelBufferReadWrite:
+                        guard let resource = resources[resourceID] else {
+                            return failure(frame, .invalidPayload, "invalid compute buffer resource \(index)")
+                        }
                         let isTexel = kind == .texelBufferRead
                             || kind == .texelBufferReadWrite
                         guard resource.kind == 1, length > 0,
@@ -1089,10 +1117,32 @@ public final class BridgeSession: @unchecked Sendable {
                             return failure(frame, .outOfBounds, "invalid compute buffer binding \(index)")
                         }
                     case .textureRead, .textureReadWrite:
+                        guard let resource = resources[resourceID] else {
+                            return failure(frame, .invalidPayload, "invalid compute texture resource \(index)")
+                        }
                         guard resource.kind == 2, resourceOffset == 0,
                               length == 0, format == 0
                         else {
                             return failure(frame, .invalidPayload, "invalid compute texture binding \(index)")
+                        }
+                    case .sampler:
+                        let minLod = Float(bitPattern: UInt32(truncatingIfNeeded: resourceOffset))
+                        let maxLod = Float(bitPattern: UInt32(truncatingIfNeeded: resourceOffset >> 32))
+                        let mipLodBias = Float(bitPattern: UInt32(truncatingIfNeeded: length))
+                        let maxAnisotropy = Float(bitPattern: UInt32(truncatingIfNeeded: length >> 32))
+                        guard resourceID == 0,
+                              format & ~UInt32(0x001f_ffff) == 0,
+                              minLod.isFinite, maxLod.isFinite,
+                              mipLodBias.isFinite, maxAnisotropy.isFinite,
+                              minLod <= maxLod,
+                              maxAnisotropy >= 1, maxAnisotropy <= 16,
+                              ((format >> 3) & 0x7) <= 4,
+                              ((format >> 6) & 0x7) <= 4,
+                              ((format >> 9) & 0x7) <= 4,
+                              ((format >> 14) & 0x7) <= 7,
+                              ((format >> 18) & 0x7) <= 5
+                        else {
+                            return failure(frame, .invalidPayload, "invalid compute sampler binding \(index)")
                         }
                     }
                     bindings.append(ComputeBinding(
@@ -1105,7 +1155,9 @@ public final class BridgeSession: @unchecked Sendable {
                         offset: resourceOffset,
                         length: length
                     ))
-                    commandResources.insert(resourceID)
+                    if resourceID != 0 {
+                        commandResources.insert(resourceID)
+                    }
                 }
                 try backend.submitCompute(
                     pipelineID: frame.header.resourceID,

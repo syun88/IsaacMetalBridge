@@ -1646,12 +1646,32 @@ public:
         return reply.header.resource_id;
     }
 
-    std::uint64_t createImage(std::uint32_t width, std::uint32_t height, std::uint32_t format) {
-        const std::uint64_t size = static_cast<std::uint64_t>(width) * height * 4;
+    std::uint64_t createImage(
+        std::uint32_t width,
+        std::uint32_t height,
+        std::uint32_t format,
+        std::uint32_t depth = 1,
+        bool texture3D = false
+    ) {
+        if (width == 0 || height == 0 || depth == 0
+            || (texture3D && depth > 0xffffU)) {
+            throw std::runtime_error("invalid ordinary image extent");
+        }
+        std::uint64_t size = width;
+        if (height > UINT64_MAX / size) throw std::runtime_error("ordinary image size overflow");
+        size *= height;
+        if (depth > UINT64_MAX / size) throw std::runtime_error("ordinary image size overflow");
+        size *= depth;
+        if (size > UINT64_MAX / 4) throw std::runtime_error("ordinary image size overflow");
+        size *= 4;
+        const std::uint32_t options = texture3D
+            ? IMB_IMAGE_OPTION_3D
+                | (depth << IMB_IMAGE_OPTION_DEPTH_SHIFT)
+            : IMB_IMAGE_OPTION_NONE;
         imb::Bytes payload;
         imb::appendLittleEndian(payload, size);
         imb::appendLittleEndian(payload, std::uint32_t{IMB_RESOURCE_IMAGE});
-        imb::appendLittleEndian(payload, std::uint32_t{0});
+        imb::appendLittleEndian(payload, options);
         imb::appendLittleEndian(payload, width);
         imb::appendLittleEndian(payload, height);
         imb::appendLittleEndian(payload, format);
@@ -1757,7 +1777,8 @@ public:
 
     std::uint64_t createComputePipeline(
         const std::vector<std::uint32_t>& code,
-        const char* entryPoint
+        const char* entryPoint,
+        std::uint32_t* creationFlags
     ) {
         if (code.empty() || entryPoint == nullptr || *entryPoint == '\0') {
             throw std::runtime_error("invalid SPIR-V compute pipeline request");
@@ -1783,6 +1804,13 @@ public:
         expectType(reply, IMB_MSG_CREATE_COMPUTE_PIPELINE);
         if (reply.header.resource_id == 0) {
             throw std::runtime_error("host returned compute pipeline resource ID zero");
+        }
+        if (creationFlags != nullptr) {
+            *creationFlags = reply.payload.size() >= sizeof(std::uint32_t)
+                ? imb::readLittleEndian<std::uint32_t>(reply.payload, 0)
+                : static_cast<std::uint32_t>(
+                    IMB_COMPUTE_PIPELINE_FLAG_SOFTWARE_FP64_EXECUTION_REQUIRED
+                );
         }
         return reply.header.resource_id;
     }
@@ -2179,6 +2207,9 @@ struct DeviceMemoryState {
     std::uint64_t resourceID = 0;
     imb::Bytes bytes;
     bool mapped = false;
+    VkDeviceSize mappedOffset = 0;
+    VkDeviceSize mappedSize = 0;
+    std::uint32_t mapReferenceCount = 0;
     VkDeviceSize dirtyOffset = VK_WHOLE_SIZE;
     VkDeviceSize dirtyEnd = 0;
     VkExternalMemoryHandleTypeFlags exportHandleTypes = 0;
@@ -2265,7 +2296,52 @@ struct ImageViewState {
 
 struct SamplerState {
     VkDevice device = VK_NULL_HANDLE;
+    VkFilter magFilter = VK_FILTER_NEAREST;
+    VkFilter minFilter = VK_FILTER_NEAREST;
+    VkSamplerMipmapMode mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    VkSamplerAddressMode addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    VkSamplerAddressMode addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    VkSamplerAddressMode addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    float mipLodBias = 0.0f;
+    VkBool32 anisotropyEnable = VK_FALSE;
+    float maxAnisotropy = 1.0f;
+    VkBool32 compareEnable = VK_FALSE;
+    VkCompareOp compareOp = VK_COMPARE_OP_NEVER;
+    float minLod = 0.0f;
+    float maxLod = 0.0f;
+    VkBorderColor borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+    VkBool32 unnormalizedCoordinates = VK_FALSE;
 };
+
+std::uint32_t bridgeSamplerOptions(const SamplerState& sampler) {
+    return (static_cast<std::uint32_t>(sampler.magFilter)
+                << IMB_COMPUTE_SAMPLER_MAG_FILTER_SHIFT)
+        | (static_cast<std::uint32_t>(sampler.minFilter)
+                << IMB_COMPUTE_SAMPLER_MIN_FILTER_SHIFT)
+        | (static_cast<std::uint32_t>(sampler.mipmapMode)
+                << IMB_COMPUTE_SAMPLER_MIPMAP_MODE_SHIFT)
+        | (static_cast<std::uint32_t>(sampler.addressModeU)
+                << IMB_COMPUTE_SAMPLER_ADDRESS_U_SHIFT)
+        | (static_cast<std::uint32_t>(sampler.addressModeV)
+                << IMB_COMPUTE_SAMPLER_ADDRESS_V_SHIFT)
+        | (static_cast<std::uint32_t>(sampler.addressModeW)
+                << IMB_COMPUTE_SAMPLER_ADDRESS_W_SHIFT)
+        | (static_cast<std::uint32_t>(sampler.anisotropyEnable != VK_FALSE)
+                << IMB_COMPUTE_SAMPLER_ANISOTROPY_ENABLE_SHIFT)
+        | (static_cast<std::uint32_t>(sampler.compareEnable != VK_FALSE)
+                << IMB_COMPUTE_SAMPLER_COMPARE_ENABLE_SHIFT)
+        | (static_cast<std::uint32_t>(sampler.compareOp)
+                << IMB_COMPUTE_SAMPLER_COMPARE_OP_SHIFT)
+        | (static_cast<std::uint32_t>(sampler.unnormalizedCoordinates != VK_FALSE)
+                << IMB_COMPUTE_SAMPLER_UNNORMALIZED_SHIFT)
+        | (static_cast<std::uint32_t>(sampler.borderColor)
+                << IMB_COMPUTE_SAMPLER_BORDER_COLOR_SHIFT);
+}
+
+std::uint64_t bridgeSamplerFloatPair(float low, float high) {
+    return static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(low))
+        | (static_cast<std::uint64_t>(std::bit_cast<std::uint32_t>(high)) << 32);
+}
 
 struct RenderPassState {
     VkDevice device = VK_NULL_HANDLE;
@@ -2289,6 +2365,7 @@ struct ShaderModuleState {
     bool isAddUInt32 = false;
     bool isTriangleVertex = false;
     bool isTriangleFragment = false;
+    bool usesFloat64Matrix = false;
     std::uint64_t hash = 0;
     std::vector<std::uint32_t> code;
 };
@@ -2308,6 +2385,8 @@ struct PipelineState {
     VkDevice device = VK_NULL_HANDLE;
     PipelineLayoutState* layout = nullptr;
     bool isAddUInt32 = false;
+    bool usesFloat64Matrix = false;
+    bool requiresSoftwareFloat64Execution = false;
     std::uint64_t computeHash = 0;
     std::uint64_t bridgeComputePipelineID = 0;
     bool graphics = false;
@@ -2394,6 +2473,7 @@ struct DescriptorSetState {
     std::unordered_map<std::uint64_t, AccelerationStructureKHRState*> accelerationStructuresKHR;
     std::unordered_map<std::uint64_t, BufferBinding> computeBuffers;
     std::unordered_map<std::uint64_t, ImageBinding> computeImages;
+    std::unordered_map<std::uint64_t, SamplerState*> computeSamplers;
 };
 
 struct CommandPoolState {
@@ -2437,6 +2517,7 @@ struct RecordedAccelerationStructureBuildKHR {
 };
 
 struct RecordedAccelerationStructureCopyKHR {
+    std::uint64_t sequence = 0;
     AccelerationStructureKHRState* destination = nullptr;
     AccelerationStructureKHRState* source = nullptr;
     VkCopyAccelerationStructureModeKHR mode = VK_COPY_ACCELERATION_STRUCTURE_MODE_CLONE_KHR;
@@ -2899,6 +2980,54 @@ bool genericComputeBridgeEnabled() {
     return value != nullptr && std::strcmp(value, "0") != 0;
 }
 
+bool float64MatrixExecutionEnabled() {
+    const char* value = std::getenv("IMB_VULKAN_FP64_MATRIX_EXECUTION");
+    return value != nullptr && std::strcmp(value, "0") != 0;
+}
+
+bool validatedSoftwareFloat64MatrixShader(std::uint64_t hash) {
+    // Each exact hash below has been dispatched from its captured Isaac SPIR-V
+    // on Apple M4 and had a deterministic Metal output checked. Keep the
+    // allowlist exact; other software-FP64 matrix shaders remain compile-only
+    // until each one has equivalent output validation.
+    switch (hash) {
+        case 0xf5dd5704d7491f17ULL:
+            // World-transform output matrix with a decoded binary64 position.
+            return true;
+        case 0x64d94f5901ee0e4fULL:
+            // Camera/depth reconstruction with two independent samplers and
+            // an FP64-transformed clipping-plane pixel.
+            return true;
+        case 0x75321ea922defdfcULL:
+            // Panoramic depth reconstruction whose software-FP64 transform
+            // writes a checked world-space position pixel.
+            return true;
+        case 0x361fde9aceebb12bULL:
+            // Panoramic depth reconstruction variant whose software-FP64
+            // world position is checked through its storage-buffer output.
+            return true;
+        case 0x2eb5c9558c6d3e5aULL:
+            // Motion-vector variant whose two software-FP64 world origins
+            // produce a checked image-space position difference.
+            return true;
+        case 0x610a7b9aed9f7b98ULL:
+            // Projection variant whose software-FP64 relative position length
+            // is checked through its dedicated depth image.
+            return true;
+        case 0xb258118a36125408ULL:
+            // Final-composite variant whose software-FP64 camera origin hits
+            // a checked clipping-plane early-output pixel.
+            return true;
+        case 0xc93eebdfc4dd964bULL:
+            // Volumetric integration variant whose binary64 camera origin
+            // moves a real 3D noise lookup from a dark to a bright voxel and
+            // writes a checked 3D storage-image pixel.
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool computeTraceEnabled() {
     const char* value = std::getenv("IMB_VULKAN_COMPUTE_TRACE");
     return traceEnabled() || (value != nullptr && std::strcmp(value, "0") != 0);
@@ -2979,6 +3108,8 @@ std::uint32_t bridgeImageFormat(VkFormat format) {
         return IMB_IMAGE_FORMAT_R16_UNORM;
     case VK_FORMAT_R16G16B16A16_UNORM:
         return IMB_IMAGE_FORMAT_RGBA16_UNORM;
+    case VK_FORMAT_R8G8B8A8_UINT:
+        return IMB_IMAGE_FORMAT_RGBA8_UINT;
     default:
         return 0;
     }
@@ -4541,21 +4672,38 @@ VkResult refreshMemoryFromExternalFDLocked(
 }
 
 VkResult ensureImageBackingLocked(ImageState* image) {
+    const bool ordinary3D = image != nullptr
+        && image->type == VK_IMAGE_TYPE_3D;
     if (image == nullptr || !gState.images.contains(image) || !gState.bridge
-        || (image->format != VK_FORMAT_R8G8B8A8_UNORM && image->format != VK_FORMAT_B8G8R8A8_UNORM)
-        || image->extent.depth != 1
-        || image->extent.width == 0 || image->extent.height == 0) {
+        || (image->format != VK_FORMAT_R8G8B8A8_UNORM
+            && image->format != VK_FORMAT_B8G8R8A8_UNORM)
+        || image->extent.width == 0 || image->extent.height == 0
+        || image->extent.depth == 0
+        // The established 2D UI path deliberately bridges only level zero of
+        // mipmapped Kit textures. Preserve that compatibility. Ordinary 3D
+        // resources, whose whole volume is transported as one tight payload,
+        // require the exact one-mip/one-layer/single-sample shape.
+        || (ordinary3D
+            && (image->mipLevels != 1 || image->arrayLayers != 1
+                || image->samples != VK_SAMPLE_COUNT_1_BIT))
+        || (!ordinary3D && image->extent.depth != 1)) {
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
     const std::uint64_t byteCount = static_cast<std::uint64_t>(image->extent.width)
-        * image->extent.height * 4;
+        * image->extent.height * image->extent.depth * 4;
     if (byteCount > IMB_PROTOCOL_MAX_PAYLOAD) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     try {
         if (image->resourceID == 0) {
             const std::uint32_t format = image->format == VK_FORMAT_R8G8B8A8_UNORM
                 ? IMB_IMAGE_FORMAT_RGBA8_UNORM
                 : IMB_IMAGE_FORMAT_BGRA8_UNORM;
-            image->resourceID = gState.bridge->createImage(image->extent.width, image->extent.height, format);
+            image->resourceID = gState.bridge->createImage(
+                image->extent.width,
+                image->extent.height,
+                format,
+                image->extent.depth,
+                ordinary3D
+            );
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "imb-vulkan-icd: image backing allocation failed: %s\n", error.what());
@@ -4613,7 +4761,7 @@ VkResult ensureLinearImageMipInitializedLocked(
 ) {
     if (image == nullptr || !gState.images.contains(image) || image->memory == nullptr
         || mipLevel >= image->mipLevels || arrayLayer >= image->arrayLayers
-        || image->extent.depth != 1 || image->samples != VK_SAMPLE_COUNT_1_BIT) {
+        || image->samples != VK_SAMPLE_COUNT_1_BIT) {
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
     const std::size_t subresource = imageSubresourceIndex(image, mipLevel, arrayLayer);
@@ -4642,12 +4790,12 @@ VkResult ensureLinearImageMipInitializedLocked(
     const VkExtent3D sourceExtent{
         std::max(1U, image->extent.width >> (mipLevel - 1)),
         std::max(1U, image->extent.height >> (mipLevel - 1)),
-        1,
+        std::max(1U, image->extent.depth >> (mipLevel - 1)),
     };
     const VkExtent3D destinationExtent{
         std::max(1U, image->extent.width >> mipLevel),
         std::max(1U, image->extent.height >> mipLevel),
-        1,
+        std::max(1U, image->extent.depth >> mipLevel),
     };
     const std::uint64_t sourceOffset = clampedAdd(
         image->memoryOffset,
@@ -4680,19 +4828,22 @@ VkResult ensureLinearImageMipInitializedLocked(
 
     const auto* source = image->memory->bytes.data() + sourceOffset;
     auto* destination = image->memory->bytes.data() + destinationOffset;
-    for (std::uint32_t y = 0; y < destinationExtent.height; ++y) {
-        const std::uint32_t sourceY = std::min(y * 2, sourceExtent.height - 1);
-        for (std::uint32_t x = 0; x < destinationExtent.width; ++x) {
-            const std::uint32_t sourceX = std::min(x * 2, sourceExtent.width - 1);
-            std::memcpy(
-                destination
-                    + (static_cast<std::uint64_t>(y) * destinationExtent.width + x)
-                        * block.bytes,
-                source
-                    + (static_cast<std::uint64_t>(sourceY) * sourceExtent.width + sourceX)
-                        * block.bytes,
-                block.bytes
-            );
+    for (std::uint32_t z = 0; z < destinationExtent.depth; ++z) {
+        const std::uint32_t sourceZ = std::min(z * 2, sourceExtent.depth - 1);
+        for (std::uint32_t y = 0; y < destinationExtent.height; ++y) {
+            const std::uint32_t sourceY = std::min(y * 2, sourceExtent.height - 1);
+            for (std::uint32_t x = 0; x < destinationExtent.width; ++x) {
+                const std::uint32_t sourceX = std::min(x * 2, sourceExtent.width - 1);
+                std::memcpy(
+                    destination
+                        + ((static_cast<std::uint64_t>(z) * destinationExtent.height + y)
+                            * destinationExtent.width + x) * block.bytes,
+                    source
+                        + ((static_cast<std::uint64_t>(sourceZ) * sourceExtent.height + sourceY)
+                            * sourceExtent.width + sourceX) * block.bytes,
+                    block.bytes
+                );
+            }
         }
     }
     image->initializedSubresources[subresource] = true;
@@ -4714,7 +4865,7 @@ VkResult completeFenceLocked(FenceState* fence) {
             const VkResult memoryResult = ensureMemoryBackingLocked(image->memory, false);
             if (memoryResult != VK_SUCCESS) return memoryResult;
             const std::uint64_t byteCount = static_cast<std::uint64_t>(image->extent.width)
-                * image->extent.height * 4;
+                * image->extent.height * image->extent.depth * 4;
             if (image->memoryOffset > image->memory->size
                 || byteCount > image->memory->size - image->memoryOffset) {
                 return VK_ERROR_MEMORY_MAP_FAILED;
@@ -5554,13 +5705,12 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkMapMemory(
     }
     std::lock_guard lock(gState.mutex);
     auto* state = objectState<DeviceMemoryState>(memory);
-    if (!gState.memories.contains(state) || state->mapped || offset > state->size) {
+    if (!gState.memories.contains(state) || offset > state->size) {
         std::fprintf(
             stderr,
-            "imb-vulkan-icd: vkMapMemory rejected memory=%p tracked=%u alreadyMapped=%u offset=%llu allocationSize=%llu requestedSize=%llu\n",
+            "imb-vulkan-icd: vkMapMemory rejected memory=%p tracked=%u offset=%llu allocationSize=%llu requestedSize=%llu\n",
             static_cast<void*>(state),
             gState.memories.contains(state) ? 1u : 0u,
-            gState.memories.contains(state) && state->mapped ? 1u : 0u,
             static_cast<unsigned long long>(offset),
             static_cast<unsigned long long>(
                 gState.memories.contains(state) ? state->size : 0
@@ -5569,8 +5719,6 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkMapMemory(
         );
         return VK_ERROR_MEMORY_MAP_FAILED;
     }
-    const VkResult backingResult = ensureMemoryBackingLocked(state, false);
-    if (backingResult != VK_SUCCESS) return backingResult;
     const VkDeviceSize mapSize = size == VK_WHOLE_SIZE ? state->size - offset : size;
     if (mapSize > state->size - offset) {
         std::fprintf(
@@ -5583,7 +5731,45 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkMapMemory(
         );
         return VK_ERROR_MEMORY_MAP_FAILED;
     }
+    if (state->mapped) {
+        // Isaac Kit can ask two subsystems to map the same persistent upload
+        // allocation before either subsystem releases it. Vulkan normally
+        // requires one map per allocation, but the backing byte vector is
+        // stable for the allocation lifetime. Accept only an identical range
+        // and keep it mapped until the matching number of unmaps arrives;
+        // overlapping or different-range remaps remain rejected.
+        if (state->mappedOffset != offset || state->mappedSize != mapSize
+            || state->mapReferenceCount == UINT32_MAX) {
+            std::fprintf(
+                stderr,
+                "imb-vulkan-icd: vkMapMemory rejected incompatible remap memory=%p offset=%llu size=%llu activeOffset=%llu activeSize=%llu references=%u\n",
+                static_cast<void*>(state),
+                static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(mapSize),
+                static_cast<unsigned long long>(state->mappedOffset),
+                static_cast<unsigned long long>(state->mappedSize),
+                state->mapReferenceCount
+            );
+            return VK_ERROR_MEMORY_MAP_FAILED;
+        }
+        ++state->mapReferenceCount;
+        *data = state->bytes.data() + static_cast<std::size_t>(offset);
+        std::fprintf(
+            stderr,
+            "imb-vulkan-icd: accepted identical persistent-memory remap memory=%p offset=%llu size=%llu references=%u\n",
+            static_cast<void*>(state),
+            static_cast<unsigned long long>(offset),
+            static_cast<unsigned long long>(mapSize),
+            state->mapReferenceCount
+        );
+        return VK_SUCCESS;
+    }
+    const VkResult backingResult = ensureMemoryBackingLocked(state, false);
+    if (backingResult != VK_SUCCESS) return backingResult;
     state->mapped = true;
+    state->mappedOffset = offset;
+    state->mappedSize = mapSize;
+    state->mapReferenceCount = 1;
     state->dirtyOffset = std::min(state->dirtyOffset, offset);
     state->dirtyEnd = std::max(state->dirtyEnd, offset + mapSize);
     *data = state->bytes.data() + static_cast<std::size_t>(offset);
@@ -5605,6 +5791,7 @@ VKAPI_ATTR void VKAPI_CALL imb_vkUnmapMemory(VkDevice, VkDeviceMemory memory) {
     std::lock_guard lock(gState.mutex);
     auto* state = objectState<DeviceMemoryState>(memory);
     if (gState.memories.contains(state)) {
+        if (!state->mapped || state->mapReferenceCount == 0) return;
         if (state->externalFD >= 0 && state->dirtyOffset != VK_WHOLE_SIZE
             && state->dirtyEnd > state->dirtyOffset) {
             (void)syncMemoryToExternalFDLocked(
@@ -5612,10 +5799,16 @@ VKAPI_ATTR void VKAPI_CALL imb_vkUnmapMemory(VkDevice, VkDeviceMemory memory) {
                 state->dirtyOffset,
                 state->dirtyEnd - state->dirtyOffset
             );
+        }
+        --state->mapReferenceCount;
+        if (state->mapReferenceCount != 0) return;
+        if (state->externalFD >= 0) {
             state->dirtyOffset = VK_WHOLE_SIZE;
             state->dirtyEnd = 0;
         }
         state->mapped = false;
+        state->mappedOffset = 0;
+        state->mappedSize = 0;
     }
 }
 
@@ -5688,6 +5881,59 @@ std::uint64_t shaderHash(const std::uint32_t* words, std::size_t byteCount) {
     return hash;
 }
 
+bool spirvUsesFloat64Matrix(const std::uint32_t* words, std::size_t byteCount) {
+    constexpr std::uint16_t kOpTypeFloat = 22;
+    constexpr std::uint16_t kOpTypeVector = 23;
+    constexpr std::uint16_t kOpTypeMatrix = 24;
+    const std::size_t wordCount = byteCount / sizeof(std::uint32_t);
+    if (words == nullptr || wordCount < 5) return false;
+
+    auto collectResultTypes = [words, wordCount](
+                                  std::uint16_t wantedOpcode,
+                                  const std::vector<std::uint32_t>* referencedTypes
+                              ) {
+        std::vector<std::uint32_t> results;
+        for (std::size_t offset = 5; offset < wordCount;) {
+            const std::uint16_t instructionWords =
+                static_cast<std::uint16_t>(words[offset] >> 16);
+            const std::uint16_t opcode =
+                static_cast<std::uint16_t>(words[offset] & UINT32_C(0xffff));
+            if (instructionWords == 0 || instructionWords > wordCount - offset) break;
+            if (opcode == wantedOpcode && instructionWords >= 3) {
+                const bool matchesReference = referencedTypes == nullptr
+                    || std::find(
+                        referencedTypes->begin(),
+                        referencedTypes->end(),
+                        words[offset + 2]
+                    ) != referencedTypes->end();
+                // OpTypeFloat's third word is its bit width. Vector/Matrix use
+                // the third word as their component/column type.
+                if (matchesReference) results.push_back(words[offset + 1]);
+            }
+            offset += instructionWords;
+        }
+        return results;
+    };
+
+    std::vector<std::uint32_t> float64Types;
+    for (std::size_t offset = 5; offset < wordCount;) {
+        const std::uint16_t instructionWords =
+            static_cast<std::uint16_t>(words[offset] >> 16);
+        const std::uint16_t opcode =
+            static_cast<std::uint16_t>(words[offset] & UINT32_C(0xffff));
+        if (instructionWords == 0 || instructionWords > wordCount - offset) break;
+        if (opcode == kOpTypeFloat && instructionWords >= 3
+            && words[offset + 2] == 64) {
+            float64Types.push_back(words[offset + 1]);
+        }
+        offset += instructionWords;
+    }
+    if (float64Types.empty()) return false;
+    const auto float64VectorTypes = collectResultTypes(kOpTypeVector, &float64Types);
+    if (float64VectorTypes.empty()) return false;
+    return !collectResultTypes(kOpTypeMatrix, &float64VectorTypes).empty();
+}
+
 void dumpShaderIfRequested(const VkShaderModuleCreateInfo* createInfo, std::uint64_t hash) {
     const char* directory = std::getenv("IMB_VULKAN_SHADER_DUMP_DIR");
     if (directory == nullptr || *directory == '\0') return;
@@ -5741,6 +5987,15 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkCreateShaderModule(
     state->isAddUInt32 = isAddUInt32;
     state->isTriangleVertex = isTriangleVertex;
     state->isTriangleFragment = isTriangleFragment;
+    try {
+        state->usesFloat64Matrix = spirvUsesFloat64Matrix(
+            createInfo->pCode,
+            createInfo->codeSize
+        );
+    } catch (const std::bad_alloc&) {
+        delete state;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     state->hash = hash;
     try {
         state->code.assign(createInfo->pCode, createInfo->pCode + createInfo->codeSize / 4);
@@ -5947,8 +6202,24 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkCreateSampler(
     if (createInfo == nullptr || sampler == nullptr) return VK_ERROR_INITIALIZATION_FAILED;
     std::lock_guard lock(gState.mutex);
     if (!validDevice(device)) return VK_ERROR_INITIALIZATION_FAILED;
-    auto* state = new (std::nothrow) SamplerState{device};
+    auto* state = new (std::nothrow) SamplerState{};
     if (state == nullptr) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    state->device = device;
+    state->magFilter = createInfo->magFilter;
+    state->minFilter = createInfo->minFilter;
+    state->mipmapMode = createInfo->mipmapMode;
+    state->addressModeU = createInfo->addressModeU;
+    state->addressModeV = createInfo->addressModeV;
+    state->addressModeW = createInfo->addressModeW;
+    state->mipLodBias = createInfo->mipLodBias;
+    state->anisotropyEnable = createInfo->anisotropyEnable;
+    state->maxAnisotropy = createInfo->maxAnisotropy;
+    state->compareEnable = createInfo->compareEnable;
+    state->compareOp = createInfo->compareOp;
+    state->minLod = createInfo->minLod;
+    state->maxLod = createInfo->maxLod;
+    state->borderColor = createInfo->borderColor;
+    state->unnormalizedCoordinates = createInfo->unnormalizedCoordinates;
     if (traceEnabled()) {
         std::fprintf(
             stderr,
@@ -6355,20 +6626,32 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkCreateComputePipelines(
         state->device = device;
         state->layout = layout;
         state->isAddUInt32 = isAddUInt32;
+        state->usesFloat64Matrix = shader->usesFloat64Matrix;
         state->computeHash = shader->hash;
         if (spirvComputeBridgeEnabled()
             && (gState.bridge->capabilities().bits & IMB_CAP_METAL_SPIRV_COMPUTE) != 0
             && info.stage.pSpecializationInfo == nullptr) {
             try {
+                std::uint32_t creationFlags = IMB_COMPUTE_PIPELINE_FLAG_NONE;
                 state->bridgeComputePipelineID = gState.bridge->createComputePipeline(
                     shader->code,
-                    info.stage.pName
+                    info.stage.pName,
+                    &creationFlags
                 );
+                state->requiresSoftwareFloat64Execution =
+                    (creationFlags
+                        & IMB_COMPUTE_PIPELINE_FLAG_SOFTWARE_FP64_EXECUTION_REQUIRED) != 0;
                 std::fprintf(
                     stderr,
-                    "imb-vulkan-icd: Metal SPIR-V compute pipeline created hash=%016llx host=%llu\n",
+                    "imb-vulkan-icd: Metal SPIR-V compute pipeline created hash=%016llx host=%llu execution=%s\n",
                     static_cast<unsigned long long>(shader->hash),
-                    static_cast<unsigned long long>(state->bridgeComputePipelineID)
+                    static_cast<unsigned long long>(state->bridgeComputePipelineID),
+                    state->usesFloat64Matrix
+                            && state->requiresSoftwareFloat64Execution
+                            && !validatedSoftwareFloat64MatrixShader(state->computeHash)
+                            && !float64MatrixExecutionEnabled()
+                        ? "compile-only-fp64-matrix"
+                        : "enabled"
                 );
             } catch (const std::exception& error) {
                 std::fprintf(
@@ -7483,7 +7766,7 @@ VkResult executeBufferToImageCopyLocked(const RecordedBufferToImageCopy& copy) {
                 > copy.destination->arrayLayers
                     - region.imageSubresource.baseArrayLayer
             || region.imageOffset.x < 0 || region.imageOffset.y < 0
-            || region.imageOffset.z != 0 || region.imageExtent.depth != 1
+            || region.imageOffset.z < 0 || region.imageExtent.depth == 0
             || region.imageExtent.width == 0 || region.imageExtent.height == 0) {
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
         }
@@ -7492,24 +7775,33 @@ VkResult executeBufferToImageCopyLocked(const RecordedBufferToImageCopy& copy) {
                 >> region.imageSubresource.mipLevel),
             std::max(1U, copy.destination->extent.height
                 >> region.imageSubresource.mipLevel),
-            1,
+            std::max(1U, copy.destination->extent.depth
+                >> region.imageSubresource.mipLevel),
         };
         const std::uint32_t destinationX =
             static_cast<std::uint32_t>(region.imageOffset.x);
         const std::uint32_t destinationY =
             static_cast<std::uint32_t>(region.imageOffset.y);
+        const std::uint32_t destinationZ =
+            static_cast<std::uint32_t>(region.imageOffset.z);
         const std::uint32_t copyWidth = region.imageExtent.width;
         const std::uint32_t copyHeight = region.imageExtent.height;
+        const std::uint32_t copyDepth = region.imageExtent.depth;
         if (destinationX > mipExtent.width
             || copyWidth > mipExtent.width - destinationX
             || destinationY > mipExtent.height
             || copyHeight > mipExtent.height - destinationY
+            || destinationZ > mipExtent.depth
+            || copyDepth > mipExtent.depth - destinationZ
             || destinationX % block.width != 0
             || destinationY % block.height != 0
+            || destinationZ % block.depth != 0
             || (copyWidth % block.width != 0
                 && destinationX + copyWidth != mipExtent.width)
             || (copyHeight % block.height != 0
                 && destinationY + copyHeight != mipExtent.height)
+            || (copyDepth % block.depth != 0
+                && destinationZ + copyDepth != mipExtent.depth)
             || (region.bufferRowLength != 0
                 && region.bufferRowLength % block.width != 0)
             || (region.bufferImageHeight != 0
@@ -7519,6 +7811,7 @@ VkResult executeBufferToImageCopyLocked(const RecordedBufferToImageCopy& copy) {
 
         const std::uint64_t copyBlocksX = ceilDivide(copyWidth, block.width);
         const std::uint64_t copyBlocksY = ceilDivide(copyHeight, block.height);
+        const std::uint64_t copyBlocksZ = ceilDivide(copyDepth, block.depth);
         const std::uint64_t sourceRowBlocks = region.bufferRowLength == 0
             ? copyBlocksX
             : ceilDivide(region.bufferRowLength, block.width);
@@ -7531,11 +7824,18 @@ VkResult executeBufferToImageCopyLocked(const RecordedBufferToImageCopy& copy) {
         }
         const std::uint64_t destinationBlocksX =
             ceilDivide(mipExtent.width, block.width);
+        const std::uint64_t destinationBlocksY =
+            ceilDivide(mipExtent.height, block.height);
         const std::uint64_t destinationXBlock = destinationX / block.width;
         const std::uint64_t destinationYBlock = destinationY / block.height;
-        const VkDeviceSize sourceLayerStride = clampedMultiply(
+        const std::uint64_t destinationZBlock = destinationZ / block.depth;
+        const VkDeviceSize sourceImageStride = clampedMultiply(
             clampedMultiply(sourceRowBlocks, sourceImageBlockRows),
             block.bytes
+        );
+        const VkDeviceSize sourceLayerStride = clampedMultiply(
+            sourceImageStride,
+            copyBlocksZ
         );
         const VkDeviceSize rowBytes = clampedMultiply(copyBlocksX, block.bytes);
         for (std::uint32_t layer = 0;
@@ -7552,47 +7852,52 @@ VkResult executeBufferToImageCopyLocked(const RecordedBufferToImageCopy& copy) {
                     arrayLayer
                 ),
                 clampedMultiply(
-                    destinationYBlock * destinationBlocksX
-                        + destinationXBlock,
+                    (destinationZBlock * destinationBlocksY + destinationYBlock)
+                        * destinationBlocksX + destinationXBlock,
                     block.bytes
                 )
             );
-            for (std::uint64_t row = 0; row < copyBlocksY; ++row) {
-                const VkDeviceSize sourceRelativeOffset = clampedAdd(
-                    region.bufferOffset,
-                    clampedAdd(
-                        clampedMultiply(layer, sourceLayerStride),
+            for (std::uint64_t z = 0; z < copyBlocksZ; ++z) {
+                for (std::uint64_t row = 0; row < copyBlocksY; ++row) {
+                    const VkDeviceSize sourceRelativeOffset = clampedAdd(
+                        region.bufferOffset,
+                        clampedAdd(
+                            clampedMultiply(layer, sourceLayerStride),
+                            clampedAdd(
+                                clampedMultiply(z, sourceImageStride),
+                                clampedMultiply(
+                                    clampedMultiply(row, sourceRowBlocks),
+                                    block.bytes
+                                )
+                            )
+                        )
+                    );
+                    const VkDeviceSize sourceOffset = clampedAdd(
+                        copy.source->memoryOffset,
+                        sourceRelativeOffset
+                    );
+                    const VkDeviceSize destinationOffset = clampedAdd(
+                        destinationBase,
                         clampedMultiply(
-                            clampedMultiply(row, sourceRowBlocks),
+                            (z * destinationBlocksY + row) * destinationBlocksX,
                             block.bytes
                         )
-                    )
-                );
-                const VkDeviceSize sourceOffset = clampedAdd(
-                    copy.source->memoryOffset,
-                    sourceRelativeOffset
-                );
-                const VkDeviceSize destinationOffset = clampedAdd(
-                    destinationBase,
-                    clampedMultiply(
-                        clampedMultiply(row, destinationBlocksX),
-                        block.bytes
-                    )
-                );
-                if (sourceRelativeOffset > copy.source->size
-                    || rowBytes > copy.source->size - sourceRelativeOffset
-                    || sourceOffset > copy.source->memory->size
-                    || rowBytes > copy.source->memory->size - sourceOffset
-                    || destinationOffset > destinationSize
-                    || rowBytes > destinationSize - destinationOffset) {
-                    return VK_ERROR_MEMORY_MAP_FAILED;
+                    );
+                    if (sourceRelativeOffset > copy.source->size
+                        || rowBytes > copy.source->size - sourceRelativeOffset
+                        || sourceOffset > copy.source->memory->size
+                        || rowBytes > copy.source->memory->size - sourceOffset
+                        || destinationOffset > destinationSize
+                        || rowBytes > destinationSize - destinationOffset) {
+                        return VK_ERROR_MEMORY_MAP_FAILED;
+                    }
+                    std::memcpy(
+                        destinationBytes + static_cast<std::size_t>(destinationOffset),
+                        copy.source->memory->bytes.data()
+                            + static_cast<std::size_t>(sourceOffset),
+                        static_cast<std::size_t>(rowBytes)
+                    );
                 }
-                std::memcpy(
-                    destinationBytes + static_cast<std::size_t>(destinationOffset),
-                    copy.source->memory->bytes.data()
-                        + static_cast<std::size_t>(sourceOffset),
-                    static_cast<std::size_t>(rowBytes)
-                );
             }
             markImageSubresourceInitialized(
                 copy.destination,
@@ -7640,7 +7945,7 @@ VkResult executeImageToBufferCopyLocked(const RecordedImageToBufferCopy& copy) {
             || region.imageSubresource.layerCount
                 > copy.source->arrayLayers - region.imageSubresource.baseArrayLayer
             || region.imageOffset.x < 0 || region.imageOffset.y < 0
-            || region.imageOffset.z != 0 || region.imageExtent.depth != 1
+            || region.imageOffset.z < 0 || region.imageExtent.depth == 0
             || region.imageExtent.width == 0 || region.imageExtent.height == 0) {
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
         }
@@ -7649,17 +7954,23 @@ VkResult executeImageToBufferCopyLocked(const RecordedImageToBufferCopy& copy) {
                 >> region.imageSubresource.mipLevel),
             std::max(1U, copy.source->extent.height
                 >> region.imageSubresource.mipLevel),
-            1,
+            std::max(1U, copy.source->extent.depth
+                >> region.imageSubresource.mipLevel),
         };
         const std::uint32_t sourceX = static_cast<std::uint32_t>(region.imageOffset.x);
         const std::uint32_t sourceY = static_cast<std::uint32_t>(region.imageOffset.y);
+        const std::uint32_t sourceZ = static_cast<std::uint32_t>(region.imageOffset.z);
         const std::uint32_t copyWidth = region.imageExtent.width;
         const std::uint32_t copyHeight = region.imageExtent.height;
+        const std::uint32_t copyDepth = region.imageExtent.depth;
         if (sourceX > mipExtent.width || copyWidth > mipExtent.width - sourceX
             || sourceY > mipExtent.height || copyHeight > mipExtent.height - sourceY
+            || sourceZ > mipExtent.depth || copyDepth > mipExtent.depth - sourceZ
             || sourceX % block.width != 0 || sourceY % block.height != 0
+            || sourceZ % block.depth != 0
             || (copyWidth % block.width != 0 && sourceX + copyWidth != mipExtent.width)
             || (copyHeight % block.height != 0 && sourceY + copyHeight != mipExtent.height)
+            || (copyDepth % block.depth != 0 && sourceZ + copyDepth != mipExtent.depth)
             || (region.bufferRowLength != 0
                 && region.bufferRowLength % block.width != 0)
             || (region.bufferImageHeight != 0
@@ -7668,6 +7979,7 @@ VkResult executeImageToBufferCopyLocked(const RecordedImageToBufferCopy& copy) {
         }
         const std::uint64_t copyBlocksX = ceilDivide(copyWidth, block.width);
         const std::uint64_t copyBlocksY = ceilDivide(copyHeight, block.height);
+        const std::uint64_t copyBlocksZ = ceilDivide(copyDepth, block.depth);
         const std::uint64_t destinationRowBlocks = region.bufferRowLength == 0
             ? copyBlocksX
             : ceilDivide(region.bufferRowLength, block.width);
@@ -7680,11 +7992,17 @@ VkResult executeImageToBufferCopyLocked(const RecordedImageToBufferCopy& copy) {
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
         }
         const std::uint64_t sourceBlocksX = ceilDivide(mipExtent.width, block.width);
+        const std::uint64_t sourceBlocksY = ceilDivide(mipExtent.height, block.height);
         const std::uint64_t sourceXBlock = sourceX / block.width;
         const std::uint64_t sourceYBlock = sourceY / block.height;
-        const VkDeviceSize destinationLayerStride = clampedMultiply(
+        const std::uint64_t sourceZBlock = sourceZ / block.depth;
+        const VkDeviceSize destinationImageStride = clampedMultiply(
             clampedMultiply(destinationRowBlocks, destinationImageBlockRows),
             block.bytes
+        );
+        const VkDeviceSize destinationLayerStride = clampedMultiply(
+            destinationImageStride,
+            copyBlocksZ
         );
         const VkDeviceSize destinationBase = clampedAdd(
             copy.destination->memoryOffset,
@@ -7713,46 +8031,52 @@ VkResult executeImageToBufferCopyLocked(const RecordedImageToBufferCopy& copy) {
                     arrayLayer
                 ),
                 clampedMultiply(
-                    sourceYBlock * sourceBlocksX + sourceXBlock,
+                    (sourceZBlock * sourceBlocksY + sourceYBlock)
+                        * sourceBlocksX + sourceXBlock,
                     block.bytes
                 )
             );
-            for (std::uint64_t row = 0; row < copyBlocksY; ++row) {
-                const VkDeviceSize sourceOffset = clampedAdd(
-                    sourceBase,
-                    clampedMultiply(
-                        clampedMultiply(row, sourceBlocksX),
-                        block.bytes
-                    )
-                );
-                const VkDeviceSize destinationOffset = clampedAdd(
-                    destinationBase,
-                    clampedAdd(
-                        clampedMultiply(layer, destinationLayerStride),
+            for (std::uint64_t z = 0; z < copyBlocksZ; ++z) {
+                for (std::uint64_t row = 0; row < copyBlocksY; ++row) {
+                    const VkDeviceSize sourceOffset = clampedAdd(
+                        sourceBase,
                         clampedMultiply(
-                            clampedMultiply(row, destinationRowBlocks),
+                            (z * sourceBlocksY + row) * sourceBlocksX,
                             block.bytes
                         )
-                    )
-                );
-                if (sourceOffset > sourceSize || rowBytes > sourceSize - sourceOffset
-                    || destinationOffset > copy.destination->memory->size
-                    || rowBytes > copy.destination->memory->size - destinationOffset
-                    || destinationOffset < copy.destination->memoryOffset
-                    || destinationOffset - copy.destination->memoryOffset
-                        > copy.destination->size
-                    || rowBytes > copy.destination->size
-                        - (destinationOffset - copy.destination->memoryOffset)) {
-                    return VK_ERROR_MEMORY_MAP_FAILED;
+                    );
+                    const VkDeviceSize destinationOffset = clampedAdd(
+                        destinationBase,
+                        clampedAdd(
+                            clampedMultiply(layer, destinationLayerStride),
+                            clampedAdd(
+                                clampedMultiply(z, destinationImageStride),
+                                clampedMultiply(
+                                    clampedMultiply(row, destinationRowBlocks),
+                                    block.bytes
+                                )
+                            )
+                        )
+                    );
+                    if (sourceOffset > sourceSize || rowBytes > sourceSize - sourceOffset
+                        || destinationOffset > copy.destination->memory->size
+                        || rowBytes > copy.destination->memory->size - destinationOffset
+                        || destinationOffset < copy.destination->memoryOffset
+                        || destinationOffset - copy.destination->memoryOffset
+                            > copy.destination->size
+                        || rowBytes > copy.destination->size
+                            - (destinationOffset - copy.destination->memoryOffset)) {
+                        return VK_ERROR_MEMORY_MAP_FAILED;
+                    }
+                    std::memcpy(
+                        copy.destination->memory->bytes.data()
+                            + static_cast<std::size_t>(destinationOffset),
+                        sourceBytes + static_cast<std::size_t>(sourceOffset),
+                        static_cast<std::size_t>(rowBytes)
+                    );
+                    dirtyStart = std::min(dirtyStart, destinationOffset);
+                    dirtyEnd = std::max(dirtyEnd, destinationOffset + rowBytes);
                 }
-                std::memcpy(
-                    copy.destination->memory->bytes.data()
-                        + static_cast<std::size_t>(destinationOffset),
-                    sourceBytes + static_cast<std::size_t>(sourceOffset),
-                    static_cast<std::size_t>(rowBytes)
-                );
-                dirtyStart = std::min(dirtyStart, destinationOffset);
-                dirtyEnd = std::max(dirtyEnd, destinationOffset + rowBytes);
             }
         }
     }
@@ -9831,6 +10155,36 @@ std::uint64_t rayTracingShaderHashForGroup(
     return pipeline->rayTracingShaders[shaderIndex]->hash;
 }
 
+std::uint64_t observedIsaacRaygenHashForExtent(
+    std::uint32_t width,
+    std::uint32_t height,
+    std::uint32_t depth
+) {
+    if (depth != 1) return 0;
+    if (width == 1280 && height == 720) return UINT64_C(0xf2dbfaa8274b5250);
+    if (width == 2560 && height == 720) return UINT64_C(0x9eeed51da7b7135d);
+    if (width == 160 && height == 90) return UINT64_C(0xa00a626692fa2fee);
+    if (width == 256 && height == 144) return UINT64_C(0x72f6dc6c98605c7f);
+    return 0;
+}
+
+std::int32_t uniqueRayTracingGroupForShaderHash(
+    const PipelineState* pipeline,
+    std::uint64_t shaderHash
+) {
+    if (pipeline == nullptr || shaderHash == 0) return -1;
+    std::int32_t match = -1;
+    for (std::size_t group = 0; group < pipeline->rayTracingGroups.size(); ++group) {
+        if (rayTracingShaderHashForGroup(pipeline, static_cast<std::int32_t>(group))
+            != shaderHash) {
+            continue;
+        }
+        if (match >= 0) return -1;
+        match = static_cast<std::int32_t>(group);
+    }
+    return match;
+}
+
 bool validRayTracingShaderStageNV(VkShaderStageFlagBits stage) {
     return stage == VK_SHADER_STAGE_RAYGEN_BIT_NV
         || stage == VK_SHADER_STAGE_ANY_HIT_BIT_NV
@@ -10761,7 +11115,22 @@ VKAPI_ATTR void VKAPI_CALL imb_vkCmdCopyAccelerationStructureKHR(
         || !gState.accelerationStructuresKHR.contains(source)) {
         return;
     }
-    command->accelerationStructureCopiesKHR.push_back({destination, source, info->mode});
+    const auto sequence = command->nextCommandSequence++;
+    command->accelerationStructureCopiesKHR.push_back({sequence, destination, source, info->mode});
+    if (rayTracingTraceEnabled()) {
+        std::fprintf(
+            stderr,
+            "imb-vulkan-icd: recorded AS copy KHR sequence=%llu mode=%u src=%p srcBuilt=%d srcType=%u dst=%p dstBuilt=%d dstType=%u\n",
+            static_cast<unsigned long long>(sequence),
+            static_cast<unsigned>(info->mode),
+            static_cast<void*>(source),
+            source->built ? 1 : 0,
+            static_cast<unsigned>(source->type),
+            static_cast<void*>(destination),
+            destination->built ? 1 : 0,
+            static_cast<unsigned>(destination->type)
+        );
+    }
 }
 
 VKAPI_ATTR void VKAPI_CALL imb_vkCmdCopyAccelerationStructureToMemoryKHR(
@@ -11130,6 +11499,23 @@ VKAPI_ATTR void VKAPI_CALL imb_vkUpdateDescriptorSets(
                         view->image,
                         write.descriptorType,
                     };
+                }
+            }
+        }
+        if (gState.descriptorSets.contains(set)
+            && write.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLER
+            && write.pImageInfo != nullptr) {
+            for (std::uint32_t descriptorIndex = 0;
+                 descriptorIndex < write.descriptorCount;
+                 ++descriptorIndex) {
+                auto* sampler = objectState<SamplerState>(
+                    write.pImageInfo[descriptorIndex].sampler
+                );
+                if (gState.samplers.contains(sampler) && sampler->device == set->device) {
+                    const std::uint64_t key =
+                        (static_cast<std::uint64_t>(write.dstBinding) << 32)
+                        | (write.dstArrayElement + descriptorIndex);
+                    set->computeSamplers[key] = sampler;
                 }
             }
         }
@@ -11726,6 +12112,12 @@ VKAPI_ATTR void VKAPI_CALL imb_vkCmdDispatch(
         && command->pipeline->layout != nullptr) {
         const bool bridgeEligible =
             command->pipeline->bridgeComputePipelineID != 0
+            && (!(command->pipeline->usesFloat64Matrix
+                    && command->pipeline->requiresSoftwareFloat64Execution)
+                || validatedSoftwareFloat64MatrixShader(
+                    command->pipeline->computeHash
+                )
+                || float64MatrixExecutionEnabled())
             && command->computePushConstants.size() >= requiredPushConstantSize;
         command->computeDispatches.push_back(RecordedComputeDispatch{
             command->nextCommandSequence++,
@@ -12180,7 +12572,7 @@ VKAPI_ATTR void VKAPI_CALL imb_vkCmdCopyBufferToImage(
         || source->memory == nullptr
         || (destination->memory == nullptr
             && (destination->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) == 0)
-        || destination->samples != VK_SAMPLE_COUNT_1_BIT || destination->extent.depth != 1
+        || destination->samples != VK_SAMPLE_COUNT_1_BIT
         || block.width == 0 || block.height == 0 || block.depth == 0
         || block.bytes == 0) {
         return;
@@ -12231,7 +12623,7 @@ VKAPI_ATTR void VKAPI_CALL imb_vkCmdCopyImageToBuffer(
         || (source->memory == nullptr
             && (source->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) == 0)
         || destination->memory == nullptr
-        || source->samples != VK_SAMPLE_COUNT_1_BIT || source->extent.depth != 1
+        || source->samples != VK_SAMPLE_COUNT_1_BIT
         || block.width == 0 || block.height == 0
         || block.depth == 0 || block.bytes == 0) {
         return;
@@ -13659,7 +14051,8 @@ VkResult uploadComputeImageForMetalLocked(ImageState* image) {
     if (image->memory == nullptr
         || (image->format != VK_FORMAT_R8G8B8A8_UNORM
             && image->format != VK_FORMAT_B8G8R8A8_UNORM)
-        || image->extent.depth != 1 || image->mipLevels != 1
+        || (image->type != VK_IMAGE_TYPE_2D && image->type != VK_IMAGE_TYPE_3D)
+        || image->extent.depth == 0 || image->mipLevels != 1
         || image->arrayLayers != 1) {
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
@@ -13668,7 +14061,7 @@ VkResult uploadComputeImageForMetalLocked(ImageState* image) {
     const VkResult imageResult = ensureImageBackingLocked(image);
     if (imageResult != VK_SUCCESS) return imageResult;
     const VkDeviceSize byteCount = static_cast<VkDeviceSize>(image->extent.width)
-        * image->extent.height * 4;
+        * image->extent.height * image->extent.depth * 4;
     if (image->memoryOffset > image->memory->size
         || byteCount > image->memory->size - image->memoryOffset) {
         return VK_ERROR_MEMORY_MAP_FAILED;
@@ -13797,7 +14190,7 @@ VkResult bridgeComputeDispatchLocked(const RecordedComputeDispatch& dispatch) {
                     if (computeTraceEnabled()) {
                         std::fprintf(
                             stderr,
-                            "imb-vulkan-icd: compute image unavailable hash=%016llx set=%u binding=%u array=%u result=%d image=%p memory=%p sparseBindings=%zu format=%d extent=%ux%u\n",
+                            "imb-vulkan-icd: compute image unavailable hash=%016llx set=%u binding=%u array=%u result=%d image=%p memory=%p sparseBindings=%zu format=%d type=%d extent=%ux%ux%u mips=%u layers=%u samples=%#x flags=%#x\n",
                             static_cast<unsigned long long>(
                                 dispatch.pipeline->computeHash
                             ),
@@ -13809,8 +14202,14 @@ VkResult bridgeComputeDispatchLocked(const RecordedComputeDispatch& dispatch) {
                             static_cast<void*>(descriptor.image->memory),
                             descriptor.image->sparseBindings.size(),
                             descriptor.image->format,
+                            descriptor.image->type,
                             descriptor.image->extent.width,
-                            descriptor.image->extent.height
+                            descriptor.image->extent.height,
+                            descriptor.image->extent.depth,
+                            descriptor.image->mipLevels,
+                            descriptor.image->arrayLayers,
+                            descriptor.image->samples,
+                            descriptor.image->flags
                         );
                     }
                     return uploadResult;
@@ -13828,6 +14227,31 @@ VkResult bridgeComputeDispatchLocked(const RecordedComputeDispatch& dispatch) {
                     0,
                 });
                 if (writable) writableImages.push_back(descriptor.image);
+            }
+            for (const auto& [key, sampler] : set->computeSamplers) {
+                if (sampler == nullptr || !gState.samplers.contains(sampler)
+                    || sampler->device != set->device) {
+                    return VK_ERROR_INITIALIZATION_FAILED;
+                }
+                const std::uint32_t samplerOptions = bridgeSamplerOptions(*sampler);
+                if ((samplerOptions & ~IMB_COMPUTE_SAMPLER_OPTIONS_MASK) != 0) {
+                    return VK_ERROR_FEATURE_NOT_PRESENT;
+                }
+                bindings.push_back(BridgeComputeBinding{
+                    setIndex,
+                    static_cast<std::uint32_t>(key >> 32),
+                    static_cast<std::uint32_t>(key),
+                    IMB_COMPUTE_BINDING_SAMPLER,
+                    samplerOptions,
+                    0,
+                    bridgeSamplerFloatPair(sampler->minLod, sampler->maxLod),
+                    bridgeSamplerFloatPair(
+                        sampler->mipLodBias,
+                        sampler->anisotropyEnable != VK_FALSE
+                            ? sampler->maxAnisotropy
+                            : 1.0f
+                    ),
+                });
             }
         }
 
@@ -13866,7 +14290,7 @@ VkResult bridgeComputeDispatchLocked(const RecordedComputeDispatch& dispatch) {
                 return VK_ERROR_FORMAT_NOT_SUPPORTED;
             }
             const VkDeviceSize byteCount = static_cast<VkDeviceSize>(image->extent.width)
-                * image->extent.height * 4;
+                * image->extent.height * image->extent.depth * 4;
             if (image->memoryOffset > image->memory->size
                 || byteCount > image->memory->size - image->memoryOffset) {
                 return VK_ERROR_MEMORY_MAP_FAILED;
@@ -14017,6 +14441,14 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
     bool isMetalUISubmit = false;
     bool containsUnsupportedRayTracing = false;
     bool nullSceneRTXInitializationCandidate = true;
+    std::size_t unsupportedNVBuildCount = 0;
+    std::size_t unsupportedNVCopyCount = 0;
+    std::size_t unsupportedNVTraceCount = 0;
+    std::size_t unsupportedKHRCopyCount = 0;
+    std::size_t totalKHRTraceCount = 0;
+    std::size_t unresolvedKHRTraceCount = 0;
+    std::size_t unknownKHRTraceCount = 0;
+    std::vector<const RecordedRayTraceKHR*> allKHRTraces;
     std::vector<const RecordedRayTraceKHR*> nullSceneRTXTraces;
     std::vector<const RecordedRayTraceKHR*> sceneRayTraces;
     const RecordedRayTraceKHR* metalRayTrace = nullptr;
@@ -14065,6 +14497,11 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
             }
             if (gState.commandBuffers.contains(candidate) && candidate->executable
                 && candidate->device == device) {
+                unsupportedNVBuildCount += candidate->accelerationStructureBuildsNV.size();
+                unsupportedNVCopyCount += candidate->accelerationStructureCopiesNV.size();
+                unsupportedNVTraceCount += candidate->rayTracesNV.size();
+                unsupportedKHRCopyCount += candidate->accelerationStructureCopiesKHR.size();
+                totalKHRTraceCount += candidate->rayTracesKHR.size();
                 if (!candidate->accelerationStructureBuildsNV.empty()
                     || !candidate->accelerationStructureCopiesNV.empty()
                     || !candidate->rayTracesNV.empty()
@@ -14073,6 +14510,7 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                     nullSceneRTXInitializationCandidate = false;
                 }
                 for (const auto& trace : candidate->rayTracesKHR) {
+                    allKHRTraces.push_back(&trace);
                     std::int32_t raygenGroup = trace.pipeline == nullptr
                         ? -1
                         : rayTracingGroupForSBTAddressLocked(
@@ -14087,10 +14525,35 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                             trace.raygen
                         );
                     }
+                    bool recoveredObservedRaygen = false;
+                    if (raygenGroup < 0 && trace.pipeline != nullptr) {
+                        const std::uint64_t expectedHash = observedIsaacRaygenHashForExtent(
+                            trace.width,
+                            trace.height,
+                            trace.depth
+                        );
+                        raygenGroup = uniqueRayTracingGroupForShaderHash(
+                            trace.pipeline,
+                            expectedHash
+                        );
+                        recoveredObservedRaygen = raygenGroup >= 0;
+                        if (recoveredObservedRaygen) {
+                            std::fprintf(
+                                stderr,
+                                "imb-vulkan-icd: recovered known Isaac raygen from exact extent=%ux%ux%u group=%d hash=%016llx after unresolved SBT record\n",
+                                trace.width,
+                                trace.height,
+                                trace.depth,
+                                raygenGroup,
+                                static_cast<unsigned long long>(expectedHash)
+                            );
+                        }
+                    }
                     const std::uint64_t raygenHash = rayTracingShaderHashForGroup(
                         trace.pipeline,
                         raygenGroup
                     );
+                    if (raygenHash == 0) ++unresolvedKHRTraceCount;
                     if (rayTracingTraceEnabled() && trace.pipeline != nullptr) {
                         const std::int32_t missGroup = trace.miss.deviceAddress == 0
                             ? -1
@@ -14148,6 +14611,9 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                             && trace.width >= 16 && trace.height >= 16
                             && trace.width <= 8192 && trace.height <= 8192
                             && trace.depth == 1;
+                        if (!knownSceneRayTrace && !knownNullSceneRaygen) {
+                            ++unknownKHRTraceCount;
+                        }
                         if (knownSceneRayTrace) {
                             sceneRayTraces.push_back(&trace);
                             if (mainSceneRayTrace == nullptr
@@ -14177,20 +14643,37 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
     // built by Metal. Match the visible USD Mesh manifest to those BLASes,
     // apply the authored world transforms, exclude renderer-internal BLASes,
     // and route viewport or camera-render-product traces through Metal.
+    bool deferSceneRayTracingUntilManifest = false;
     if (mainSceneRayTrace != nullptr
         && gState.bridge != nullptr
         && (gState.bridge->capabilities().bits & IMB_CAP_METAL_RAY_DISPATCH) != 0) {
-        AccelerationStructureKHRState* fallbackTopLevel = nullptr;
-        const VkResult fallbackResult = bridgeFallbackInstanceAccelerationStructureBuildLocked(
-            device,
-            &fallbackTopLevel
-        );
-        if (fallbackResult == VK_SUCCESS && fallbackTopLevel != nullptr) {
-            metalRayTrace = mainSceneRayTrace;
-            containsUnsupportedRayTracing = false;
-            nullSceneRTXInitializationCandidate = false;
-        } else if (fallbackResult != VK_ERROR_FEATURE_NOT_PRESENT) {
-            return fallbackResult;
+        const auto liveSceneHeader = readLiveSceneState(false);
+        if (!liveSceneHeader.has_value() || !liveSceneHeader->hasMeshManifest) {
+            // Full may start rendering while the stage extension is still
+            // walking the real USD hierarchy and publishing its mesh
+            // manifest. Rejecting that first known scene trace poisons Kit's
+            // render graph before the real Metal TLAS can be built. Defer only
+            // a pure KHR-trace submit with resolved shader records; once the
+            // manifest appears the normal fallback-TLAS path below is used.
+            deferSceneRayTracingUntilManifest = unsupportedNVBuildCount == 0
+                && unsupportedNVCopyCount == 0
+                && unsupportedNVTraceCount == 0
+                && unsupportedKHRCopyCount == 0
+                && unresolvedKHRTraceCount == 0
+                && !allKHRTraces.empty();
+        } else {
+            AccelerationStructureKHRState* fallbackTopLevel = nullptr;
+            const VkResult fallbackResult = bridgeFallbackInstanceAccelerationStructureBuildLocked(
+                device,
+                &fallbackTopLevel
+            );
+            if (fallbackResult == VK_SUCCESS && fallbackTopLevel != nullptr) {
+                metalRayTrace = mainSceneRayTrace;
+                containsUnsupportedRayTracing = false;
+                nullSceneRTXInitializationCandidate = false;
+            } else if (fallbackResult != VK_ERROR_FEATURE_NOT_PRESENT) {
+                return fallbackResult;
+            }
         }
     }
     std::vector<const RecordedRayTraceKHR*> metalRayTraces;
@@ -14204,10 +14687,13 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
     // until they have a real Metal acceleration-structure / shader backend.
     // Keeping the recorded object graph here lets us trace Kit's exact workload
     // without silently turning scene construction or trace dispatches into no-ops.
-    if (containsUnsupportedRayTracing && nullSceneRTXInitializationCandidate
-        && !nullSceneRTXTraces.empty()) {
+    const auto& initializationTraces = deferSceneRayTracingUntilManifest
+        ? allKHRTraces : nullSceneRTXTraces;
+    if ((deferSceneRayTracingUntilManifest
+            || (containsUnsupportedRayTracing && nullSceneRTXInitializationCandidate))
+        && !initializationTraces.empty()) {
         std::unordered_set<ImageState*> clearedImages;
-        for (const auto* trace : nullSceneRTXTraces) {
+        for (const auto* trace : initializationTraces) {
             for (auto* set : trace->descriptorSets) {
                 if (set == nullptr || !gState.descriptorSets.contains(set)) continue;
                 for (const auto& [_, image] : set->storageImages) {
@@ -14297,13 +14783,24 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                 }
             }
             if (fenceState != nullptr) fenceState->signaled = true;
-            std::fprintf(
-                stderr,
-                "imb-vulkan-icd: executed Metal-backed null-TLAS RTX initialization traces=%zu clearedStorageImages=%zu fence=%llu\n",
-                nullSceneRTXTraces.size(),
-                clearedImages.size(),
-                static_cast<unsigned long long>(bridgeFence)
-            );
+            if (deferSceneRayTracingUntilManifest) {
+                std::fprintf(
+                    stderr,
+                    "imb-vulkan-icd: deferred pre-manifest Isaac scene RTX traces=%zu unknownTraces=%zu clearedStorageImages=%zu fence=%llu\n",
+                    initializationTraces.size(),
+                    unknownKHRTraceCount,
+                    clearedImages.size(),
+                    static_cast<unsigned long long>(bridgeFence)
+                );
+            } else {
+                std::fprintf(
+                    stderr,
+                    "imb-vulkan-icd: executed Metal-backed null-TLAS RTX initialization traces=%zu clearedStorageImages=%zu fence=%llu\n",
+                    initializationTraces.size(),
+                    clearedImages.size(),
+                    static_cast<unsigned long long>(bridgeFence)
+                );
+            }
             return VK_SUCCESS;
         } catch (const std::exception& error) {
             std::fprintf(stderr, "imb-vulkan-icd: null-TLAS RTX initialization failed: %s\n", error.what());
@@ -14313,7 +14810,16 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
     if (containsUnsupportedRayTracing) {
         std::fprintf(
             stderr,
-            "imb-vulkan-icd: ray-tracing submit rejected: Metal ray dispatch/copy is not connected yet\n"
+            "imb-vulkan-icd: ray-tracing submit rejected: Metal ray dispatch/copy is not connected yet nvBuilds=%zu nvCopies=%zu nvTraces=%zu khrCopies=%zu khrTraces=%zu unresolvedKHRTraces=%zu unknownKHRTraces=%zu nullSceneTraces=%zu sceneTraces=%zu\n",
+            unsupportedNVBuildCount,
+            unsupportedNVCopyCount,
+            unsupportedNVTraceCount,
+            unsupportedKHRCopyCount,
+            totalKHRTraceCount,
+            unresolvedKHRTraceCount,
+            unknownKHRTraceCount,
+            nullSceneRTXTraces.size(),
+            sceneRayTraces.size()
         );
         return VK_ERROR_FEATURE_NOT_PRESENT;
     }
@@ -14782,7 +15288,22 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
         }
         try {
             const VkResult imageResult = ensureImageBackingLocked(image);
-            if (imageResult != VK_SUCCESS) return imageResult;
+            if (imageResult != VK_SUCCESS) {
+                std::fprintf(
+                    stderr,
+                    "imb-vulkan-icd: Kit UI root image unavailable result=%d format=%d type=%d extent=%ux%ux%u mips=%u layers=%u samples=%#x\n",
+                    imageResult,
+                    image->format,
+                    image->type,
+                    image->extent.width,
+                    image->extent.height,
+                    image->extent.depth,
+                    image->mipLevels,
+                    image->arrayLayers,
+                    image->samples
+                );
+                return imageResult;
+            }
             const VkResult vertexResult = ensureMemoryBackingLocked(vertexBuffer->memory, true);
             if (vertexResult != VK_SUCCESS) return vertexResult;
             const VkResult indexResult = ensureMemoryBackingLocked(indexBuffer->memory, true);
@@ -14844,7 +15365,22 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                     const VkResult textureMemoryResult = ensureMemoryBackingLocked(draw.texture->memory, false);
                     if (textureMemoryResult != VK_SUCCESS) return textureMemoryResult;
                     const VkResult textureImageResult = ensureImageBackingLocked(draw.texture);
-                    if (textureImageResult != VK_SUCCESS) return textureImageResult;
+                    if (textureImageResult != VK_SUCCESS) {
+                        std::fprintf(
+                            stderr,
+                            "imb-vulkan-icd: Kit UI texture unavailable result=%d format=%d type=%d extent=%ux%ux%u mips=%u layers=%u samples=%#x\n",
+                            textureImageResult,
+                            draw.texture->format,
+                            draw.texture->type,
+                            draw.texture->extent.width,
+                            draw.texture->extent.height,
+                            draw.texture->extent.depth,
+                            draw.texture->mipLevels,
+                            draw.texture->arrayLayers,
+                            draw.texture->samples
+                        );
+                        return textureImageResult;
+                    }
                     const std::uint64_t textureBytes =
                         static_cast<std::uint64_t>(draw.texture->extent.width)
                         * draw.texture->extent.height * 4;

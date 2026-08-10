@@ -61,6 +61,7 @@ public enum ComputeBindingKind: UInt32, Sendable {
     case textureReadWrite = 4
     case texelBufferRead = 5
     case texelBufferReadWrite = 6
+    case sampler = 7
 }
 
 public struct ComputeBinding: Sendable, Equatable {
@@ -303,7 +304,7 @@ public protocol BridgeGPUBackend: AnyObject {
     ) throws
     func destroyBuffer(id: UInt64) throws
     func destroyImage(id: UInt64) throws
-    func createComputePipeline(id: UInt64, spirv: Data, entryPoint: String) throws
+    func createComputePipeline(id: UInt64, spirv: Data, entryPoint: String) throws -> UInt32
     func destroyComputePipeline(id: UInt64) throws
     func createAccelerationStructure(id: UInt64, type: UInt32, requestedSize: UInt64) throws
     func destroyAccelerationStructure(id: UInt64) throws
@@ -378,8 +379,16 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         let pipeline: any MTLComputePipelineState
         let function: any MTLFunction
         let argumentBufferSets: Set<Int>
+        let argumentIndicesByVulkanBinding: [SPIRVDescriptorBinding: [Int]]
         let pushConstantBufferIndex: Int?
         let threadsPerThreadgroup: MTLSize
+        let creationFlags: UInt32
+    }
+
+    private struct ComputeSamplerKey: Hashable {
+        let options: UInt32
+        let lodClamps: UInt64
+        let lodBiasAndAnisotropy: UInt64
     }
 
     private struct ImageResource {
@@ -387,6 +396,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         let sparseHeap: (any MTLHeap)?
         let width: Int
         let height: Int
+        let depth: Int
         let format: UInt32
         let mipLevels: Int
         let arrayLayers: Int
@@ -1132,6 +1142,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     private var images: [UInt64: ImageResource] = [:]
     private var computePipelines: [UInt64: ComputePipelineResource] = [:]
     private var computePipelineCache: [ComputePipelineKey: ComputePipelineResource] = [:]
+    private var computeSamplerCache: [ComputeSamplerKey: any MTLSamplerState] = [:]
     private var accelerationStructures: [UInt64: AccelerationStructureResource] = [:]
     private var commandBuffers: [UInt64: any MTLCommandBuffer] = [:]
     private var frameImages: [UInt64: UInt64] = [:]
@@ -1321,30 +1332,69 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         format: UInt32,
         options: UInt32
     ) throws {
-        guard (format == 1 || format == 2), options == 0 else {
-            throw GPUBackendError.unsupported("only option-free RGBA8/BGRA8_UNORM images are supported")
+        let depth: UInt32
+        let is3D: Bool
+        if options == 0 {
+            depth = 1
+            is3D = false
+        } else if let decodedDepth = ImageOption.decodedDepth(from: options) {
+            depth = decodedDepth
+            is3D = true
+        } else {
+            throw GPUBackendError.unsupported(
+                "ordinary images require either zero options or a valid 3D depth option"
+            )
         }
-        guard width > 0, height > 0, width <= 4096, height <= 4096,
+        guard format == 1 || format == 2 || format == 8 else {
+            throw GPUBackendError.unsupported(
+                "only RGBA8/BGRA8_UNORM and RGBA8_UINT ordinary images are supported"
+            )
+        }
+        guard width > 0, height > 0, depth > 0,
+              width <= 4096, height <= 4096, depth <= 4096,
               buffers[id] == nil, images[id] == nil
         else {
             throw GPUBackendError.outOfBounds
         }
-        let descriptor = MTLTextureDescriptor.texture2DDescriptor(
-            pixelFormat: format == 1 ? .rgba8Unorm : .bgra8Unorm,
-            width: Int(width),
-            height: Int(height),
-            mipmapped: false
-        )
+        let pixelFormat: MTLPixelFormat = format == 1
+            ? .rgba8Unorm
+            : (format == 2 ? .bgra8Unorm : .rgba8Uint)
+        let descriptor: MTLTextureDescriptor
+        if is3D {
+            descriptor = MTLTextureDescriptor()
+            descriptor.textureType = .type3D
+            descriptor.pixelFormat = pixelFormat
+            descriptor.width = Int(width)
+            descriptor.height = Int(height)
+            descriptor.depth = Int(depth)
+            descriptor.mipmapLevelCount = 1
+            descriptor.arrayLength = 1
+            descriptor.sampleCount = 1
+        } else {
+            descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: pixelFormat,
+                width: Int(width),
+                height: Int(height),
+                mipmapped: false
+            )
+        }
         descriptor.storageMode = .shared
-        descriptor.usage = [.renderTarget, .shaderRead, .shaderWrite]
+        if is3D {
+            descriptor.usage = [.shaderRead, .shaderWrite]
+        } else {
+            descriptor.usage = [.renderTarget, .shaderRead, .shaderWrite]
+        }
         guard let texture = device.makeTexture(descriptor: descriptor) else {
-            throw GPUBackendError.unavailable("Metal failed to allocate a \(width)x\(height) RGBA8 image")
+            throw GPUBackendError.unavailable(
+                "Metal failed to allocate a \(width)x\(height)x\(depth) RGBA8 image"
+            )
         }
         images[id] = ImageResource(
             texture: texture,
             sparseHeap: nil,
             width: Int(width),
             height: Int(height),
+            depth: Int(depth),
             format: format,
             mipLevels: 1,
             arrayLayers: 1,
@@ -1379,6 +1429,8 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 throw GPUBackendError.unsupported("Metal BC5_RGUnorm is unavailable")
             }
             return format
+        case 8:
+            return .rgba8Uint
         default:
             throw GPUBackendError.unsupported("unsupported sparse image format \(format)")
         }
@@ -1520,6 +1572,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             sparseHeap: heap,
             width: Int(width),
             height: Int(height),
+            depth: 1,
             format: format,
             mipLevels: Int(mipLevels),
             arrayLayers: Int(arrayLayers),
@@ -1588,7 +1641,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         }
     }
 
-    public func createComputePipeline(id: UInt64, spirv: Data, entryPoint: String) throws {
+    public func createComputePipeline(id: UInt64, spirv: Data, entryPoint: String) throws -> UInt32 {
         guard let spirvCompiler else {
             throw GPUBackendError.unsupported("SPIR-V compute translation is not configured")
         }
@@ -1598,7 +1651,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         let key = ComputePipelineKey(spirv: spirv, entryPoint: entryPoint)
         if let resource = computePipelineCache[key] {
             computePipelines[id] = resource
-            return
+            return resource.creationFlags
         }
         let source: String
         do {
@@ -1620,6 +1673,17 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         }
         do {
             let pipeline = try device.makeComputePipelineState(function: function)
+            let argumentBindingMap = SPIRVCrossCompiler.metalArgumentBindingMap(
+                spirv: spirv,
+                msl: source
+            )
+            guard argumentBindingMap.emittedFieldCount == argumentBindingMap.mappedFieldCount else {
+                throw GPUBackendError.commandFailed(
+                    "translated Metal argument-buffer reflection mapped "
+                    + "\(argumentBindingMap.mappedFieldCount)/"
+                    + "\(argumentBindingMap.emittedFieldCount) resource fields"
+                )
+            }
             var argumentBufferSets: Set<Int> = []
             for descriptorSet in 0..<32 where source.contains(
                 "spvDescriptorSet\(descriptorSet) [[buffer(\(descriptorSet))]]"
@@ -1641,11 +1705,16 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 pipeline: pipeline,
                 function: function,
                 argumentBufferSets: argumentBufferSets,
+                argumentIndicesByVulkanBinding: argumentBindingMap.indicesByVulkanBinding,
                 pushConstantBufferIndex: Self.pushConstantBufferIndex(in: source),
-                threadsPerThreadgroup: localSize
+                threadsPerThreadgroup: localSize,
+                creationFlags: source.contains(
+                    SPIRVCrossCompiler.softwareFloat64ExecutionRequiredMarker
+                ) ? ComputePipelineFlag.softwareFP64ExecutionRequired : 0
             )
             computePipelines[id] = resource
             computePipelineCache[key] = resource
+            return resource.creationFlags
         } catch {
             if let backendError = error as? GPUBackendError {
                 throw backendError
@@ -2375,7 +2444,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         let blockHeight: Int
         let blockBytes: Int
         switch image.format {
-        case 1, 2:
+        case 1, 2, 8:
             (blockWidth, blockHeight, blockBytes) = (1, 1, 4)
         case 3, 6, 7:
             (blockWidth, blockHeight, blockBytes) = (4, 4, 16)
@@ -2393,6 +2462,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             let rowBytes: Int
             let rowPitch: Int
             let rowCount: Int
+            let depth: Int
             let width: Int
             let height: Int
             let mipLevel: Int
@@ -2416,10 +2486,11 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         for slice in 0..<image.arrayLayers {
             var width = image.width
             var height = image.height
+            var depth = image.depth
             for mipLevel in 0..<image.mipLevels {
                 let rowBytes = ((width + blockWidth - 1) / blockWidth) * blockBytes
                 let rowCount = (height + blockHeight - 1) / blockHeight
-                let tightByteCount = rowBytes * rowCount
+                let tightByteCount = rowBytes * rowCount * depth
                 let stagingOffset = align(stagingSize)
                 let rowPitch = align(rowBytes)
                 plans.append(UploadPlan(
@@ -2428,15 +2499,17 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                     rowBytes: rowBytes,
                     rowPitch: rowPitch,
                     rowCount: rowCount,
+                    depth: depth,
                     width: width,
                     height: height,
                     mipLevel: mipLevel,
                     slice: slice
                 ))
                 tightOffset += tightByteCount
-                stagingSize = stagingOffset + rowPitch * rowCount
+                stagingSize = stagingOffset + rowPitch * rowCount * depth
                 width = max(1, width / 2)
                 height = max(1, height / 2)
+                depth = max(1, depth / 2)
             }
         }
         guard data.count == tightOffset else {
@@ -2447,12 +2520,26 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
            blockWidth == 1, blockHeight == 1 {
             data.withUnsafeBytes { source in
                 guard let baseAddress = source.baseAddress else { return }
-                image.texture.replace(
-                    region: MTLRegionMake2D(0, 0, image.width, image.height),
-                    mipmapLevel: 0,
-                    withBytes: baseAddress,
-                    bytesPerRow: plans[0].rowBytes
-                )
+                if image.depth == 1 {
+                    image.texture.replace(
+                        region: MTLRegionMake2D(0, 0, image.width, image.height),
+                        mipmapLevel: 0,
+                        withBytes: baseAddress,
+                        bytesPerRow: plans[0].rowBytes
+                    )
+                } else {
+                    image.texture.replace(
+                        region: MTLRegionMake3D(
+                            0, 0, 0,
+                            image.width, image.height, image.depth
+                        ),
+                        mipmapLevel: 0,
+                        slice: 0,
+                        withBytes: baseAddress,
+                        bytesPerRow: plans[0].rowBytes,
+                        bytesPerImage: plans[0].rowBytes * plans[0].rowCount
+                    )
+                }
             }
             return
         }
@@ -2469,12 +2556,20 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             guard let sourceBase = source.baseAddress else { return }
             let destinationBase = staging.contents()
             for plan in plans {
-                for row in 0..<plan.rowCount {
-                    memcpy(
-                        destinationBase.advanced(by: plan.stagingOffset + row * plan.rowPitch),
-                        sourceBase.advanced(by: plan.tightOffset + row * plan.rowBytes),
-                        plan.rowBytes
-                    )
+                for z in 0..<plan.depth {
+                    for row in 0..<plan.rowCount {
+                        memcpy(
+                            destinationBase.advanced(
+                                by: plan.stagingOffset
+                                    + (z * plan.rowCount + row) * plan.rowPitch
+                            ),
+                            sourceBase.advanced(
+                                by: plan.tightOffset
+                                    + (z * plan.rowCount + row) * plan.rowBytes
+                            ),
+                            plan.rowBytes
+                        )
+                    }
                 }
             }
         }
@@ -2492,7 +2587,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 sourceSize: MTLSize(
                     width: plan.width,
                     height: plan.height,
-                    depth: 1
+                    depth: plan.depth
                 ),
                 to: image.texture,
                 destinationSlice: plan.slice,
@@ -2522,15 +2617,30 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             throw GPUBackendError.resourceNotFound(id)
         }
         let bytesPerRow = image.width * 4
-        var result = Data(count: bytesPerRow * image.height)
+        let bytesPerImage = bytesPerRow * image.height
+        var result = Data(count: bytesPerImage * image.depth)
         result.withUnsafeMutableBytes { destination in
             guard let baseAddress = destination.baseAddress else { return }
-            image.texture.getBytes(
-                baseAddress,
-                bytesPerRow: bytesPerRow,
-                from: MTLRegionMake2D(0, 0, image.width, image.height),
-                mipmapLevel: 0
-            )
+            if image.depth == 1 {
+                image.texture.getBytes(
+                    baseAddress,
+                    bytesPerRow: bytesPerRow,
+                    from: MTLRegionMake2D(0, 0, image.width, image.height),
+                    mipmapLevel: 0
+                )
+            } else {
+                image.texture.getBytes(
+                    baseAddress,
+                    bytesPerRow: bytesPerRow,
+                    bytesPerImage: bytesPerImage,
+                    from: MTLRegionMake3D(
+                        0, 0, 0,
+                        image.width, image.height, image.depth
+                    ),
+                    mipmapLevel: 0,
+                    slice: 0
+                )
+            }
         }
         return result
     }
@@ -2621,7 +2731,16 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
 
         var argumentBuffers: [any MTLBuffer] = []
         var texelBufferTextures: [any MTLTexture] = []
-        let bindingsBySet = Dictionary(grouping: bindings, by: { Int($0.descriptorSet) })
+        // Descriptor sets can contain bindings which the selected entry point
+        // does not statically use. Ignore those, then translate every active
+        // Vulkan binding to SPIRV-Cross's compact Metal argument ID(s).
+        let activeBindings = bindings.filter {
+            resource.argumentIndicesByVulkanBinding[SPIRVDescriptorBinding(
+                descriptorSet: $0.descriptorSet,
+                binding: $0.binding
+            )] != nil
+        }
+        let bindingsBySet = Dictionary(grouping: activeBindings, by: { Int($0.descriptorSet) })
         for (descriptorSet, setBindings) in bindingsBySet.sorted(by: { $0.key < $1.key }) {
             guard descriptorSet >= 0, descriptorSet < 32,
                   resource.argumentBufferSets.contains(descriptorSet)
@@ -2645,11 +2764,26 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             }
             argumentEncoder.setArgumentBuffer(argumentBuffer, offset: 0)
             for binding in setBindings {
-                let metalIndexValue = UInt64(binding.binding) + UInt64(binding.arrayElement)
-                guard metalIndexValue <= UInt64(Int.max) else {
+                let descriptorBinding = SPIRVDescriptorBinding(
+                    descriptorSet: binding.descriptorSet,
+                    binding: binding.binding
+                )
+                guard let baseMetalIndices = resource.argumentIndicesByVulkanBinding[
+                    descriptorBinding
+                ], !baseMetalIndices.isEmpty else {
+                    continue
+                }
+                let metalIndices = try baseMetalIndices.map { baseIndex -> Int in
+                    guard baseIndex >= 0,
+                          UInt64(baseIndex) + UInt64(binding.arrayElement) <= UInt64(Int.max)
+                    else {
+                        throw GPUBackendError.outOfBounds
+                    }
+                    return baseIndex + Int(binding.arrayElement)
+                }
+                guard !metalIndices.isEmpty else {
                     throw GPUBackendError.outOfBounds
                 }
-                let metalIndex = Int(metalIndexValue)
                 switch binding.kind {
                 case .bufferRead, .bufferReadWrite:
                     let buffer = try requireBuffer(binding.resourceID)
@@ -2658,11 +2792,13 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         length: binding.length,
                         bufferLength: UInt64(buffer.length)
                     )
-                    argumentEncoder.setBuffer(
-                        buffer,
-                        offset: try checkedInt(binding.offset),
-                        index: metalIndex
-                    )
+                    for metalIndex in metalIndices {
+                        argumentEncoder.setBuffer(
+                            buffer,
+                            offset: try checkedInt(binding.offset),
+                            index: metalIndex
+                        )
+                    }
                     var usage: MTLResourceUsage = .read
                     if binding.kind == .bufferReadWrite {
                         usage.insert(.write)
@@ -2712,7 +2848,9 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                             "Metal failed to create a buffer-backed texture"
                         )
                     }
-                    argumentEncoder.setTexture(texture, index: metalIndex)
+                    for metalIndex in metalIndices {
+                        argumentEncoder.setTexture(texture, index: metalIndex)
+                    }
                     var resourceUsage: MTLResourceUsage = .read
                     if binding.kind == .texelBufferReadWrite {
                         resourceUsage.insert(.write)
@@ -2725,12 +2863,24 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                     else {
                         throw GPUBackendError.resourceNotFound(binding.resourceID)
                     }
-                    argumentEncoder.setTexture(image.texture, index: metalIndex)
+                    for metalIndex in metalIndices {
+                        argumentEncoder.setTexture(image.texture, index: metalIndex)
+                    }
                     var usage: MTLResourceUsage = .read
                     if binding.kind == .textureReadWrite {
                         usage.insert(.write)
                     }
                     encoder.useResource(image.texture, usage: usage)
+                case .sampler:
+                    guard binding.resourceID == 0 else {
+                        throw GPUBackendError.unsupported(
+                            "Metal compute sampler bindings must be inline"
+                        )
+                    }
+                    let sampler = try computeSamplerState(for: binding)
+                    for metalIndex in metalIndices {
+                        argumentEncoder.setSamplerState(sampler, index: metalIndex)
+                    }
                 }
             }
             encoder.setBuffer(argumentBuffer, offset: 0, index: descriptorSet)
@@ -3282,7 +3432,112 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         images.removeAll()
         computePipelines.removeAll()
         computePipelineCache.removeAll()
+        computeSamplerCache.removeAll()
         accelerationStructures.removeAll()
+    }
+
+    private func computeSamplerState(
+        for binding: ComputeBinding
+    ) throws -> any MTLSamplerState {
+        let key = ComputeSamplerKey(
+            options: binding.format,
+            lodClamps: binding.offset,
+            lodBiasAndAnisotropy: binding.length
+        )
+        if let existing = computeSamplerCache[key] {
+            return existing
+        }
+        guard binding.format & ~UInt32(0x001f_ffff) == 0 else {
+            throw GPUBackendError.unsupported("unknown Vulkan sampler option bits")
+        }
+
+        let descriptor = MTLSamplerDescriptor()
+        descriptor.magFilter = binding.format & 1 != 0 ? .linear : .nearest
+        descriptor.minFilter = binding.format & 2 != 0 ? .linear : .nearest
+        descriptor.mipFilter = binding.format & 4 != 0 ? .linear : .nearest
+        descriptor.sAddressMode = try metalSamplerAddressMode(
+            UInt32((binding.format >> 3) & 0x7)
+        )
+        descriptor.tAddressMode = try metalSamplerAddressMode(
+            UInt32((binding.format >> 6) & 0x7)
+        )
+        descriptor.rAddressMode = try metalSamplerAddressMode(
+            UInt32((binding.format >> 9) & 0x7)
+        )
+        descriptor.normalizedCoordinates = binding.format & (1 << 17) == 0
+        descriptor.compareFunction = binding.format & (1 << 13) != 0
+            ? try metalSamplerCompareFunction(UInt32((binding.format >> 14) & 0x7))
+            : .never
+        descriptor.borderColor = try metalSamplerBorderColor(
+            UInt32((binding.format >> 18) & 0x7)
+        )
+        descriptor.supportArgumentBuffers = true
+
+        let minLod = Float(bitPattern: UInt32(truncatingIfNeeded: binding.offset))
+        let maxLod = Float(bitPattern: UInt32(truncatingIfNeeded: binding.offset >> 32))
+        let mipLodBias = Float(bitPattern: UInt32(truncatingIfNeeded: binding.length))
+        let maxAnisotropy = Float(bitPattern: UInt32(truncatingIfNeeded: binding.length >> 32))
+        guard minLod.isFinite, maxLod.isFinite, minLod <= maxLod,
+              mipLodBias.isFinite, maxAnisotropy.isFinite,
+              maxAnisotropy >= 1, maxAnisotropy <= 16
+        else {
+            throw GPUBackendError.unsupported("invalid Vulkan sampler float state")
+        }
+        descriptor.lodMinClamp = minLod
+        descriptor.lodMaxClamp = maxLod
+        if binding.format & (1 << 12) != 0 {
+            descriptor.maxAnisotropy = Int(maxAnisotropy.rounded())
+        } else {
+            descriptor.maxAnisotropy = 1
+        }
+        if mipLodBias != 0 {
+            if #available(macOS 26.0, *) {
+                descriptor.lodBias = mipLodBias
+            } else {
+                throw GPUBackendError.unsupported(
+                    "Vulkan sampler mip LOD bias requires macOS 26 or newer"
+                )
+            }
+        }
+        guard let sampler = device.makeSamplerState(descriptor: descriptor) else {
+            throw GPUBackendError.unavailable("Metal sampler creation failed")
+        }
+        computeSamplerCache[key] = sampler
+        return sampler
+    }
+
+    private func metalSamplerAddressMode(_ value: UInt32) throws -> MTLSamplerAddressMode {
+        switch value {
+        case 0: return .repeat
+        case 1: return .mirrorRepeat
+        case 2: return .clampToEdge
+        case 3: return .clampToBorderColor
+        case 4: return .mirrorClampToEdge
+        default: throw GPUBackendError.unsupported("unknown Vulkan sampler address mode")
+        }
+    }
+
+    private func metalSamplerCompareFunction(_ value: UInt32) throws -> MTLCompareFunction {
+        switch value {
+        case 0: return .never
+        case 1: return .less
+        case 2: return .equal
+        case 3: return .lessEqual
+        case 4: return .greater
+        case 5: return .notEqual
+        case 6: return .greaterEqual
+        case 7: return .always
+        default: throw GPUBackendError.unsupported("unknown Vulkan sampler compare operation")
+        }
+    }
+
+    private func metalSamplerBorderColor(_ value: UInt32) throws -> MTLSamplerBorderColor {
+        switch value {
+        case 0, 1: return .transparentBlack
+        case 2, 3: return .opaqueBlack
+        case 4, 5: return .opaqueWhite
+        default: throw GPUBackendError.unsupported("unknown Vulkan sampler border color")
+        }
     }
 
     private func requireBuffer(_ id: UInt64) throws -> any MTLBuffer {
@@ -3856,7 +4111,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     public func updateSparseImageMapping(id: UInt64, map: Bool, mipLevel: UInt32, slice: UInt32, tileX: UInt32, tileY: UInt32, tileZ: UInt32, tileWidth: UInt32, tileHeight: UInt32, tileDepth: UInt32) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
     public func destroyBuffer(id: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
     public func destroyImage(id: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
-    public func createComputePipeline(id: UInt64, spirv: Data, entryPoint: String) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
+    public func createComputePipeline(id: UInt64, spirv: Data, entryPoint: String) throws -> UInt32 { throw GPUBackendError.unavailable("Metal is unavailable") }
     public func destroyComputePipeline(id: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
     public func createAccelerationStructure(id: UInt64, type: UInt32, requestedSize: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
     public func destroyAccelerationStructure(id: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }

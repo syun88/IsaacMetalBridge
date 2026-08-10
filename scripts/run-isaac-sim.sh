@@ -671,6 +671,11 @@ fi
 if [[ -n "${IMB_VULKAN_COMPUTE_TRACE:-}" ]]; then
     container_env_args+=(--env "IMB_VULKAN_COMPUTE_TRACE=${IMB_VULKAN_COMPUTE_TRACE}")
 fi
+if [[ -n "${IMB_VULKAN_FP64_MATRIX_EXECUTION:-}" ]]; then
+    container_env_args+=(
+        --env "IMB_VULKAN_FP64_MATRIX_EXECUTION=${IMB_VULKAN_FP64_MATRIX_EXECUTION}"
+    )
+fi
 if [[ -n "${IMB_VULKAN_RT_TRACE:-}" ]]; then
     container_env_args+=(--env "IMB_VULKAN_RT_TRACE=${IMB_VULKAN_RT_TRACE}")
 fi
