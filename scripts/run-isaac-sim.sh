@@ -35,6 +35,7 @@ demo_scene=0
 animate_demo=0
 simple_grid=0
 robot_warehouse=0
+empty_stage_grid=0
 ros2_flag_seen=0
 viewer_pid=""
 frame_output="${IMB_FRAME_OUTPUT:-}"
@@ -328,7 +329,7 @@ fi
 
 mkdir -p "${runtime_dir}"
 if [[ "${demo_scene}" -eq 1 || "${simple_grid}" -eq 1 \
-    || "${robot_warehouse}" -eq 1 ]]; then
+    || "${robot_warehouse}" -eq 1 || "${show_window}" -eq 1 ]]; then
     camera_dir="${runtime_dir}/${container_id}-camera"
     camera_state_output="${camera_dir}/state.bin"
     mkdir -p "${camera_dir}"
@@ -473,14 +474,22 @@ elif [[ "${simple_grid}" -eq 1 ]]; then
 elif [[ "${robot_warehouse}" -eq 1 ]]; then
     startup_stage="${warehouse_asset_path}"
 fi
-if [[ -n "${startup_stage}" ]]; then
+if [[ -z "${startup_stage}" && "${show_window}" -eq 1 ]]; then
+    empty_stage_grid=1
+fi
+if [[ -n "${startup_stage}" || "${empty_stage_grid}" -eq 1 ]]; then
     # isaacsim.exp.base.kit creates an empty stage and its legacy
-    # /app/content/usdFile opener is disabled in Isaac Sim 6.0.1.  Load the
-    # requested stage from a small early extension instead of passing an
-    # ignored positional USD argument or replacing the stage after rendering.
+    # /app/content/usdFile opener is disabled in Isaac Sim 6.0.1. The early
+    # extension opens an explicitly requested stage; with no stage it retains
+    # Kit's default stage and publishes only its viewport camera/layout state
+    # for the renderer-owned Metal guide grid.
+    if [[ -n "${startup_stage}" ]]; then
+        kit_args+=(
+            "--/app/content/emptyStageOnStart=false"
+            "--/isaac/startup/create_new_stage=false"
+        )
+    fi
     kit_args+=(
-        "--/app/content/emptyStageOnStart=false"
-        "--/isaac/startup/create_new_stage=false"
         "--ext-folder" "/opt/imb-stage-exts"
         "--enable" "isaacmetalbridge.stage"
     )
@@ -581,8 +590,18 @@ fi
 if [[ -n "${startup_stage}" ]]; then
     container_env_args+=(
         --env "IMB_STARTUP_STAGE_URL=${startup_stage}"
-        --env "IMB_CAMERA_STATE_FILE=/opt/imb-camera/state.bin"
         --env "IMB_VULKAN_SCENE_PRESENTATION=1"
+    )
+fi
+if [[ "${empty_stage_grid}" -eq 1 ]]; then
+    container_env_args+=(
+        --env "IMB_VULKAN_EMPTY_STAGE_GRID=1"
+        --env "IMB_CENTER_STAGE_ORIGIN=1"
+    )
+fi
+if [[ -n "${startup_stage}" || "${empty_stage_grid}" -eq 1 ]]; then
+    container_env_args+=(
+        --env "IMB_CAMERA_STATE_FILE=/opt/imb-camera/state.bin"
     )
     if [[ "${experience}" == "full" && "${show_window}" -eq 1 ]]; then
         container_env_args+=(

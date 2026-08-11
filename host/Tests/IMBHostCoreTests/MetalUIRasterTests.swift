@@ -142,6 +142,38 @@ private func appendUIVertex(
     #expect(Array(pixels[center..<(center + 4)]) == [36, 36, 36, 255])
 }
 
+@Test func metalEmptyStageGridDrawsPerspectiveLinesAndAxes() throws {
+    let backend = try #require(MetalGPUBackend.makeDefault())
+    let width = 320
+    let height = 180
+    try backend.createImage(
+        id: 41,
+        width: UInt32(width),
+        height: UInt32(height),
+        format: 1,
+        options: 0
+    )
+    try backend.submitEmptyStageGrid(
+        imageID: 41,
+        width: UInt32(width),
+        height: UInt32(height),
+        camera: nil,
+        fenceID: 42
+    )
+    #expect(try backend.waitFence(id: 42))
+
+    let pixels = try backend.readImage(id: 41)
+    let center = (height / 2 * width + width / 2) * 4
+    let centerPixel = Array(pixels[center..<(center + 4)])
+    #expect(centerPixel[3] == 255)
+    #expect(centerPixel[1] > centerPixel[0])
+    #expect(centerPixel[1] > centerPixel[2])
+    let sampledColors = Set(stride(from: 0, to: pixels.count, by: 4).map {
+        try! pixels.readLittleEndian(at: $0) as UInt32
+    })
+    #expect(sampledColors.count > 8)
+}
+
 @Test func metalBuildsPrimitiveTriangleAccelerationStructure() throws {
     let backend = try #require(MetalGPUBackend.makeDefault())
     #expect(backend.supportsAccelerationStructures)

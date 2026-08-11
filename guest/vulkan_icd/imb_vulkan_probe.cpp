@@ -1715,6 +1715,151 @@ int main(int argc, char** argv) {
             << "VULKAN_IMAGE_READBACK format=RGBA16 mips=4 bytes=680"
             << " buffer_to_image=passed image_to_buffer=passed\n";
 
+        constexpr std::uint32_t snormWidth = 2;
+        constexpr std::uint32_t snormHeight = 2;
+        constexpr VkDeviceSize snormBytes = snormWidth * snormHeight * 4;
+        constexpr std::array<std::uint8_t, snormBytes> snormExpected = {
+            0x81, 0x00, 0x00, 0x00,
+            0xff, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x7f, 0x00, 0x00, 0x00,
+        };
+        VkBufferCreateInfo snormBufferInfo{};
+        snormBufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        snormBufferInfo.size = snormBytes;
+        snormBufferInfo.usage =
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        snormBufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkBuffer snormBuffer = VK_NULL_HANDLE;
+        require(
+            vkCreateBuffer(device, &snormBufferInfo, nullptr, &snormBuffer),
+            "vkCreateBuffer(RGBA8_SNORM transfer)"
+        );
+        VkMemoryRequirements snormBufferRequirements{};
+        vkGetBufferMemoryRequirements(device, snormBuffer, &snormBufferRequirements);
+        VkMemoryAllocateInfo snormBufferMemoryInfo{};
+        snormBufferMemoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        snormBufferMemoryInfo.allocationSize = snormBufferRequirements.size;
+        snormBufferMemoryInfo.memoryTypeIndex = memoryTypeIndex;
+        VkDeviceMemory snormBufferMemory = VK_NULL_HANDLE;
+        require(
+            vkAllocateMemory(device, &snormBufferMemoryInfo, nullptr, &snormBufferMemory),
+            "vkAllocateMemory(RGBA8_SNORM transfer buffer)"
+        );
+        require(
+            vkBindBufferMemory(device, snormBuffer, snormBufferMemory, 0),
+            "vkBindBufferMemory(RGBA8_SNORM transfer)"
+        );
+        void* snormMapped = nullptr;
+        require(
+            vkMapMemory(device, snormBufferMemory, 0, snormBytes, 0, &snormMapped),
+            "vkMapMemory(RGBA8_SNORM upload)"
+        );
+        std::memcpy(snormMapped, snormExpected.data(), snormExpected.size());
+        vkUnmapMemory(device, snormBufferMemory);
+
+        VkImageCreateInfo snormImageInfo{};
+        snormImageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        snormImageInfo.imageType = VK_IMAGE_TYPE_2D;
+        snormImageInfo.format = VK_FORMAT_R8G8B8A8_SNORM;
+        snormImageInfo.extent = {snormWidth, snormHeight, 1};
+        snormImageInfo.mipLevels = 1;
+        snormImageInfo.arrayLayers = 1;
+        snormImageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        snormImageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        snormImageInfo.usage =
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        snormImageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        snormImageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImage snormImage = VK_NULL_HANDLE;
+        require(
+            vkCreateImage(device, &snormImageInfo, nullptr, &snormImage),
+            "vkCreateImage(RGBA8_SNORM transfer)"
+        );
+        VkMemoryRequirements snormImageRequirements{};
+        vkGetImageMemoryRequirements(device, snormImage, &snormImageRequirements);
+        VkMemoryAllocateInfo snormImageMemoryInfo{};
+        snormImageMemoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        snormImageMemoryInfo.allocationSize = snormImageRequirements.size;
+        snormImageMemoryInfo.memoryTypeIndex = memoryTypeIndex;
+        VkDeviceMemory snormImageMemory = VK_NULL_HANDLE;
+        require(
+            vkAllocateMemory(device, &snormImageMemoryInfo, nullptr, &snormImageMemory),
+            "vkAllocateMemory(RGBA8_SNORM image)"
+        );
+        require(
+            vkBindImageMemory(device, snormImage, snormImageMemory, 0),
+            "vkBindImageMemory(RGBA8_SNORM image)"
+        );
+
+        VkCommandBuffer snormCommand = VK_NULL_HANDLE;
+        require(
+            vkAllocateCommandBuffers(device, &commandAllocateInfo, &snormCommand),
+            "vkAllocateCommandBuffers(RGBA8_SNORM image)"
+        );
+        require(
+            vkBeginCommandBuffer(snormCommand, &beginInfo),
+            "vkBeginCommandBuffer(RGBA8_SNORM image)"
+        );
+        VkBufferImageCopy snormRegion{};
+        snormRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        snormRegion.imageSubresource.layerCount = 1;
+        snormRegion.imageExtent = {snormWidth, snormHeight, 1};
+        vkCmdCopyBufferToImage(
+            snormCommand,
+            snormBuffer,
+            snormImage,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &snormRegion
+        );
+        vkCmdFillBuffer(snormCommand, snormBuffer, 0, VK_WHOLE_SIZE, 0);
+        vkCmdCopyImageToBuffer(
+            snormCommand,
+            snormImage,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            snormBuffer,
+            1,
+            &snormRegion
+        );
+        require(
+            vkEndCommandBuffer(snormCommand),
+            "vkEndCommandBuffer(RGBA8_SNORM image)"
+        );
+        VkFence snormFence = VK_NULL_HANDLE;
+        require(
+            vkCreateFence(device, &fenceInfo, nullptr, &snormFence),
+            "vkCreateFence(RGBA8_SNORM image)"
+        );
+        VkSubmitInfo snormSubmit{};
+        snormSubmit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        snormSubmit.commandBufferCount = 1;
+        snormSubmit.pCommandBuffers = &snormCommand;
+        require(
+            vkQueueSubmit(queue, 1, &snormSubmit, snormFence),
+            "vkQueueSubmit(RGBA8_SNORM image)"
+        );
+        require(
+            vkWaitForFences(device, 1, &snormFence, VK_TRUE, UINT64_MAX),
+            "vkWaitForFences(RGBA8_SNORM image)"
+        );
+        snormMapped = nullptr;
+        require(
+            vkMapMemory(device, snormBufferMemory, 0, snormBytes, 0, &snormMapped),
+            "vkMapMemory(RGBA8_SNORM readback)"
+        );
+        if (std::memcmp(snormMapped, snormExpected.data(), snormExpected.size()) != 0) {
+            throw std::runtime_error("IMB RGBA8_SNORM signed-byte transfer mismatch");
+        }
+        vkUnmapMemory(device, snormBufferMemory);
+        vkDestroyFence(device, snormFence, nullptr);
+        vkFreeCommandBuffers(device, commandPool, 1, &snormCommand);
+        vkDestroyImage(device, snormImage, nullptr);
+        vkFreeMemory(device, snormImageMemory, nullptr);
+        vkDestroyBuffer(device, snormBuffer, nullptr);
+        vkFreeMemory(device, snormBufferMemory, nullptr);
+        std::cout << "VULKAN_IMAGE_SNORM format=RGBA8_SNORM extent=2x2 signed_bytes=passed buffer_to_image=passed image_to_buffer=passed\n";
+
         constexpr std::uint32_t volumeWidth = 2;
         constexpr std::uint32_t volumeHeight = 2;
         constexpr std::uint32_t volumeDepth = 2;

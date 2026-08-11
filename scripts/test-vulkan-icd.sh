@@ -163,6 +163,11 @@ if ! grep -F 'VULKAN_IMAGE_READBACK format=RGBA16 mips=4 bytes=680 buffer_to_ima
     sed -n '1,240p' "${guest_log}" >&2
     exit 1
 fi
+if ! grep -F 'VULKAN_IMAGE_SNORM format=RGBA8_SNORM extent=2x2 signed_bytes=passed buffer_to_image=passed image_to_buffer=passed' "${guest_log}" >/dev/null; then
+    echo "test-vulkan-icd: Vulkan RGBA8_SNORM signed-byte upload/readback did not pass" >&2
+    sed -n '1,240p' "${guest_log}" >&2
+    exit 1
+fi
 if ! grep -F 'VULKAN_EXTERNAL_MEMORY image=RGBA8 handle=OPAQUE_FD roundtrip=passed' "${guest_log}" >/dev/null; then
     echo "test-vulkan-icd: Vulkan OPAQUE_FD image-memory compatibility did not pass" >&2
     sed -n '1,240p' "${guest_log}" >&2
@@ -177,4 +182,4 @@ sips -s format png "${vulkan_ppm}" --out "${vulkan_png}" >/dev/null
 sed -n '1,240p' "${adapter_log}"
 sed -n '1,240p' "${guest_log}"
 
-echo "test-vulkan-icd: Vulkan compute, raster, BLAS, TLAS, depth-3 KHR pipeline, Metal sparse-image residency, OPAQUE_FD, and real Metal ray dispatch validation passed; image=${vulkan_png}"
+echo "test-vulkan-icd: Vulkan compute, raster, RGBA8_SNORM ordinary-image transfer, BLAS, TLAS, depth-3 KHR pipeline, Metal sparse-image residency, OPAQUE_FD, and real Metal ray dispatch validation passed; image=${vulkan_png}"

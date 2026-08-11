@@ -1,0 +1,31 @@
+From: IsaacMetalBridge
+Subject: [PATCH] MSL: lower 64-bit compare-exchange for serialized execution
+
+Metal exposes no 64-bit integer atomics on Apple M4, including with MSL 4.0.
+Emit an explicit helper call for OpAtomicCompareExchange and let the host wrap
+eligible kernels in one-thread serialized execution. Other 64-bit atomic
+operations remain rejected.
+
+diff --git a/spirv_msl.cpp b/spirv_msl.cpp
+index 27b61e50..27c301ee 100644
+--- a/spirv_msl.cpp
++++ b/spirv_msl.cpp
+@@ -11369,7 +11369,17 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id,
+ 		use_native_image_atomic = false;
+ 
+ 	if (type.width == 64)
+-		SPIRV_CROSS_THROW("MSL currently does not support 64-bit atomics.");
++	{
++		if (opcode != OpAtomicCompareExchange || !op1_is_pointer || !op1 || !op2)
++			SPIRV_CROSS_THROW("MSL currently only supports serialized 64-bit compare-exchange lowering.");
++
++		emit_op(result_type, result_id,
++		        join("spvAtomicCompareExchange64(", to_enclosed_pointer_expression(obj), ", ",
++		             to_expression(op1), ", ", to_expression(op2), ")"),
++		        false);
++		flush_all_atomic_capable_variables();
++		return;
++	}
+ 
+ 	auto remapped_type = type;
+ 	remapped_type.basetype = expected_type;

@@ -10,7 +10,7 @@ extern "C" {
 
 #define IMB_PROTOCOL_MAGIC UINT32_C(0x31424d49) /* little-endian bytes: I M B 1 */
 #define IMB_PROTOCOL_VERSION_MAJOR UINT16_C(1)
-#define IMB_PROTOCOL_VERSION_MINOR UINT16_C(14)
+#define IMB_PROTOCOL_VERSION_MINOR UINT16_C(15)
 #define IMB_PROTOCOL_HEADER_SIZE UINT32_C(32)
 #define IMB_PROTOCOL_MAX_PAYLOAD UINT32_C(16777216)
 
@@ -93,7 +93,8 @@ enum imb_image_format {
     IMB_IMAGE_FORMAT_RGBA16_UNORM = 5,
     IMB_IMAGE_FORMAT_BC3_SRGB = 6,
     IMB_IMAGE_FORMAT_BC5_UNORM = 7,
-    IMB_IMAGE_FORMAT_RGBA8_UINT = 8
+    IMB_IMAGE_FORMAT_RGBA8_UINT = 8,
+    IMB_IMAGE_FORMAT_RGBA8_SNORM = 9
 };
 
 enum imb_image_options {
@@ -167,7 +168,9 @@ enum imb_compute_binding_kind {
 enum imb_compute_pipeline_flags {
     IMB_COMPUTE_PIPELINE_FLAG_NONE = 0,
     /* The translated entry point evaluates values through software binary64. */
-    IMB_COMPUTE_PIPELINE_FLAG_SOFTWARE_FP64_EXECUTION_REQUIRED = 1u << 0
+    IMB_COMPUTE_PIPELINE_FLAG_SOFTWARE_FP64_EXECUTION_REQUIRED = 1u << 0,
+    /* Logical invocations are serialized to preserve 64-bit compare-exchange. */
+    IMB_COMPUTE_PIPELINE_FLAG_SERIALIZED_ATOMIC64_EXECUTION_REQUIRED = 1u << 1
 };
 
 enum imb_trace_rays_options {
@@ -175,7 +178,9 @@ enum imb_trace_rays_options {
     IMB_TRACE_RAYS_OPTION_LIVE_CAMERA = 1u << 0,
     IMB_TRACE_RAYS_OPTION_LIVE_SPHERE_LIGHT = 1u << 1,
     IMB_TRACE_RAYS_OPTION_LIVE_DISTANT_LIGHT = 1u << 2,
-    IMB_TRACE_RAYS_OPTION_LIVE_DOME_LIGHT = 1u << 3
+    IMB_TRACE_RAYS_OPTION_LIVE_DOME_LIGHT = 1u << 3,
+    /* Draw the renderer-owned empty-stage guide grid; AS resource ID is zero. */
+    IMB_TRACE_RAYS_OPTION_EMPTY_STAGE_GRID = 1u << 4
 };
 
 enum imb_acceleration_structure_vertex_format {

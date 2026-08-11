@@ -63,7 +63,7 @@ public final class BridgeSession: @unchecked Sendable {
         let blockHeight: UInt64
         let blockBytes: UInt64
         switch resource.format {
-        case 1, 2, 8:
+        case 1, 2, 8, 9:
             (blockWidth, blockHeight, blockBytes) = (1, 1, 4)
         case 3, 6, 7:
             (blockWidth, blockHeight, blockBytes) = (4, 4, 16)
@@ -231,7 +231,7 @@ public final class BridgeSession: @unchecked Sendable {
                               width <= 4096,
                               height <= 4096,
                               depth <= 4096,
-                              (format == 1 || format == 2 || format == 8),
+                              (format == 1 || format == 2 || format == 8 || format == 9),
                               reserved == 0,
                               size == UInt64(width) * UInt64(height) * UInt64(depth) * 4,
                               size <= UInt64(IMBProtocol.maxPayloadLength)
@@ -913,9 +913,6 @@ public final class BridgeSession: @unchecked Sendable {
                       let target = resources[frame.header.resourceID],
                       target.kind == 2,
                       let accelerationStructureID: UInt64 = try? frame.payload.readLittleEndian(at: 8),
-                      let accelerationStructure = resources[accelerationStructureID],
-                      accelerationStructure.kind == 4,
-                      accelerationStructure.format == 0,
                       let width: UInt32 = try? frame.payload.readLittleEndian(at: 16),
                       let height: UInt32 = try? frame.payload.readLittleEndian(at: 20),
                       let missRGBA8: UInt32 = try? frame.payload.readLittleEndian(at: 24),
@@ -924,11 +921,27 @@ public final class BridgeSession: @unchecked Sendable {
                       let reserved1: UInt32 = try? frame.payload.readLittleEndian(at: 36),
                       width == target.width,
                       height == target.height,
-                      options & ~UInt32(15) == 0,
+                      options & ~UInt32(31) == 0,
                       reserved1 == 0,
                       backend.supportsRayDispatch
                 else {
-                    return failure(frame, .invalidPayload, "TRACE_RAYS requires an image and a built top-level Metal acceleration structure")
+                    return failure(
+                        frame,
+                        .invalidPayload,
+                        "TRACE_RAYS requires a matching image and valid options"
+                    )
+                }
+                let emptyStageGrid = options & 16 != 0
+                let accelerationStructure = resources[accelerationStructureID]
+                guard emptyStageGrid
+                    ? accelerationStructureID == 0 && options & UInt32(14) == 0
+                    : accelerationStructure?.kind == 4 && accelerationStructure?.format == 0
+                else {
+                    return failure(
+                        frame,
+                        .invalidPayload,
+                        "TRACE_RAYS requires a built top-level Metal acceleration structure unless EMPTY_STAGE_GRID is set"
+                    )
                 }
                 var camera: RayCamera?
                 if options & 1 != 0 {
@@ -1040,20 +1053,34 @@ public final class BridgeSession: @unchecked Sendable {
                         intensity: values[3]
                     )
                 }
-                try backend.submitRayTrace(
-                    imageID: frame.header.resourceID,
-                    accelerationStructureID: accelerationStructureID,
-                    width: width,
-                    height: height,
-                    missRGBA8: missRGBA8,
-                    hitRGBA8: hitRGBA8,
-                    camera: camera,
-                    sphereLight: sphereLight,
-                    distantLight: distantLight,
-                    domeLight: domeLight,
-                    fenceID: fenceID
-                )
-                commandResources.formUnion([frame.header.resourceID, accelerationStructureID])
+                if emptyStageGrid {
+                    try backend.submitEmptyStageGrid(
+                        imageID: frame.header.resourceID,
+                        width: width,
+                        height: height,
+                        camera: camera,
+                        fenceID: fenceID
+                    )
+                    commandResources.insert(frame.header.resourceID)
+                } else {
+                    try backend.submitRayTrace(
+                        imageID: frame.header.resourceID,
+                        accelerationStructureID: accelerationStructureID,
+                        width: width,
+                        height: height,
+                        missRGBA8: missRGBA8,
+                        hitRGBA8: hitRGBA8,
+                        camera: camera,
+                        sphereLight: sphereLight,
+                        distantLight: distantLight,
+                        domeLight: domeLight,
+                        fenceID: fenceID
+                    )
+                    commandResources.formUnion([
+                        frame.header.resourceID,
+                        accelerationStructureID,
+                    ])
+                }
             case 5:
                 guard frame.payload.count >= 32,
                       let pipeline = resources[frame.header.resourceID],

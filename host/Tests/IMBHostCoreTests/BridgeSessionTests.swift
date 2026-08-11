@@ -34,10 +34,12 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     private(set) var lastImageWriteID: UInt64?
     private(set) var lastImageWriteData: Data?
     private(set) var lastImageOptions: UInt32?
+    private(set) var lastImageFormat: UInt32?
     private(set) var lastRayCamera: RayCamera?
     private(set) var lastRaySphereLight: RaySphereLight?
     private(set) var lastRayDistantLight: RayDistantLight?
     private(set) var lastRayDomeLight: RayDomeLight?
+    private(set) var lastEmptyStageGridCamera: RayCamera?
 
     var supportsSPIRVCompute: Bool { true }
     var supportsAccelerationStructures: Bool { true }
@@ -52,7 +54,7 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     func createImage(id: UInt64, width: UInt32, height: UInt32, format: UInt32, options: UInt32) throws {
         let depth = ImageOption.decodedDepth(from: options) ?? (options == 0 ? 1 : 0)
         guard width > 0, height > 0, depth > 0,
-              (format == 1 || format == 2 || format == 8),
+              (format == 1 || format == 2 || format == 8 || format == 9),
               options == 0 || ImageOption.decodedDepth(from: options) != nil
         else {
             throw GPUBackendError.unsupported("invalid test image")
@@ -65,6 +67,7 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             pixels: Data(repeating: 0, count: byteCount)
         )
         lastImageOptions = options
+        lastImageFormat = format
     }
 
     func querySparseImageProperties(
@@ -354,6 +357,32 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         fences.insert(fenceID)
     }
 
+    func submitEmptyStageGrid(
+        imageID: UInt64,
+        width: UInt32,
+        height: UInt32,
+        camera: RayCamera?,
+        fenceID: UInt64
+    ) throws {
+        guard var image = images[imageID],
+              image.width == Int(width), image.height == Int(height)
+        else {
+            throw GPUBackendError.resourceNotFound(imageID)
+        }
+        let background = Data([18, 19, 21, 255])
+        for offset in stride(from: 0, to: image.pixels.count, by: 4) {
+            image.pixels.replaceSubrange(offset..<(offset + 4), with: background)
+        }
+        let centerOffset = ((image.height / 2) * image.width + image.width / 2) * 4
+        image.pixels.replaceSubrange(
+            centerOffset..<(centerOffset + 4),
+            with: Data([224, 51, 43, 255])
+        )
+        images[imageID] = image
+        lastEmptyStageGridCamera = camera
+        fences.insert(fenceID)
+    }
+
     func waitFence(id: UInt64) throws -> Bool {
         guard fences.remove(id) != nil else { throw GPUBackendError.resourceNotFound(id) }
         return true
@@ -367,6 +396,7 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         accelerationStructures.removeAll()
         lastImageWriteID = nil
         lastImageWriteData = nil
+        lastEmptyStageGridCamera = nil
     }
 }
 
@@ -617,6 +647,57 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
         payload: read
     )).response
     #expect(readBack.payload == voxels)
+}
+
+@Test func ordinaryRGBA8SnormImagePreservesSignedBytes() throws {
+    let backend = TestGPUBackend()
+    let session = BridgeSession(metal: testMetal, backend: backend)
+    negotiate(session)
+
+    var create = Data()
+    create.appendLittleEndian(UInt64(2 * 2 * 4))
+    create.appendLittleEndian(UInt32(2))
+    create.appendLittleEndian(UInt32(0))
+    create.appendLittleEndian(UInt32(2))
+    create.appendLittleEndian(UInt32(2))
+    create.appendLittleEndian(UInt32(9))
+    create.appendLittleEndian(UInt32(0))
+    let created = session.handle(request(
+        .createResource,
+        id: 23,
+        payload: create
+    )).response
+    #expect(created.header.messageType == MessageType.createResource.rawValue)
+    #expect(created.header.resourceID != 0)
+    #expect(backend.lastImageFormat == 9)
+
+    let signedPixels = Data([
+        0x81, 0, 0, 0, 0xff, 0, 0, 0,
+        0x00, 0, 0, 0, 0x7f, 0, 0, 0,
+    ])
+    var write = Data()
+    write.appendLittleEndian(UInt64(0))
+    write.appendLittleEndian(UInt32(signedPixels.count))
+    write.appendLittleEndian(UInt32(0))
+    write.append(signedPixels)
+    let written = session.handle(request(
+        .writeResource,
+        id: 24,
+        resourceID: created.header.resourceID,
+        payload: write
+    )).response
+    #expect(written.header.messageType == MessageType.writeResource.rawValue)
+
+    var read = Data()
+    read.appendLittleEndian(UInt64(0))
+    read.appendLittleEndian(UInt64(signedPixels.count))
+    let readBack = session.handle(request(
+        .readResource,
+        id: 25,
+        resourceID: created.header.resourceID,
+        payload: read
+    )).response
+    #expect(readBack.payload == signedPixels)
 }
 
 @Test func spirvComputePipelineLifecycleAndValidation() throws {
@@ -1019,6 +1100,69 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     let waited = session.handle(request(
         .waitFence,
         id: 6,
+        resourceID: submitted.header.resourceID
+    )).response
+    #expect(try waited.payload.readLittleEndian(at: 0) as UInt32 == 1)
+}
+
+@Test func emptyStageGridUsesMetalWithoutAnAccelerationStructure() throws {
+    let backend = TestGPUBackend()
+    let session = BridgeSession(metal: testMetalWithRayTracing, backend: backend)
+    negotiate(session)
+
+    var imageCreate = Data()
+    imageCreate.appendLittleEndian(UInt64(16 * 16 * 4))
+    imageCreate.appendLittleEndian(UInt32(2))
+    imageCreate.appendLittleEndian(UInt32(0))
+    imageCreate.appendLittleEndian(UInt32(16))
+    imageCreate.appendLittleEndian(UInt32(16))
+    imageCreate.appendLittleEndian(UInt32(1))
+    imageCreate.appendLittleEndian(UInt32(0))
+    let image = session.handle(request(.createResource, id: 2, payload: imageCreate)).response
+
+    let camera = RayCamera(
+        position: SIMD3<Float>(4.5, 4.5, 3.5),
+        forward: SIMD3<Float>(-0.6, -0.6, -0.45),
+        up: SIMD3<Float>(0, 0, 1),
+        verticalFOVRadians: 0.9,
+        nearDistance: 0.1,
+        farDistance: 10_000
+    )
+    var command = Data()
+    command.appendLittleEndian(UInt16(4))
+    command.appendLittleEndian(UInt16(0))
+    command.appendLittleEndian(UInt32(0))
+    command.appendLittleEndian(UInt64(0))
+    command.appendLittleEndian(UInt32(16))
+    command.appendLittleEndian(UInt32(16))
+    command.appendLittleEndian(UInt32(0))
+    command.appendLittleEndian(UInt32(0))
+    command.appendLittleEndian(UInt32(17))
+    command.appendLittleEndian(UInt32(0))
+    for value in [
+        camera.position.x, camera.position.y, camera.position.z,
+        camera.forward.x, camera.forward.y, camera.forward.z,
+        camera.up.x, camera.up.y, camera.up.z,
+        camera.verticalFOVRadians, camera.nearDistance, camera.farDistance,
+    ] {
+        command.appendLittleEndian(value.bitPattern)
+    }
+    for _ in 0..<20 {
+        command.appendLittleEndian(Float(0).bitPattern)
+    }
+    #expect(command.count == 168)
+
+    let submitted = session.handle(request(
+        .submitCommand,
+        id: 3,
+        resourceID: image.header.resourceID,
+        payload: command
+    )).response
+    #expect(submitted.header.messageType == MessageType.submitCommand.rawValue)
+    #expect(backend.lastEmptyStageGridCamera == camera)
+    let waited = session.handle(request(
+        .waitFence,
+        id: 4,
         resourceID: submitted.header.resourceID
     )).response
     #expect(try waited.payload.readLittleEndian(at: 0) as UInt32 == 1)

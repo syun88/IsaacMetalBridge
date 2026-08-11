@@ -4,6 +4,7 @@ public enum SPIRVCrossCompilerError: Error, CustomStringConvertible {
     case executableUnavailable(String)
     case processFailed(status: Int32, diagnostic: String)
     case invalidUTF8
+    case unsupportedSerializedAtomic64(String)
 
     public var description: String {
         switch self {
@@ -13,6 +14,8 @@ public enum SPIRVCrossCompilerError: Error, CustomStringConvertible {
             "SPIRV-Cross exited with status \(status): \(diagnostic)"
         case .invalidUTF8:
             "SPIRV-Cross produced non-UTF-8 MSL"
+        case .unsupportedSerializedAtomic64(let diagnostic):
+            "serialized 64-bit atomic lowering is unavailable: \(diagnostic)"
         }
     }
 }
@@ -24,6 +27,9 @@ struct SPIRVDescriptorBinding: Hashable, Sendable {
 
 struct MetalArgumentBindingMap: Sendable {
     let indicesByVulkanBinding: [SPIRVDescriptorBinding: [Int]]
+    let directBufferIndicesByVulkanBinding: [SPIRVDescriptorBinding: [Int]]
+    let directTextureIndicesByVulkanBinding: [SPIRVDescriptorBinding: [Int]]
+    let directSamplerIndicesByVulkanBinding: [SPIRVDescriptorBinding: [Int]]
     let emittedFieldCount: Int
     let mappedFieldCount: Int
 }
@@ -98,7 +104,8 @@ public final class SPIRVCrossCompiler: @unchecked Sendable {
         guard let source = String(data: translated, encoding: .utf8) else {
             throw SPIRVCrossCompilerError.invalidUTF8
         }
-        return Self.addSoftwareFloat64SupportIfNeeded(to: source)
+        let withSoftwareFloat64 = Self.addSoftwareFloat64SupportIfNeeded(to: source)
+        return try Self.addSerializedAtomic64SupportIfNeeded(to: withSoftwareFloat64)
     }
 
     /// Correlates Vulkan descriptor set/binding decorations in SPIR-V with
@@ -114,6 +121,9 @@ public final class SPIRVCrossCompiler: @unchecked Sendable {
         guard spirv.count >= 20, spirv.count % MemoryLayout<UInt32>.size == 0 else {
             return MetalArgumentBindingMap(
                 indicesByVulkanBinding: [:],
+                directBufferIndicesByVulkanBinding: [:],
+                directTextureIndicesByVulkanBinding: [:],
+                directSamplerIndicesByVulkanBinding: [:],
                 emittedFieldCount: 0,
                 mappedFieldCount: 0
             )
@@ -131,6 +141,9 @@ public final class SPIRVCrossCompiler: @unchecked Sendable {
         guard words.first == 0x0723_0203 else {
             return MetalArgumentBindingMap(
                 indicesByVulkanBinding: [:],
+                directBufferIndicesByVulkanBinding: [:],
+                directTextureIndicesByVulkanBinding: [:],
+                directSamplerIndicesByVulkanBinding: [:],
                 emittedFieldCount: 0,
                 mappedFieldCount: 0
             )
@@ -195,6 +208,39 @@ public final class SPIRVCrossCompiler: @unchecked Sendable {
         var mappedFieldCount = 0
         var result: [SPIRVDescriptorBinding: Set<Int>] = [:]
 
+        func descriptorBindings(for fieldName: String, descriptorSet: UInt32?)
+            -> [SPIRVDescriptorBinding]
+        {
+            var matches = bindingsByName[fieldName] ?? []
+            if let descriptorSet {
+                matches = matches.filter { $0.descriptorSet == descriptorSet }
+            }
+            if matches.isEmpty {
+                // When a SPIR-V resource has only its generated numeric name
+                // (for example `_10` for result ID 10), SPIRV-Cross makes the
+                // MSL identifier legal by spelling it `m_10`.
+                let generatedIDText: Substring?
+                if fieldName.hasPrefix("m_") {
+                    generatedIDText = fieldName.dropFirst(2)
+                } else if fieldName.hasPrefix("_") {
+                    generatedIDText = fieldName.dropFirst()
+                } else {
+                    generatedIDText = nil
+                }
+                if let generatedIDText,
+                   let generatedID = UInt32(generatedIDText),
+                   let generatedSet = descriptorSets[generatedID],
+                   descriptorSet == nil || descriptorSet == generatedSet,
+                   let binding = bindings[generatedID] {
+                    matches = [SPIRVDescriptorBinding(
+                        descriptorSet: generatedSet,
+                        binding: binding
+                    )]
+                }
+            }
+            return matches
+        }
+
         for rawLine in source.split(separator: "\n", omittingEmptySubsequences: false) {
             let line = String(rawLine)
             let fullRange = NSRange(line.startIndex..<line.endIndex, in: line)
@@ -219,43 +265,233 @@ public final class SPIRVCrossCompiler: @unchecked Sendable {
             }
             emittedFieldCount += 1
             let fieldName = String(line[nameRange])
-            var matches = (bindingsByName[fieldName] ?? []).filter {
-                $0.descriptorSet == descriptorSet
-            }
-            if matches.isEmpty {
-                // When a SPIR-V resource has only its generated numeric name
-                // (for example `_10` for result ID 10), SPIRV-Cross makes the
-                // MSL identifier legal by spelling it `m_10`. Recover that
-                // exact result ID from the original decorations instead of
-                // dropping an otherwise valid argument-buffer field.
-                let generatedIDText: Substring?
-                if fieldName.hasPrefix("m_") {
-                    generatedIDText = fieldName.dropFirst(2)
-                } else if fieldName.hasPrefix("_") {
-                    generatedIDText = fieldName.dropFirst()
-                } else {
-                    generatedIDText = nil
-                }
-                if let generatedIDText,
-                   let generatedID = UInt32(generatedIDText),
-                   descriptorSets[generatedID] == descriptorSet,
-                   let binding = bindings[generatedID] {
-                    matches = [SPIRVDescriptorBinding(
-                        descriptorSet: descriptorSet,
-                        binding: binding
-                    )]
-                }
-            }
+            let matches = descriptorBindings(for: fieldName, descriptorSet: descriptorSet)
             guard matches.count == 1, let descriptorBinding = matches.first else { continue }
             mappedFieldCount += 1
             result[descriptorBinding, default: []].insert(metalIndex)
         }
 
+        // Metal supports only eight argument-buffer slots. SPIRV-Cross emits
+        // descriptors from higher Vulkan sets as direct kernel arguments and
+        // aliases overlapping storage-buffer types through one raw pointer.
+        // Track those direct buffer/texture/sampler indices alongside compact
+        // argument-buffer IDs so the backend can bind every active resource.
+        let kernelPattern = "kernel void imb_compute_main"
+        let directPattern = try? NSRegularExpression(
+            pattern: #"\b([A-Za-z_][A-Za-z0-9_]*)\s*\[\[(buffer|texture|sampler)\(([0-9]+)\)\]\]"#
+        )
+        let aliasPattern = try? NSRegularExpression(
+            pattern: #"^spvBufferAliasSet([0-9]+)Binding([0-9]+)$"#
+        )
+        var directBuffers: [SPIRVDescriptorBinding: Set<Int>] = [:]
+        var directTextures: [SPIRVDescriptorBinding: Set<Int>] = [:]
+        var directSamplers: [SPIRVDescriptorBinding: Set<Int>] = [:]
+        if let kernelStart = source.range(of: kernelPattern),
+           let bodyStart = source[kernelStart.lowerBound...].firstIndex(of: "{") {
+            let signature = String(source[kernelStart.lowerBound..<bodyStart])
+            let signatureRange = NSRange(signature.startIndex..<signature.endIndex, in: signature)
+            for match in directPattern?.matches(in: signature, range: signatureRange) ?? [] {
+                guard let nameRange = Range(match.range(at: 1), in: signature),
+                      let kindRange = Range(match.range(at: 2), in: signature),
+                      let indexRange = Range(match.range(at: 3), in: signature),
+                      let metalIndex = Int(signature[indexRange])
+                else {
+                    continue
+                }
+                let fieldName = String(signature[nameRange])
+                var matches = descriptorBindings(for: fieldName, descriptorSet: nil)
+                if matches.isEmpty,
+                   let aliasMatch = aliasPattern?.firstMatch(
+                       in: fieldName,
+                       range: NSRange(fieldName.startIndex..<fieldName.endIndex, in: fieldName)
+                   ),
+                   let setRange = Range(aliasMatch.range(at: 1), in: fieldName),
+                   let bindingRange = Range(aliasMatch.range(at: 2), in: fieldName),
+                   let descriptorSet = UInt32(fieldName[setRange]),
+                   let binding = UInt32(fieldName[bindingRange]) {
+                    matches = [SPIRVDescriptorBinding(
+                        descriptorSet: descriptorSet,
+                        binding: binding
+                    )]
+                }
+                // Descriptor-set argument buffers, push constants, builtins,
+                // and the bridge's hidden serial-grid constant deliberately
+                // have no original descriptor binding and are ignored here.
+                guard matches.count == 1, let descriptorBinding = matches.first else { continue }
+                emittedFieldCount += 1
+                mappedFieldCount += 1
+                switch String(signature[kindRange]) {
+                case "buffer":
+                    directBuffers[descriptorBinding, default: []].insert(metalIndex)
+                case "texture":
+                    directTextures[descriptorBinding, default: []].insert(metalIndex)
+                case "sampler":
+                    directSamplers[descriptorBinding, default: []].insert(metalIndex)
+                default:
+                    break
+                }
+            }
+        }
+
         return MetalArgumentBindingMap(
             indicesByVulkanBinding: result.mapValues { $0.sorted() },
+            directBufferIndicesByVulkanBinding: directBuffers.mapValues { $0.sorted() },
+            directTextureIndicesByVulkanBinding: directTextures.mapValues { $0.sorted() },
+            directSamplerIndicesByVulkanBinding: directSamplers.mapValues { $0.sorted() },
             emittedFieldCount: emittedFieldCount,
             mappedFieldCount: mappedFieldCount
         )
+    }
+
+    static let serializedAtomic64ExecutionMarker =
+        "// IMB_SERIALIZED_ATOMIC64_EXECUTION_REQUIRED=1\n"
+    static let serializedAtomic64GridBufferIndex = 30
+
+    /// Metal has no 64-bit integer atomics, including in MSL 4.0 on Apple M4.
+    /// A shader which uses only GlobalInvocationID and no threadgroup/subgroup
+    /// coordination can nevertheless preserve Vulkan compare-exchange exactly
+    /// by executing every logical invocation in a deterministic loop on one
+    /// Metal thread. The patched SPIRV-Cross emits the helper call below only
+    /// for 64-bit OpAtomicCompareExchange; all other 64-bit atomic operations
+    /// remain rejected.
+    static func addSerializedAtomic64SupportIfNeeded(to source: String) throws -> String {
+        guard source.contains("spvAtomicCompareExchange64(") else { return source }
+        guard !source.contains("thread_position_in_threadgroup"),
+              !source.contains("threadgroup_position_in_grid"),
+              !source.contains("simdgroup"),
+              !source.contains("threadgroup_barrier")
+        else {
+            throw SPIRVCrossCompilerError.unsupportedSerializedAtomic64(
+                "the shader uses threadgroup or subgroup execution state"
+            )
+        }
+        let marker = "using namespace metal;\n"
+        guard source.range(of: marker) != nil else {
+            throw SPIRVCrossCompilerError.unsupportedSerializedAtomic64(
+                "the Metal namespace marker is missing"
+            )
+        }
+        let kernelToken = source.contains("kernel void imb_compute_main")
+            ? "kernel void imb_compute_main"
+            : "kernel void main0"
+        guard let kernelStart = source.range(of: kernelToken),
+              let bodyStart = source[kernelStart.lowerBound...].firstIndex(of: "{")
+        else {
+            throw SPIRVCrossCompilerError.unsupportedSerializedAtomic64(
+                "the translated compute entry point is missing"
+            )
+        }
+        let signatureRange = kernelStart.lowerBound..<bodyStart
+        let signature = String(source[signatureRange])
+        let globalIDParameter = "uint3 gl_GlobalInvocationID [[thread_position_in_grid]]"
+        guard signature.components(separatedBy: globalIDParameter).count == 2 else {
+            throw SPIRVCrossCompilerError.unsupportedSerializedAtomic64(
+                "GlobalInvocationID is not a single uint3 kernel parameter"
+            )
+        }
+        let hiddenBufferAttribute = "[[buffer(\(serializedAtomic64GridBufferIndex))]]"
+        guard !signature.contains(hiddenBufferAttribute) else {
+            throw SPIRVCrossCompilerError.unsupportedSerializedAtomic64(
+                "Metal buffer index \(serializedAtomic64GridBufferIndex) is already occupied"
+            )
+        }
+
+        var depth = 0
+        var bodyEnd: String.Index?
+        for index in source.indices[bodyStart...] {
+            switch source[index] {
+            case "{": depth += 1
+            case "}":
+                depth -= 1
+                if depth == 0 {
+                    bodyEnd = index
+                    break
+                }
+            default: break
+            }
+            if bodyEnd != nil { break }
+        }
+        guard bodyEnd != nil else {
+            throw SPIRVCrossCompilerError.unsupportedSerializedAtomic64(
+                "the translated compute body is unbalanced"
+            )
+        }
+
+        let replacementParameter = """
+        uint3 imbSerialThreadID [[thread_position_in_grid]], constant uint3& imbSerialGrid \(hiddenBufferAttribute)
+        """
+        var serialized = source.replacingOccurrences(
+            of: globalIDParameter,
+            with: replacementParameter,
+            range: signatureRange
+        )
+        // The replacement does not change any text before the opening brace,
+        // so reacquire the kernel braces in the updated String before insertion.
+        guard let updatedKernelStart = serialized.range(of: kernelToken),
+              let updatedBodyStart = serialized[updatedKernelStart.lowerBound...].firstIndex(of: "{")
+        else {
+            throw SPIRVCrossCompilerError.unsupportedSerializedAtomic64(
+                "the rewritten compute entry point is missing"
+            )
+        }
+        depth = 0
+        var updatedBodyEnd: String.Index?
+        for index in serialized.indices[updatedBodyStart...] {
+            switch serialized[index] {
+            case "{": depth += 1
+            case "}":
+                depth -= 1
+                if depth == 0 {
+                    updatedBodyEnd = index
+                    break
+                }
+            default: break
+            }
+            if updatedBodyEnd != nil { break }
+        }
+        guard let updatedBodyEnd else {
+            throw SPIRVCrossCompilerError.unsupportedSerializedAtomic64(
+                "the rewritten compute body is unbalanced"
+            )
+        }
+        let loopPrefix = """
+
+            if (any(imbSerialThreadID != uint3(0u)))
+                return;
+            for (uint imbSerialZ = 0u; imbSerialZ < imbSerialGrid.z; ++imbSerialZ)
+            for (uint imbSerialY = 0u; imbSerialY < imbSerialGrid.y; ++imbSerialY)
+            for (uint imbSerialX = 0u; imbSerialX < imbSerialGrid.x; ++imbSerialX)
+            {
+                const uint3 gl_GlobalInvocationID = uint3(imbSerialX, imbSerialY, imbSerialZ);
+        """
+        let loopSuffix = """
+            }
+
+        """
+        serialized.insert(contentsOf: loopSuffix, at: updatedBodyEnd)
+        serialized.insert(contentsOf: loopPrefix, at: serialized.index(after: updatedBodyStart))
+
+        let helper = """
+        \(serializedAtomic64ExecutionMarker)
+        inline ulong spvAtomicCompareExchange64(
+            device ulong* object,
+            ulong expected,
+            ulong desired)
+        {
+            const ulong observed = *object;
+            if (observed == expected)
+                *object = desired;
+            return observed;
+        }
+
+        """
+        guard let updatedMarkerRange = serialized.range(of: marker) else {
+            throw SPIRVCrossCompilerError.unsupportedSerializedAtomic64(
+                "the rewritten Metal namespace marker is missing"
+            )
+        }
+        serialized.insert(contentsOf: helper, at: updatedMarkerRange.upperBound)
+        return serialized
     }
 
     /// SPIR-V uses binary64 for several RTX world-position buffers, while

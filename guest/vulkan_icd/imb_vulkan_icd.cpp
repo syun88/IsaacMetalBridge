@@ -2123,9 +2123,12 @@ public:
         std::uint32_t height,
         std::uint32_t missRGBA8,
         std::uint32_t hitRGBA8,
-        const BridgeRayCamera* camera
+        const BridgeRayCamera* camera,
+        bool emptyStageGrid = false
     ) {
-        if (imageID == 0 || accelerationStructureID == 0 || width == 0 || height == 0) {
+        if (imageID == 0 || (!emptyStageGrid && accelerationStructureID == 0)
+            || (emptyStageGrid && accelerationStructureID != 0)
+            || width == 0 || height == 0) {
             throw std::runtime_error("invalid Metal ray dispatch request");
         }
         imb::Bytes payload;
@@ -2141,21 +2144,26 @@ public:
         std::uint32_t rayOptions = IMB_TRACE_RAYS_OPTION_NONE;
         if (camera != nullptr) {
             rayOptions |= static_cast<std::uint32_t>(IMB_TRACE_RAYS_OPTION_LIVE_CAMERA);
-            if (camera->hasSphereLight) {
+            if (!emptyStageGrid && camera->hasSphereLight) {
                 rayOptions |= static_cast<std::uint32_t>(
                     IMB_TRACE_RAYS_OPTION_LIVE_SPHERE_LIGHT
                 );
             }
-            if (camera->hasDistantLight) {
+            if (!emptyStageGrid && camera->hasDistantLight) {
                 rayOptions |= static_cast<std::uint32_t>(
                     IMB_TRACE_RAYS_OPTION_LIVE_DISTANT_LIGHT
                 );
             }
-            if (camera->hasDomeLight) {
+            if (!emptyStageGrid && camera->hasDomeLight) {
                 rayOptions |= static_cast<std::uint32_t>(
                     IMB_TRACE_RAYS_OPTION_LIVE_DOME_LIGHT
                 );
             }
+        }
+        if (emptyStageGrid) {
+            rayOptions |= static_cast<std::uint32_t>(
+                IMB_TRACE_RAYS_OPTION_EMPTY_STAGE_GRID
+            );
         }
         imb::appendLittleEndian(payload, rayOptions);
         imb::appendLittleEndian(payload, std::uint32_t{0});
@@ -2741,6 +2749,8 @@ struct DriverState {
     std::uint32_t latestMetalSceneWidth = 0;
     std::uint32_t latestMetalSceneHeight = 0;
     imb::Bytes latestMetalSceneRGBA8;
+    bool emptyStageGridLoggedWithoutCamera = false;
+    bool emptyStageGridLoggedWithCamera = false;
     VkDevice cameraSensorFrameDevice = VK_NULL_HANDLE;
     bool cameraSensorFrameAttempted = false;
     bool cameraSensorFramePublished = false;
@@ -2998,6 +3008,24 @@ bool validatedSoftwareFloat64MatrixShader(std::uint64_t hash) {
             // Camera/depth reconstruction with two independent samplers and
             // an FP64-transformed clipping-plane pixel.
             return true;
+        case 0x75cdce75f76c7184ULL:
+            // Splat-record generation variant whose binary64 camera origin
+            // changes four checked hierarchy counters through the exact-zero
+            // clipping decision and real storage-buffer array writes.
+            return true;
+        case 0x0a553b2a8825d0ffULL:
+            // Temporal-consistency variant with current-ray and four-neighbor
+            // binary64 clipping loops. Both loops update only local maximum
+            // ray lengths; the following reprojections use the original
+            // sampled depths. A two-origin 3x3 dispatch checks identical final
+            // consistency pixels after both loops complete.
+            return true;
+        case 0xd1b78c3914cb1874ULL:
+            // Depth-consistency variant whose two clipping loops consume the
+            // software-binary64 camera origin. Both clipped lengths are
+            // output-dead by construction; a signed-neighbor 3x3 dispatch
+            // checks unchanged depth plus completion after the second loop.
+            return true;
         case 0x75321ea922defdfcULL:
             // Panoramic depth reconstruction whose software-FP64 transform
             // writes a checked world-space position pixel.
@@ -3022,6 +3050,22 @@ bool validatedSoftwareFloat64MatrixShader(std::uint64_t hash) {
             // Volumetric integration variant whose binary64 camera origin
             // moves a real 3D noise lookup from a dark to a bright voxel and
             // writes a checked 3D storage-image pixel.
+            return true;
+        case 0xbdd2d21d53978c2eULL:
+            // Volume-composite variant whose binary64 camera origin changes
+            // the checked output from its scaled path to an exact clipping
+            // early return while a real 3D texture remains bound.
+            return true;
+        case 0xd38fa4ca78558061ULL:
+            // Render-output inspection variant whose mode-3 position path
+            // writes software-binary64 origin changes as checked RGBA8 color.
+            return true;
+        case 0xf72cb1589be7be96ULL:
+            // The final captured module uses two UInt64 compare-exchanges in
+            // its hash-table insertion path. Metal serializes its independent
+            // GlobalInvocationID-only workload on one thread; the exact
+            // captured shader inserts one checked key and increments its real
+            // insertion counter from zero to one on Apple M4.
             return true;
         default:
             return false;
@@ -3054,6 +3098,11 @@ bool scenePresentationEnabled() {
 
 bool sceneGridPresentationEnabled() {
     const char* value = std::getenv("IMB_VULKAN_SCENE_GRID");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+bool emptyStageGridPresentationEnabled() {
+    const char* value = std::getenv("IMB_VULKAN_EMPTY_STAGE_GRID");
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
@@ -3110,6 +3159,8 @@ std::uint32_t bridgeImageFormat(VkFormat format) {
         return IMB_IMAGE_FORMAT_RGBA16_UNORM;
     case VK_FORMAT_R8G8B8A8_UINT:
         return IMB_IMAGE_FORMAT_RGBA8_UINT;
+    case VK_FORMAT_R8G8B8A8_SNORM:
+        return IMB_IMAGE_FORMAT_RGBA8_SNORM;
     default:
         return 0;
     }
@@ -14648,7 +14699,9 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
         && gState.bridge != nullptr
         && (gState.bridge->capabilities().bits & IMB_CAP_METAL_RAY_DISPATCH) != 0) {
         const auto liveSceneHeader = readLiveSceneState(false);
-        if (!liveSceneHeader.has_value() || !liveSceneHeader->hasMeshManifest) {
+        if (emptyStageGridPresentationEnabled()
+            || !liveSceneHeader.has_value()
+            || !liveSceneHeader->hasMeshManifest) {
             // Full may start rendering while the stage extension is still
             // walking the real USD hierarchy and publishing its mesh
             // manifest. Rejecting that first known scene trace poisons Kit's
@@ -14693,43 +14746,44 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
             || (containsUnsupportedRayTracing && nullSceneRTXInitializationCandidate))
         && !initializationTraces.empty()) {
         std::unordered_set<ImageState*> clearedImages;
-        for (const auto* trace : initializationTraces) {
-            for (auto* set : trace->descriptorSets) {
-                if (set == nullptr || !gState.descriptorSets.contains(set)) continue;
-                for (const auto& [_, image] : set->storageImages) {
-                    if (image == nullptr || !gState.images.contains(image)
-                        || image->memory == nullptr
-                        || image->extent.width != trace->width
-                        || image->extent.height != trace->height
-                        || !clearedImages.insert(image).second) {
-                        continue;
-                    }
-                    auto* memory = image->memory;
-                    const VkResult backingResult = ensureMemoryBackingLocked(memory, false);
-                    if (backingResult != VK_SUCCESS) return backingResult;
-                    if (image->memoryOffset > memory->size
-                        || image->size > memory->size - image->memoryOffset) {
-                        return VK_ERROR_MEMORY_MAP_FAILED;
-                    }
-                    std::memset(
-                        memory->bytes.data() + static_cast<std::size_t>(image->memoryOffset),
-                        0,
-                        static_cast<std::size_t>(image->size)
-                    );
-                    const VkResult syncResult = syncMemoryToExternalFDLocked(
-                        memory,
-                        image->memoryOffset,
-                        image->size
-                    );
-                    if (syncResult != VK_SUCCESS) return syncResult;
-                    image->dirty = true;
-                }
-            }
-        }
         try {
             if (!gState.bridge
                 || (gState.bridge->capabilities().bits & IMB_CAP_NOOP_COMMAND) == 0) {
                 return VK_ERROR_FEATURE_NOT_PRESENT;
+            }
+            for (const auto* trace : initializationTraces) {
+                for (auto* set : trace->descriptorSets) {
+                    if (set == nullptr || !gState.descriptorSets.contains(set)) continue;
+                    for (const auto& [_, image] : set->storageImages) {
+                        if (image == nullptr || !gState.images.contains(image)
+                            || image->memory == nullptr
+                            || image->extent.width != trace->width
+                            || image->extent.height != trace->height
+                            || !clearedImages.insert(image).second) {
+                            continue;
+                        }
+                        auto* memory = image->memory;
+                        const VkResult backingResult = ensureMemoryBackingLocked(memory, false);
+                        if (backingResult != VK_SUCCESS) return backingResult;
+                        if (image->memoryOffset > memory->size
+                            || image->size > memory->size - image->memoryOffset) {
+                            return VK_ERROR_MEMORY_MAP_FAILED;
+                        }
+                        std::memset(
+                            memory->bytes.data()
+                                + static_cast<std::size_t>(image->memoryOffset),
+                            0,
+                            static_cast<std::size_t>(image->size)
+                        );
+                        const VkResult syncResult = syncMemoryToExternalFDLocked(
+                            memory,
+                            image->memoryOffset,
+                            image->size
+                        );
+                        if (syncResult != VK_SUCCESS) return syncResult;
+                        image->dirty = true;
+                    }
+                }
             }
             const std::uint64_t bridgeFence = gState.bridge->submitNoop();
             gState.bridge->waitFence(bridgeFence);
@@ -15384,11 +15438,70 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                     const std::uint64_t textureBytes =
                         static_cast<std::uint64_t>(draw.texture->extent.width)
                         * draw.texture->extent.height * 4;
-                    if (gState.latestMetalSceneDevice == device
+                    const bool isLargeViewportTexture =
+                        draw.scissor.extent.width >= 600
+                        && draw.scissor.extent.height >= 300
+                        // Kit's RGBA font/icon atlas can also be used by a
+                        // full-window draw, but it is a tall 1024x3240 image.
+                        // Only landscape render products are viewports.
+                        && static_cast<std::uint64_t>(draw.texture->extent.width) * 3
+                            >= static_cast<std::uint64_t>(draw.texture->extent.height) * 4;
+                    if (emptyStageGridPresentationEnabled()
+                        && isLargeViewportTexture
+                        && scenePresentationTextures.insert(draw.texture).second) {
+                        if (draw.texture->memoryOffset > draw.texture->memory->size
+                            || textureBytes > draw.texture->memory->size
+                                - draw.texture->memoryOffset) {
+                            return VK_ERROR_MEMORY_MAP_FAILED;
+                        }
+                        const std::optional<BridgeRayCamera> gridCamera =
+                            readLiveCameraState();
+                        const std::uint64_t gridFence = gState.bridge->submitRayTrace(
+                            draw.texture->resourceID,
+                            0,
+                            draw.texture->extent.width,
+                            draw.texture->extent.height,
+                            0,
+                            0,
+                            gridCamera.has_value() ? &*gridCamera : nullptr,
+                            true
+                        );
+                        gState.bridge->waitFence(gridFence);
+                        gState.bridge->readImage(
+                            draw.texture->resourceID,
+                            draw.texture->memory->bytes.data()
+                                + draw.texture->memoryOffset,
+                            textureBytes
+                        );
+                        const VkResult gridSyncResult = syncMemoryToExternalFDLocked(
+                            draw.texture->memory,
+                            draw.texture->memoryOffset,
+                            textureBytes
+                        );
+                        if (gridSyncResult != VK_SUCCESS) return gridSyncResult;
+                        draw.texture->dirty = true;
+                        bool& gridLogEmitted = gridCamera.has_value()
+                            ? gState.emptyStageGridLoggedWithCamera
+                            : gState.emptyStageGridLoggedWithoutCamera;
+                        if (!gridLogEmitted) {
+                            std::fprintf(
+                                stderr,
+                                "imb-vulkan-icd: rendered Metal empty-stage grid into Kit viewport image=%llu extent=%ux%u liveCamera=%d scissor=%d,%d %ux%u\n",
+                                static_cast<unsigned long long>(draw.texture->resourceID),
+                                draw.texture->extent.width,
+                                draw.texture->extent.height,
+                                gridCamera.has_value() ? 1 : 0,
+                                draw.scissor.offset.x,
+                                draw.scissor.offset.y,
+                                draw.scissor.extent.width,
+                                draw.scissor.extent.height
+                            );
+                            gridLogEmitted = true;
+                        }
+                    } else if (gState.latestMetalSceneDevice == device
                         && draw.texture->extent.width == gState.latestMetalSceneWidth
                         && draw.texture->extent.height == gState.latestMetalSceneHeight
-                        && draw.scissor.extent.width >= 600
-                        && draw.scissor.extent.height >= 300
+                        && isLargeViewportTexture
                         && gState.latestMetalSceneRGBA8.size() == textureBytes
                         && scenePresentationTextures.insert(draw.texture).second) {
                         if (draw.texture->memoryOffset > draw.texture->memory->size

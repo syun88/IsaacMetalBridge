@@ -3,7 +3,7 @@ import Foundation
 public enum IMBProtocol {
     public static let magic: UInt32 = 0x3142_4d49
     public static let major: UInt16 = 1
-    public static let minor: UInt16 = 14
+    public static let minor: UInt16 = 15
     public static let headerSize = 32
     public static let maxPayloadLength = 16 * 1024 * 1024
     public static let responseFlag: UInt16 = 1
@@ -51,6 +51,7 @@ public enum ErrorCode: UInt32, Sendable {
 
 public enum ComputePipelineFlag {
     public static let softwareFP64ExecutionRequired: UInt32 = 1 << 0
+    public static let serializedAtomic64ExecutionRequired: UInt32 = 1 << 1
 }
 
 public enum ImageOption {

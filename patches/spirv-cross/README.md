@@ -11,9 +11,12 @@ double3, double4, double4x4, numeric `lf` literals, and `PackDouble2x32` are
 covered, including the padded physical representation required by the real
 Isaac matrix shaders. The host marks whether the selected entry point actually
 uses software FP64; the Vulkan ICD enables declaration-only matrix modules and
-gates only the 13 true-use matrix pipelines until a real dispatch validates
-their outputs. Traced and untraced all-enabled Full Warehouse diagnostics
-reached the final Metal scene, but did not dispatch those 13 hashes. The one
-remaining real module uses 64-bit atomic compare-exchange, which Metal on Apple
-M4 does not provide and cannot be emulated correctly as two independent
-32-bit atomics.
+gates true-use pipelines until a real dispatch validates their outputs. All 14
+captured true-use fixtures now pass on Apple M4 and are enabled by default.
+
+`0002-msl-serialized-atomic64-cas.patch` emits a host-provided helper for
+64-bit compare-exchange. Metal on Apple M4 has no native 64-bit atomics, so the
+host enables this only for kernels without threadgroup/subgroup coordination
+and executes their logical invocations serially on one Metal thread. This is
+slower than the source Vulkan kernel but preserves compare, update, and
+returned-old-value semantics without an incorrect split 32-bit CAS.

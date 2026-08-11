@@ -1666,10 +1666,14 @@ class StartupStageExtension(omni.ext.IExt):
         )
         stage_url = os.environ.get("IMB_STARTUP_STAGE_URL", "")
         if not stage_url:
-            carb.log_error(
-                "isaacmetalbridge.stage: IMB_STARTUP_STAGE_URL is unset; "
-                "no startup stage will be opened"
+            carb.log_warn(
+                "isaacmetalbridge.stage: retaining Kit's normal empty stage; "
+                "no startup USD will be opened"
             )
+            if self._restore_full_layout:
+                self._task = asyncio.ensure_future(
+                    self._restore_default_full_layout()
+                )
             return
 
         if self._camera_state_path:

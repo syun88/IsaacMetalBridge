@@ -15,6 +15,10 @@ func floatArrayData(_ values: [Float]) -> Data {
     values.withUnsafeBytes { Data($0) }
 }
 
+func doubleArrayData(_ values: [Double]) -> Data {
+    values.withUnsafeBytes { Data($0) }
+}
+
 func packedFloatPair(_ low: Float, _ high: Float) -> UInt64 {
     UInt64(low.bitPattern) | (UInt64(high.bitPattern) << 32)
 }
@@ -1168,6 +1172,1051 @@ func executeIsaacFP64CompositeClipFixture(
     return pixel
 }
 
+/// Executes the captured volume-composite sibling through both sides of its
+/// clipping branch. With a zero binary64 origin the shader reaches its normal
+/// output path and halves the initialized magenta color. Changing only the
+/// binary64 y origin to 2 places the ray on plane -y+2=0, so the shader keeps
+/// the original pixel. The comparison proves that this exact shader executes
+/// its software-FP64 camera-origin arithmetic on Metal.
+func executeIsaacFP64VolumeCompositeFixture(
+    device: any MTLDevice,
+    translator: SPIRVCrossCompiler,
+    shader: URL
+) throws -> (baseline: [UInt8], clipped: [UInt8]) {
+    let expectedHash = "bdd2d21d53978c2e"
+    guard shader.deletingPathExtension().lastPathComponent == expectedHash else {
+        throw GPUBackendError.unsupported(
+            "the volume-composite FP64 dispatch fixture requires \(expectedHash).spv"
+        )
+    }
+
+    let backend = try MetalGPUBackend(device: device, spirvCompiler: translator)
+    let pipelineID: UInt64 = 1
+    let flags = try backend.createComputePipeline(
+        id: pipelineID,
+        spirv: Data(contentsOf: shader),
+        entryPoint: "main"
+    )
+    guard flags & ComputePipelineFlag.softwareFP64ExecutionRequired != 0 else {
+        throw GPUBackendError.commandFailed(
+            "captured volume-composite shader was not classified as software-FP64 execution"
+        )
+    }
+
+    struct BufferResource {
+        let id: UInt64
+        let size: UInt64
+        let descriptorSet: UInt32
+        let binding: UInt32
+        let kind: ComputeBindingKind
+        let format: UInt32
+    }
+    let buffers = [
+        BufferResource(id: 10, size: 4_036, descriptorSet: 3, binding: 0, kind: .bufferRead, format: 0),
+        BufferResource(id: 11, size: 704, descriptorSet: 4, binding: 0, kind: .bufferRead, format: 0),
+        BufferResource(id: 12, size: 96, descriptorSet: 7, binding: 0, kind: .bufferRead, format: 0),
+        BufferResource(id: 13, size: 32, descriptorSet: 6, binding: 0, kind: .bufferRead, format: 0),
+        BufferResource(id: 14, size: 256, descriptorSet: 3, binding: 11, kind: .texelBufferRead, format: 109),
+        BufferResource(id: 15, size: 256, descriptorSet: 3, binding: 12, kind: .texelBufferRead, format: 109),
+        BufferResource(id: 16, size: 256, descriptorSet: 3, binding: 13, kind: .texelBufferRead, format: 109),
+    ]
+    for buffer in buffers {
+        try backend.createBuffer(id: buffer.id, size: buffer.size, options: 0)
+    }
+
+    // Configure one panoramic camera tile. The generated MSL uses the common
+    // UBO's actual 3264-byte inverse-extent field for this shader; keeping the
+    // exact reflected offsets here catches layout regressions as well.
+    try backend.writeBuffer(
+        id: 10,
+        offset: 3_264,
+        data: scalarData(SIMD2<Float>(repeating: 1.0 / 16.0))
+    )
+    try backend.writeBuffer(id: 10, offset: 2_816, data: scalarData(Int32(7)))
+    try backend.writeBuffer(id: 10, offset: 2_888, data: scalarData(Float(0)))
+    try backend.writeBuffer(id: 10, offset: 2_892, data: scalarData(Float(1)))
+    try backend.writeBuffer(id: 10, offset: 2_912, data: scalarData(Float(2)))
+    try backend.writeBuffer(id: 10, offset: 2_916, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 10, offset: 2_920, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 10, offset: 2_960, data: scalarData(UInt32(16)))
+    try backend.writeBuffer(id: 10, offset: 3_272, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 10, offset: 3_276, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 10, offset: 3_368, data: scalarData(Float(2)))
+    try backend.writeBuffer(id: 10, offset: 3_648, data: scalarData(SIMD2<Float>(1, 1)))
+    try backend.writeBuffer(id: 10, offset: 3_728, data: scalarData(SIMD2<UInt32>(1, 1)))
+    try backend.writeBuffer(id: 10, offset: 3_744, data: scalarData(UInt32(1)))
+
+    let identity: [Float] = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    ]
+    try backend.writeBuffer(id: 10, offset: 672, data: floatArrayData(identity))
+    try backend.writeBuffer(
+        id: 10,
+        offset: 3_008,
+        data: scalarData(SIMD4<Float>(0, -1, 0, 2))
+    )
+
+    // The non-clipped path preserves alpha and applies inputScale*outputScale
+    // to RGB. Volume and atmospheric branches stay disabled, isolating the
+    // camera-origin clipping decision from unrelated material state.
+    try backend.writeBuffer(id: 13, offset: 0, data: scalarData(Float(0.5)))
+    try backend.writeBuffer(id: 13, offset: 4, data: scalarData(Float(1)))
+
+    struct ImageResource {
+        let id: UInt64
+        let descriptorSet: UInt32
+        let binding: UInt32
+        let width: UInt32
+        let height: UInt32
+        let depth: UInt32
+        let writable: Bool
+        let pixels: [UInt8]
+    }
+    let magenta = [UInt8](arrayLiteral: 255, 0, 255, 255)
+    let images = [
+        ImageResource(
+            id: 20, descriptorSet: 3, binding: 8,
+            width: 1, height: 1, depth: 1, writable: false,
+            pixels: [0, 0, 0, 0]
+        ),
+        ImageResource(
+            id: 21, descriptorSet: 7, binding: 19,
+            width: 16, height: 16, depth: 1, writable: false,
+            pixels: Array(repeating: UInt8(0), count: 16 * 16 * 4)
+        ),
+        ImageResource(
+            id: 22, descriptorSet: 7, binding: 20,
+            width: 16, height: 16, depth: 1, writable: true,
+            pixels: Array(repeating: magenta, count: 16 * 16).flatMap { $0 }
+        ),
+        ImageResource(
+            id: 23, descriptorSet: 7, binding: 17,
+            width: 1, height: 1, depth: 1, writable: false,
+            pixels: [0, 0, 0, 0]
+        ),
+    ]
+    for image in images {
+        let options: UInt32
+        if image.binding == 17 {
+            guard let encoded = ImageOption.encodedTexture3D(depth: image.depth) else {
+                throw GPUBackendError.outOfBounds
+            }
+            options = encoded
+        } else {
+            options = 0
+        }
+        try backend.createImage(
+            id: image.id,
+            width: image.width,
+            height: image.height,
+            format: 1,
+            options: options
+        )
+        try backend.writeImage(id: image.id, data: Data(image.pixels))
+    }
+
+    var bindings = buffers.map {
+        ComputeBinding(
+            descriptorSet: $0.descriptorSet,
+            binding: $0.binding,
+            arrayElement: 0,
+            kind: $0.kind,
+            format: $0.format,
+            resourceID: $0.id,
+            offset: 0,
+            length: $0.size
+        )
+    }
+    bindings.append(contentsOf: images.map {
+        ComputeBinding(
+            descriptorSet: $0.descriptorSet,
+            binding: $0.binding,
+            arrayElement: 0,
+            kind: $0.writable ? .textureReadWrite : .textureRead,
+            resourceID: $0.id,
+            offset: 0,
+            length: 0
+        )
+    })
+    let samplerOptions: UInt32 = 1 | 2 | 4 | (1 << 3) | (1 << 6) | (1 << 9)
+    bindings.append(ComputeBinding(
+        descriptorSet: 2,
+        binding: 7,
+        arrayElement: 0,
+        kind: .sampler,
+        format: samplerOptions,
+        resourceID: 0,
+        offset: packedFloatPair(0, 16),
+        length: packedFloatPair(0, 1)
+    ))
+
+    func dispatchAndRead(fenceID: UInt64) throws -> [UInt8] {
+        try backend.submitCompute(
+            pipelineID: pipelineID,
+            groupCountX: 1,
+            groupCountY: 1,
+            groupCountZ: 1,
+            bindings: bindings,
+            pushConstants: Data(),
+            fenceID: fenceID
+        )
+        guard try backend.waitFence(id: fenceID) else {
+            throw GPUBackendError.commandFailed(
+                "volume-composite FP64 fixture fence \(fenceID) was not signaled"
+            )
+        }
+        return Array([UInt8](try backend.readImage(id: 22)).prefix(4))
+    }
+
+    let baseline = try dispatchAndRead(fenceID: 99)
+    guard (127...128).contains(Int(baseline[0])), baseline[1] == 0,
+          (127...128).contains(Int(baseline[2])), baseline[3] == 255
+    else {
+        throw GPUBackendError.commandFailed(
+            "volume-composite baseline \(baseline) did not take the scaled output path"
+        )
+    }
+
+    // Change only the captured binary64 y component. As in the related final
+    // composite shader, rayOrigin.y / 2 + 2 lands exactly on -y+2=0.
+    try backend.writeBuffer(
+        id: 10,
+        offset: 2_840,
+        data: scalarData(Double(2).bitPattern)
+    )
+    try backend.writeImage(
+        id: 22,
+        data: Data(Array(repeating: magenta, count: 16 * 16).flatMap { $0 })
+    )
+    let clipped = try dispatchAndRead(fenceID: 100)
+    guard clipped == magenta else {
+        throw GPUBackendError.commandFailed(
+            "volume-composite clipped output \(clipped) did not preserve the source pixel"
+        )
+    }
+    return (baseline, clipped)
+}
+
+/// Executes both software-binary64 clipping sites in the captured RTX depth
+/// consistency shader. The first site clips the current ray and the second
+/// clips every valid four-neighbor ray. SPIRV-Cross's generated dataflow
+/// assigns both clipped distances back to local ray-length variables, but the
+/// subsequent reprojections deliberately use the original origin, direction,
+/// and input depth. Two dispatches change only the binary64 world origin and
+/// therefore must preserve both the depth image and the neighbor-completion
+/// marker. A signed-normalized validity image is required to reach the real
+/// neighbor path used by this shader.
+func executeIsaacFP64DepthConsistencyFixture(
+    device: any MTLDevice,
+    translator: SPIRVCrossCompiler,
+    shader: URL
+) throws -> (baselineDepth: [UInt8], shiftedDepth: [UInt8], neighborMarker: [UInt8]) {
+    let expectedHash = "d1b78c3914cb1874"
+    guard shader.deletingPathExtension().lastPathComponent == expectedHash else {
+        throw GPUBackendError.unsupported(
+            "the depth-consistency FP64 dispatch fixture requires \(expectedHash).spv"
+        )
+    }
+
+    let backend = try MetalGPUBackend(device: device, spirvCompiler: translator)
+    let pipelineID: UInt64 = 1
+    let flags = try backend.createComputePipeline(
+        id: pipelineID,
+        spirv: Data(contentsOf: shader),
+        entryPoint: "main"
+    )
+    guard flags & ComputePipelineFlag.softwareFP64ExecutionRequired != 0 else {
+        throw GPUBackendError.commandFailed(
+            "captured depth-consistency shader was not classified as software-FP64 execution"
+        )
+    }
+
+    struct BufferResource {
+        let id: UInt64
+        let size: UInt64
+        let descriptorSet: UInt32
+        let binding: UInt32
+        let kind: ComputeBindingKind
+        let format: UInt32
+    }
+    let buffers = [
+        BufferResource(id: 10, size: 1_200, descriptorSet: 0, binding: 0, kind: .bufferRead, format: 0),
+        BufferResource(id: 11, size: 4_036, descriptorSet: 1, binding: 0, kind: .bufferRead, format: 0),
+        BufferResource(id: 12, size: 256, descriptorSet: 1, binding: 11, kind: .texelBufferRead, format: 109),
+        BufferResource(id: 13, size: 256, descriptorSet: 1, binding: 12, kind: .texelBufferRead, format: 109),
+        BufferResource(id: 14, size: 256, descriptorSet: 1, binding: 13, kind: .texelBufferRead, format: 109),
+    ]
+    for buffer in buffers {
+        try backend.createBuffer(id: buffer.id, size: buffer.size, options: 0)
+    }
+
+    let extent = SIMD2<UInt32>(3, 3)
+    let inverseExtent = SIMD2<Float>(repeating: 1.0 / 3.0)
+    try backend.writeBuffer(id: 10, offset: 0, data: scalarData(extent))
+    let identity: [Float] = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    ]
+    // Reflected common-UBO offsets: panorama projection and ray transforms.
+    for offset: UInt64 in [608, 672] {
+        try backend.writeBuffer(id: 11, offset: offset, data: floatArrayData(identity))
+    }
+    try backend.writeBuffer(id: 11, offset: 2_784, data: scalarData(SIMD2<Float>(3, 3)))
+    try backend.writeBuffer(id: 11, offset: 2_792, data: scalarData(inverseExtent))
+    try backend.writeBuffer(id: 11, offset: 2_816, data: scalarData(Int32(7)))
+    try backend.writeBuffer(id: 11, offset: 2_888, data: scalarData(Float(0)))
+    try backend.writeBuffer(id: 11, offset: 2_892, data: scalarData(Float(1)))
+    try backend.writeBuffer(id: 11, offset: 2_912, data: scalarData(Float(2)))
+    try backend.writeBuffer(id: 11, offset: 2_916, data: scalarData(UInt32(3)))
+    try backend.writeBuffer(id: 11, offset: 2_920, data: scalarData(UInt32(3)))
+    try backend.writeBuffer(
+        id: 11,
+        offset: 3_008,
+        data: scalarData(SIMD4<Float>(0, -1, 0, 0))
+    )
+    try backend.writeBuffer(id: 11, offset: 3_264, data: scalarData(inverseExtent))
+    try backend.writeBuffer(id: 11, offset: 3_272, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 11, offset: 3_276, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 11, offset: 3_648, data: scalarData(SIMD2<Float>(1, 1)))
+    try backend.writeBuffer(id: 11, offset: 3_728, data: scalarData(SIMD2<UInt32>(1, 1)))
+    try backend.writeBuffer(id: 11, offset: 3_736, data: scalarData(UInt32(3)))
+    try backend.writeBuffer(id: 11, offset: 3_740, data: scalarData(UInt32(3)))
+    try backend.writeBuffer(id: 11, offset: 3_744, data: scalarData(UInt32(1)))
+
+    struct ImageResource {
+        let id: UInt64
+        let descriptorSet: UInt32
+        let binding: UInt32
+        let format: UInt32
+        let writable: Bool
+        let pixels: [UInt8]
+    }
+    let pixelCount = 9
+    let depthPixel = [UInt8](arrayLiteral: 128, 0, 0, 255)
+    let zeroPixel = [UInt8](arrayLiteral: 0, 0, 0, 0)
+    let neighborSeed = [UInt8](arrayLiteral: 64, 0, 0, 255)
+    // 0x81 is -127 in signed normalized RGBA8 and makes every valid neighbor
+    // enter the shader's second FP64 clipping/reprojection path.
+    let validNeighbor = [UInt8](arrayLiteral: 0x81, 0, 0, 0)
+    let images = [
+        ImageResource(id: 20, descriptorSet: 0, binding: 26, format: 1, writable: false, pixels: Array(repeating: depthPixel, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 21, descriptorSet: 0, binding: 6, format: 1, writable: false, pixels: Array(repeating: depthPixel, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 22, descriptorSet: 0, binding: 2, format: 1, writable: true, pixels: Array(repeating: zeroPixel, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 23, descriptorSet: 0, binding: 1, format: 1, writable: true, pixels: Array(repeating: neighborSeed, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 24, descriptorSet: 0, binding: 7, format: 9, writable: false, pixels: Array(repeating: validNeighbor, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 25, descriptorSet: 1, binding: 8, format: 1, writable: false, pixels: Array(repeating: zeroPixel, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 26, descriptorSet: 1, binding: 9, format: 1, writable: false, pixels: Array(repeating: zeroPixel, count: pixelCount).flatMap { $0 }),
+    ]
+    for image in images {
+        try backend.createImage(id: image.id, width: 3, height: 3, format: image.format, options: 0)
+        try backend.writeImage(id: image.id, data: Data(image.pixels))
+    }
+
+    var bindings = buffers.map {
+        ComputeBinding(
+            descriptorSet: $0.descriptorSet,
+            binding: $0.binding,
+            arrayElement: 0,
+            kind: $0.kind,
+            format: $0.format,
+            resourceID: $0.id,
+            offset: 0,
+            length: $0.size
+        )
+    }
+    bindings.append(contentsOf: images.map {
+        ComputeBinding(
+            descriptorSet: $0.descriptorSet,
+            binding: $0.binding,
+            arrayElement: 0,
+            kind: $0.writable ? .textureReadWrite : .textureRead,
+            resourceID: $0.id,
+            offset: 0,
+            length: 0
+        )
+    })
+    let samplerOptions: UInt32 = 1 | 2 | 4 | (1 << 3) | (1 << 6) | (1 << 9)
+    bindings.append(ComputeBinding(
+        descriptorSet: 2,
+        binding: 7,
+        arrayElement: 0,
+        kind: .sampler,
+        format: samplerOptions,
+        resourceID: 0,
+        offset: packedFloatPair(0, 16),
+        length: packedFloatPair(0, 1)
+    ))
+
+    func writeOriginY(_ value: Double) throws {
+        for (offset, component) in [(2_832, 0.0), (2_840, value), (2_848, 0.0)] {
+            try backend.writeBuffer(
+                id: 11,
+                offset: UInt64(offset),
+                data: scalarData(component.bitPattern)
+            )
+        }
+    }
+    func resetOutputs() throws {
+        try backend.writeImage(
+            id: 22,
+            data: Data(Array(repeating: zeroPixel, count: pixelCount).flatMap { $0 })
+        )
+        try backend.writeImage(
+            id: 23,
+            data: Data(Array(repeating: neighborSeed, count: pixelCount).flatMap { $0 })
+        )
+    }
+    func dispatchAndRead(fenceID: UInt64) throws -> (depth: [UInt8], marker: [UInt8]) {
+        try backend.submitCompute(
+            pipelineID: pipelineID,
+            groupCountX: 1,
+            groupCountY: 1,
+            groupCountZ: 1,
+            bindings: bindings,
+            pushConstants: Data(),
+            fenceID: fenceID
+        )
+        guard try backend.waitFence(id: fenceID) else {
+            throw GPUBackendError.commandFailed(
+                "depth-consistency FP64 fixture fence \(fenceID) was not signaled"
+            )
+        }
+        return (
+            [UInt8](try backend.readImage(id: 22)),
+            [UInt8](try backend.readImage(id: 23))
+        )
+    }
+
+    try resetOutputs()
+    try writeOriginY(-2)
+    let baseline = try dispatchAndRead(fenceID: 99)
+    try resetOutputs()
+    try writeOriginY(0)
+    let shifted = try dispatchAndRead(fenceID: 100)
+
+    let expectedDepth = Array(repeating: [UInt8](arrayLiteral: 128, 0, 0, 0), count: pixelCount).flatMap { $0 }
+    let expectedMarker = Array(repeating: [UInt8](arrayLiteral: 64, 0, 0, 0), count: pixelCount).flatMap { $0 }
+    guard baseline.depth == expectedDepth,
+          shifted.depth == expectedDepth,
+          baseline.marker == expectedMarker,
+          shifted.marker == expectedMarker
+    else {
+        throw GPUBackendError.commandFailed(
+            "depth-consistency outputs differed: baselineDepth=\(baseline.depth) "
+            + "shiftedDepth=\(shifted.depth) baselineMarker=\(baseline.marker) "
+            + "shiftedMarker=\(shifted.marker)"
+        )
+    }
+    return (baseline.depth, shifted.depth, shifted.marker)
+}
+
+/// Executes both software-binary64 clipping sites in the captured temporal
+/// consistency shader. Each site updates a local maximum ray length, while the
+/// immediately following reprojection uses the original sampled depth. The
+/// fixture changes only the binary64 camera origins used by those clipping
+/// sites and requires the final four-neighbor consistency result to remain
+/// identical after both loops have completed.
+func executeIsaacFP64TemporalConsistencyFixture(
+    device: any MTLDevice,
+    translator: SPIRVCrossCompiler,
+    shader: URL
+) throws -> (baseline: [UInt8], shifted: [UInt8]) {
+    let expectedHash = "0a553b2a8825d0ff"
+    guard shader.deletingPathExtension().lastPathComponent == expectedHash else {
+        throw GPUBackendError.unsupported(
+            "the temporal-consistency FP64 fixture requires \(expectedHash).spv"
+        )
+    }
+
+    let backend = try MetalGPUBackend(device: device, spirvCompiler: translator)
+    let pipelineID: UInt64 = 1
+    let flags = try backend.createComputePipeline(
+        id: pipelineID,
+        spirv: Data(contentsOf: shader),
+        entryPoint: "main"
+    )
+    guard flags & ComputePipelineFlag.softwareFP64ExecutionRequired != 0 else {
+        throw GPUBackendError.commandFailed(
+            "captured temporal-consistency shader was not classified as software-FP64 execution"
+        )
+    }
+
+    struct BufferResource {
+        let id: UInt64
+        let size: UInt64
+        let descriptorSet: UInt32
+        let binding: UInt32
+        let kind: ComputeBindingKind
+        let format: UInt32
+    }
+    let buffers = [
+        BufferResource(id: 10, size: 48, descriptorSet: 0, binding: 0, kind: .bufferRead, format: 0),
+        BufferResource(id: 11, size: 4_036, descriptorSet: 1, binding: 0, kind: .bufferRead, format: 0),
+        BufferResource(id: 12, size: 4_036, descriptorSet: 2, binding: 0, kind: .bufferRead, format: 0),
+        BufferResource(id: 13, size: 256, descriptorSet: 1, binding: 11, kind: .texelBufferRead, format: 109),
+        BufferResource(id: 14, size: 256, descriptorSet: 1, binding: 12, kind: .texelBufferRead, format: 109),
+        BufferResource(id: 15, size: 256, descriptorSet: 1, binding: 13, kind: .texelBufferRead, format: 109),
+        BufferResource(id: 16, size: 256, descriptorSet: 2, binding: 11, kind: .texelBufferRead, format: 109),
+        BufferResource(id: 17, size: 256, descriptorSet: 2, binding: 12, kind: .texelBufferRead, format: 109),
+        BufferResource(id: 18, size: 256, descriptorSet: 2, binding: 13, kind: .texelBufferRead, format: 109),
+    ]
+    for buffer in buffers {
+        try backend.createBuffer(id: buffer.id, size: buffer.size, options: 0)
+    }
+
+    // Enter the four-neighbor consistency path and make its completed result
+    // select the explicit blue diagnostic output.
+    try backend.writeBuffer(id: 10, offset: 0, data: scalarData(Float(10)))
+    try backend.writeBuffer(id: 10, offset: 4, data: scalarData(Float(2)))
+    try backend.writeBuffer(id: 10, offset: 8, data: scalarData(UInt32(1)))
+
+    let identity: [Float] = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    ]
+    let extent = SIMD2<UInt32>(3, 3)
+    let inverseExtent = SIMD2<Float>(repeating: 1.0 / 3.0)
+    for bufferID: UInt64 in [11, 12] {
+        // Reflected camera transform and panorama projection fields.
+        for offset: UInt64 in [608, 672] {
+            try backend.writeBuffer(id: bufferID, offset: offset, data: floatArrayData(identity))
+        }
+        try backend.writeBuffer(id: bufferID, offset: 2_784, data: scalarData(SIMD2<Float>(3, 3)))
+        try backend.writeBuffer(id: bufferID, offset: 2_792, data: scalarData(inverseExtent))
+        try backend.writeBuffer(id: bufferID, offset: 2_816, data: scalarData(Int32(7)))
+        try backend.writeBuffer(id: bufferID, offset: 2_888, data: scalarData(Float(0)))
+        try backend.writeBuffer(id: bufferID, offset: 2_892, data: scalarData(Float(1)))
+        try backend.writeBuffer(id: bufferID, offset: 2_912, data: scalarData(Float(2)))
+        try backend.writeBuffer(id: bufferID, offset: 2_916, data: scalarData(UInt32(3)))
+        try backend.writeBuffer(id: bufferID, offset: 2_920, data: scalarData(UInt32(3)))
+        try backend.writeBuffer(id: bufferID, offset: 2_960, data: scalarData(UInt32(3)))
+        try backend.writeBuffer(id: bufferID, offset: 2_964, data: scalarData(UInt32(3)))
+        try backend.writeBuffer(
+            id: bufferID,
+            offset: 3_008,
+            data: scalarData(SIMD4<Float>(0, 0, 1, 0))
+        )
+        try backend.writeBuffer(id: bufferID, offset: 3_272, data: scalarData(UInt32(1)))
+        try backend.writeBuffer(id: bufferID, offset: 3_276, data: scalarData(UInt32(1)))
+        try backend.writeBuffer(id: bufferID, offset: 3_648, data: scalarData(SIMD2<Float>(1, 1)))
+        try backend.writeBuffer(id: bufferID, offset: 3_728, data: scalarData(SIMD2<UInt32>(1, 1)))
+        try backend.writeBuffer(id: bufferID, offset: 3_736, data: scalarData(UInt32(3)))
+        try backend.writeBuffer(id: bufferID, offset: 3_740, data: scalarData(UInt32(3)))
+        try backend.writeBuffer(id: bufferID, offset: 3_744, data: scalarData(UInt32(1)))
+    }
+
+    struct ImageResource {
+        let id: UInt64
+        let descriptorSet: UInt32
+        let binding: UInt32
+        let format: UInt32
+        let writable: Bool
+        let pixels: [UInt8]
+    }
+    let pixelCount = 9
+    let depthPixel = [UInt8](arrayLiteral: 128, 0, 0, 255)
+    let zeroPixel = [UInt8](arrayLiteral: 0, 0, 0, 0)
+    let images = [
+        ImageResource(id: 20, descriptorSet: 0, binding: 7, format: 1, writable: true, pixels: Array(repeating: zeroPixel, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 21, descriptorSet: 0, binding: 1, format: 1, writable: false, pixels: Array(repeating: depthPixel, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 22, descriptorSet: 0, binding: 2, format: 1, writable: false, pixels: Array(repeating: zeroPixel, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 23, descriptorSet: 0, binding: 3, format: 8, writable: false, pixels: Array(repeating: zeroPixel, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 24, descriptorSet: 0, binding: 4, format: 1, writable: false, pixels: Array(repeating: depthPixel, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 25, descriptorSet: 0, binding: 6, format: 8, writable: false, pixels: Array(repeating: zeroPixel, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 26, descriptorSet: 0, binding: 5, format: 1, writable: false, pixels: Array(repeating: zeroPixel, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 27, descriptorSet: 1, binding: 8, format: 1, writable: false, pixels: Array(repeating: zeroPixel, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 28, descriptorSet: 2, binding: 8, format: 1, writable: false, pixels: Array(repeating: zeroPixel, count: pixelCount).flatMap { $0 }),
+        ImageResource(id: 29, descriptorSet: 2, binding: 9, format: 1, writable: false, pixels: Array(repeating: zeroPixel, count: pixelCount).flatMap { $0 }),
+    ]
+    for image in images {
+        try backend.createImage(id: image.id, width: extent.x, height: extent.y, format: image.format, options: 0)
+        try backend.writeImage(id: image.id, data: Data(image.pixels))
+    }
+
+    var bindings = buffers.map {
+        ComputeBinding(
+            descriptorSet: $0.descriptorSet,
+            binding: $0.binding,
+            arrayElement: 0,
+            kind: $0.kind,
+            format: $0.format,
+            resourceID: $0.id,
+            offset: 0,
+            length: $0.size
+        )
+    }
+    bindings.append(contentsOf: images.map {
+        ComputeBinding(
+            descriptorSet: $0.descriptorSet,
+            binding: $0.binding,
+            arrayElement: 0,
+            kind: $0.writable ? .textureReadWrite : .textureRead,
+            resourceID: $0.id,
+            offset: 0,
+            length: 0
+        )
+    })
+    let samplerOptions: UInt32 = 1 | 2 | 4 | (1 << 3) | (1 << 6) | (1 << 9)
+    for descriptorSet: UInt32 in [0, 3] {
+        bindings.append(ComputeBinding(
+            descriptorSet: descriptorSet,
+            binding: descriptorSet == 0 ? 8 : 7,
+            arrayElement: 0,
+            kind: .sampler,
+            format: samplerOptions,
+            resourceID: 0,
+            offset: packedFloatPair(0, 16),
+            length: packedFloatPair(0, 1)
+        ))
+    }
+
+    func writeOriginZ(_ value: Double) throws {
+        for bufferID: UInt64 in [11, 12] {
+            for (offset, component) in [(2_832, 0.0), (2_840, 0.0), (2_848, value)] {
+                try backend.writeBuffer(
+                    id: bufferID,
+                    offset: UInt64(offset),
+                    data: scalarData(component.bitPattern)
+                )
+            }
+        }
+    }
+    func dispatchAndRead(fenceID: UInt64) throws -> [UInt8] {
+        try backend.writeImage(
+            id: 20,
+            data: Data(Array(repeating: zeroPixel, count: pixelCount).flatMap { $0 })
+        )
+        try backend.submitCompute(
+            pipelineID: pipelineID,
+            groupCountX: 1,
+            groupCountY: 1,
+            groupCountZ: 1,
+            bindings: bindings,
+            pushConstants: Data(),
+            fenceID: fenceID
+        )
+        guard try backend.waitFence(id: fenceID) else {
+            throw GPUBackendError.commandFailed(
+                "temporal-consistency FP64 fixture fence \(fenceID) was not signaled"
+            )
+        }
+        return [UInt8](try backend.readImage(id: 20))
+    }
+
+    try writeOriginZ(-2)
+    let baseline = try dispatchAndRead(fenceID: 101)
+    try writeOriginZ(0)
+    let shifted = try dispatchAndRead(fenceID: 102)
+    let expected = Array(
+        repeating: [UInt8](arrayLiteral: 0, 0, 255, 255),
+        count: pixelCount
+    ).flatMap { $0 }
+    guard baseline == expected, shifted == expected else {
+        throw GPUBackendError.commandFailed(
+            "temporal-consistency outputs differed: baseline=\(baseline) shifted=\(shifted)"
+        )
+    }
+    return (baseline, shifted)
+}
+
+/// Executes the captured RTX splat-record generation shader and observes its
+/// software-binary64 camera-origin clipping through the shader's real storage
+/// buffer output. The baseline origin leaves every finite ray length nonzero;
+/// moving only origin.y onto the enabled clipping plane makes the upper
+/// panoramic rays take the exact-zero branch, reducing the four-level atomic
+/// record count produced by the same Metal dispatch.
+func executeIsaacFP64SplatRecordFixture(
+    device: any MTLDevice,
+    translator: SPIRVCrossCompiler,
+    shader: URL
+) throws -> (baseline: [UInt32], clipped: [UInt32]) {
+    let expectedHash = "75cdce75f76c7184"
+    guard shader.deletingPathExtension().lastPathComponent == expectedHash else {
+        throw GPUBackendError.unsupported(
+            "the splat-record FP64 dispatch fixture requires \(expectedHash).spv"
+        )
+    }
+
+    let backend = try MetalGPUBackend(device: device, spirvCompiler: translator)
+    let pipelineID: UInt64 = 1
+    let flags = try backend.createComputePipeline(
+        id: pipelineID,
+        spirv: Data(contentsOf: shader),
+        entryPoint: "main"
+    )
+    guard flags & ComputePipelineFlag.softwareFP64ExecutionRequired != 0 else {
+        throw GPUBackendError.commandFailed(
+            "captured splat-record shader was not classified as software-FP64 execution"
+        )
+    }
+
+    struct BufferResource {
+        let id: UInt64
+        let size: UInt64
+        let descriptorSet: UInt32
+        let binding: UInt32
+        let arrayElement: UInt32
+        let kind: ComputeBindingKind
+        let format: UInt32
+    }
+    let recordBufferSize: UInt64 = 65_536
+    let buffers = [
+        BufferResource(id: 10, size: 4_036, descriptorSet: 0, binding: 0, arrayElement: 0, kind: .bufferRead, format: 0),
+        BufferResource(id: 11, size: 48, descriptorSet: 2, binding: 0, arrayElement: 0, kind: .bufferRead, format: 0),
+        BufferResource(id: 12, size: 512, descriptorSet: 2, binding: 3, arrayElement: 0, kind: .bufferReadWrite, format: 0),
+        BufferResource(id: 13, size: recordBufferSize, descriptorSet: 2, binding: 2, arrayElement: 0, kind: .bufferReadWrite, format: 0),
+        BufferResource(id: 14, size: recordBufferSize, descriptorSet: 2, binding: 2, arrayElement: 1, kind: .bufferReadWrite, format: 0),
+        BufferResource(id: 15, size: recordBufferSize, descriptorSet: 2, binding: 2, arrayElement: 2, kind: .bufferReadWrite, format: 0),
+        BufferResource(id: 16, size: recordBufferSize, descriptorSet: 2, binding: 2, arrayElement: 3, kind: .bufferReadWrite, format: 0),
+        BufferResource(id: 17, size: 256, descriptorSet: 0, binding: 11, arrayElement: 0, kind: .texelBufferRead, format: 109),
+        BufferResource(id: 18, size: 256, descriptorSet: 0, binding: 12, arrayElement: 0, kind: .texelBufferRead, format: 109),
+        BufferResource(id: 19, size: 256, descriptorSet: 0, binding: 13, arrayElement: 0, kind: .texelBufferRead, format: 109),
+        BufferResource(id: 23, size: 16, descriptorSet: 3, binding: 0, arrayElement: 0, kind: .bufferRead, format: 0),
+    ]
+    for buffer in buffers {
+        try backend.createBuffer(id: buffer.id, size: buffer.size, options: 0)
+    }
+
+    let identity: [Float] = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    ]
+    // One 32x32 panorama and one camera record. The exact reflected matrix
+    // offsets are the camera-space and camera-to-world transforms used by this
+    // shader's non-mode-0 ray and circle-of-confusion calculations.
+    for offset: UInt64 in [608, 672] {
+        try backend.writeBuffer(id: 10, offset: offset, data: floatArrayData(identity))
+    }
+    try backend.writeBuffer(id: 10, offset: 2_792, data: scalarData(SIMD2<Float>(repeating: 1.0 / 32.0)))
+    try backend.writeBuffer(id: 10, offset: 2_816, data: scalarData(Int32(7)))
+    try backend.writeBuffer(id: 10, offset: 2_888, data: scalarData(Float(0)))
+    try backend.writeBuffer(id: 10, offset: 2_892, data: scalarData(Float(1)))
+    try backend.writeBuffer(id: 10, offset: 2_912, data: scalarData(Float(1)))
+    try backend.writeBuffer(id: 10, offset: 2_916, data: scalarData(UInt32(32)))
+    try backend.writeBuffer(id: 10, offset: 2_920, data: scalarData(UInt32(32)))
+    // The plane is -y=0. With origin.y=-2 the finite rays remain nonzero;
+    // origin.y=0 later puts the ray origin exactly on the plane.
+    try backend.writeBuffer(
+        id: 10,
+        offset: 3_008,
+        data: scalarData(SIMD4<Float>(0, -1, 0, 0))
+    )
+    try backend.writeBuffer(id: 10, offset: 3_264, data: scalarData(SIMD2<Float>(repeating: 1.0 / 32.0)))
+    try backend.writeBuffer(id: 10, offset: 3_272, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 10, offset: 3_276, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 10, offset: 3_648, data: scalarData(SIMD2<Float>(1, 1)))
+    try backend.writeBuffer(id: 10, offset: 3_728, data: scalarData(SIMD2<UInt32>(1, 1)))
+    try backend.writeBuffer(id: 10, offset: 3_736, data: scalarData(UInt32(32)))
+    try backend.writeBuffer(id: 10, offset: 3_740, data: scalarData(UInt32(32)))
+    try backend.writeBuffer(id: 10, offset: 3_744, data: scalarData(UInt32(1)))
+
+    // Force the shader down its per-sample record path. The optical constants
+    // deliberately make a 0.5 depth sample generate a magnitude above one,
+    // while very large hierarchy thresholds prevent coarser reductions from
+    // hiding the four individual FP64-controlled zero decisions.
+    try backend.writeBuffer(id: 11, offset: 0, data: scalarData(Float(128)))
+    try backend.writeBuffer(id: 11, offset: 4, data: scalarData(Float(2)))
+    for offset: UInt64 in [12, 16, 20] {
+        try backend.writeBuffer(id: 11, offset: offset, data: scalarData(Float(1_000_000)))
+    }
+    try backend.writeBuffer(id: 11, offset: 24, data: scalarData(Float(1)))
+    try backend.writeBuffer(id: 11, offset: 28, data: scalarData(Float(1)))
+    try backend.writeBuffer(id: 11, offset: 32, data: scalarData(Float(128)))
+    try backend.writeBuffer(id: 23, offset: 0, data: scalarData(SIMD2<Float>(repeating: 1.0 / 32.0)))
+    try backend.writeBuffer(id: 23, offset: 8, data: scalarData(SIMD2<UInt32>(32, 32)))
+
+    // Both sampled images use the actual 32x32 footprint accessed by the
+    // generated gather/read operations. RGBA8 normalized depth 128 is finite
+    // and the colored source makes any generated record data nontrivial.
+    try backend.createImage(id: 20, width: 1, height: 1, format: 1, options: 0)
+    try backend.writeImage(id: 20, data: Data([0, 0, 0, 0]))
+    try backend.createImage(id: 21, width: 32, height: 32, format: 1, options: 0)
+    try backend.writeImage(
+        id: 21,
+        data: Data(Array(repeating: [UInt8](arrayLiteral: 64, 128, 191, 255), count: 32 * 32).flatMap { $0 })
+    )
+    try backend.createImage(id: 22, width: 32, height: 32, format: 1, options: 0)
+    try backend.writeImage(
+        id: 22,
+        data: Data(Array(repeating: [UInt8](arrayLiteral: 128, 0, 0, 255), count: 32 * 32).flatMap { $0 })
+    )
+
+    var bindings = buffers.map {
+        ComputeBinding(
+            descriptorSet: $0.descriptorSet,
+            binding: $0.binding,
+            arrayElement: $0.arrayElement,
+            kind: $0.kind,
+            format: $0.format,
+            resourceID: $0.id,
+            offset: 0,
+            length: $0.size
+        )
+    }
+    bindings.append(contentsOf: [
+        ComputeBinding(descriptorSet: 0, binding: 8, arrayElement: 0, kind: .textureRead, resourceID: 20, offset: 0, length: 0),
+        ComputeBinding(descriptorSet: 2, binding: 1, arrayElement: 0, kind: .textureRead, resourceID: 21, offset: 0, length: 0),
+        ComputeBinding(descriptorSet: 3, binding: 1, arrayElement: 0, kind: .textureRead, resourceID: 22, offset: 0, length: 0),
+    ])
+    let samplerOptions: UInt32 = 1 | 2 | 4 | (1 << 3) | (1 << 6) | (1 << 9)
+    for descriptor: (UInt32, UInt32) in [(3, 2), (7, 7)] {
+        bindings.append(ComputeBinding(
+            descriptorSet: descriptor.0,
+            binding: descriptor.1,
+            arrayElement: 0,
+            kind: .sampler,
+            format: samplerOptions,
+            resourceID: 0,
+            offset: packedFloatPair(0, 16),
+            length: packedFloatPair(0, 1)
+        ))
+    }
+
+    func writeOriginY(_ value: Double) throws {
+        try backend.writeBuffer(id: 10, offset: 2_832, data: scalarData(Double(0).bitPattern))
+        try backend.writeBuffer(id: 10, offset: 2_840, data: scalarData(value.bitPattern))
+        try backend.writeBuffer(id: 10, offset: 2_848, data: scalarData(Double(0).bitPattern))
+    }
+    func clearOutputs() throws {
+        try backend.writeBuffer(id: 12, offset: 0, data: Data(repeating: 0, count: 512))
+        for id: UInt64 in 13...16 {
+            try backend.writeBuffer(
+                id: id,
+                offset: 0,
+                data: Data(repeating: 0, count: Int(recordBufferSize))
+            )
+        }
+    }
+    func dispatchAndRead(fenceID: UInt64) throws -> [UInt32] {
+        try backend.submitCompute(
+            pipelineID: pipelineID,
+            groupCountX: 1,
+            groupCountY: 1,
+            groupCountZ: 1,
+            bindings: bindings,
+            pushConstants: Data(),
+            fenceID: fenceID
+        )
+        guard try backend.waitFence(id: fenceID) else {
+            throw GPUBackendError.commandFailed(
+                "splat-record FP64 fixture fence \(fenceID) was not signaled"
+            )
+        }
+        let counterData = try backend.readBuffer(id: 12, offset: 0, length: 512)
+        return [4, 132, 260, 388].map { offset in
+            counterData.withUnsafeBytes {
+                $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self)
+            }
+        }
+    }
+
+    try clearOutputs()
+    try writeOriginY(-2)
+    let baseline = try dispatchAndRead(fenceID: 99)
+    try clearOutputs()
+    try writeOriginY(0)
+    let clipped = try dispatchAndRead(fenceID: 100)
+    let expectedBaseline: [UInt32] = [64, 32, 128, 800]
+    let expectedClipped: [UInt32] = [32, 32, 64, 384]
+    guard baseline == expectedBaseline, clipped == expectedClipped else {
+        throw GPUBackendError.commandFailed(
+            "splat-record FP64 counters differed: baseline=\(baseline) clipped=\(clipped)"
+        )
+    }
+    return (baseline, clipped)
+}
+
+/// Executes the captured render-output inspection shader through its mode-3
+/// position reconstruction path. The reconstructed local position is zero for
+/// the one-voxel fixture, so the shader's real software-binary64
+/// `origin + local / scale` operation is observable directly in the RGBA8
+/// output. Two dispatches that differ only in the dvec3 origin prove that this
+/// exact (large, production-captured) shader executes FP64-derived color on
+/// Metal rather than merely compiling it.
+func executeIsaacFP64RenderOutputFixture(
+    device: any MTLDevice,
+    translator: SPIRVCrossCompiler,
+    shader: URL
+) throws -> (baseline: [UInt8], shifted: [UInt8]) {
+    let expectedHash = "d38fa4ca78558061"
+    guard shader.deletingPathExtension().lastPathComponent == expectedHash else {
+        throw GPUBackendError.unsupported(
+            "the render-output FP64 dispatch fixture requires \(expectedHash).spv"
+        )
+    }
+
+    let backend = try MetalGPUBackend(device: device, spirvCompiler: translator)
+    let pipelineID: UInt64 = 1
+    let flags = try backend.createComputePipeline(
+        id: pipelineID,
+        spirv: Data(contentsOf: shader),
+        entryPoint: "main"
+    )
+    guard flags & ComputePipelineFlag.softwareFP64ExecutionRequired != 0 else {
+        throw GPUBackendError.commandFailed(
+            "captured render-output shader was not classified as software-FP64 execution"
+        )
+    }
+
+    struct BufferResource {
+        let id: UInt64
+        let size: UInt64
+        let descriptorSet: UInt32
+        let binding: UInt32
+        let kind: ComputeBindingKind
+        let format: UInt32
+    }
+    let buffers = [
+        BufferResource(id: 10, size: 496, descriptorSet: 0, binding: 0, kind: .bufferRead, format: 0),
+        BufferResource(id: 11, size: 80, descriptorSet: 2, binding: 0, kind: .bufferRead, format: 0),
+        BufferResource(id: 12, size: 4_036, descriptorSet: 3, binding: 0, kind: .bufferRead, format: 0),
+        BufferResource(id: 13, size: 256, descriptorSet: 3, binding: 11, kind: .texelBufferRead, format: 109),
+        BufferResource(id: 14, size: 256, descriptorSet: 3, binding: 12, kind: .texelBufferRead, format: 109),
+        BufferResource(id: 15, size: 256, descriptorSet: 3, binding: 13, kind: .texelBufferRead, format: 109),
+    ]
+    for buffer in buffers {
+        try backend.createBuffer(id: buffer.id, size: buffer.size, options: 0)
+    }
+
+    // One output pixel and one voxel select mode 3 (position reconstruction).
+    // A zero depth sample plus identity transforms reconstructs local (0,0,0).
+    try backend.writeBuffer(id: 11, offset: 0, data: scalarData(SIMD2<Float>(1, 1)))
+    try backend.writeBuffer(id: 11, offset: 8, data: scalarData(SIMD2<Float>(1, 1)))
+    try backend.writeBuffer(id: 11, offset: 16, data: scalarData(SIMD3<UInt32>(1, 1, 1)))
+    try backend.writeBuffer(id: 11, offset: 28, data: scalarData(Float(1)))
+    try backend.writeBuffer(id: 11, offset: 32, data: scalarData(Float(1)))
+    try backend.writeBuffer(id: 11, offset: 60, data: scalarData(Int32(3)))
+
+    let identity: [Float] = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    ]
+    // Reflected nested camera transforms used by both halves of the mode-0
+    // depth/position conversion. Keeping the real offsets checks ABI layout.
+    for offset: UInt64 in [336, 864, 928] {
+        try backend.writeBuffer(id: 12, offset: offset, data: floatArrayData(identity))
+    }
+    try backend.writeBuffer(id: 12, offset: 2_816, data: scalarData(Int32(0)))
+    try backend.writeBuffer(id: 12, offset: 2_912, data: scalarData(Float(1)))
+    try backend.writeBuffer(id: 12, offset: 2_916, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 12, offset: 2_920, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 12, offset: 3_264, data: scalarData(SIMD2<Float>(1, 1)))
+    try backend.writeBuffer(id: 12, offset: 3_728, data: scalarData(SIMD2<UInt32>(1, 1)))
+    try backend.writeBuffer(id: 12, offset: 3_744, data: scalarData(UInt32(1)))
+
+    struct ImageResource {
+        let id: UInt64
+        let descriptorSet: UInt32
+        let binding: UInt32
+        let is3D: Bool
+        let writable: Bool
+    }
+    let images = [
+        ImageResource(id: 20, descriptorSet: 0, binding: 3, is3D: true, writable: false),
+        ImageResource(id: 21, descriptorSet: 0, binding: 2, is3D: true, writable: false),
+        ImageResource(id: 22, descriptorSet: 1, binding: 2, is3D: true, writable: false),
+        ImageResource(id: 23, descriptorSet: 2, binding: 1, is3D: false, writable: false),
+        ImageResource(id: 24, descriptorSet: 3, binding: 8, is3D: false, writable: false),
+        ImageResource(id: 25, descriptorSet: 3, binding: 9, is3D: false, writable: false),
+        ImageResource(id: 26, descriptorSet: 3, binding: 1, is3D: false, writable: true),
+    ]
+    for image in images {
+        let options: UInt32
+        if image.is3D {
+            guard let encoded = ImageOption.encodedTexture3D(depth: 1) else {
+                throw GPUBackendError.outOfBounds
+            }
+            options = encoded
+        } else {
+            options = 0
+        }
+        try backend.createImage(id: image.id, width: 1, height: 1, format: 1, options: options)
+        try backend.writeImage(id: image.id, data: Data([0, 0, 0, image.writable ? 255 : 0]))
+    }
+
+    var bindings = buffers.map {
+        ComputeBinding(
+            descriptorSet: $0.descriptorSet,
+            binding: $0.binding,
+            arrayElement: 0,
+            kind: $0.kind,
+            format: $0.format,
+            resourceID: $0.id,
+            offset: 0,
+            length: $0.size
+        )
+    }
+    bindings.append(contentsOf: images.map {
+        ComputeBinding(
+            descriptorSet: $0.descriptorSet,
+            binding: $0.binding,
+            arrayElement: 0,
+            kind: $0.writable ? .textureReadWrite : .textureRead,
+            resourceID: $0.id,
+            offset: 0,
+            length: 0
+        )
+    })
+    let samplerOptions: UInt32 = 1 | 2 | 4 | (1 << 3) | (1 << 6) | (1 << 9)
+    for descriptor: (UInt32, UInt32) in [(0, 12), (4, 7)] {
+        bindings.append(ComputeBinding(
+            descriptorSet: descriptor.0,
+            binding: descriptor.1,
+            arrayElement: 0,
+            kind: .sampler,
+            format: samplerOptions,
+            resourceID: 0,
+            offset: packedFloatPair(0, 16),
+            length: packedFloatPair(0, 1)
+        ))
+    }
+
+    func writeOrigin(_ value: SIMD3<Double>) throws {
+        try backend.writeBuffer(id: 12, offset: 2_832, data: scalarData(value.x.bitPattern))
+        try backend.writeBuffer(id: 12, offset: 2_840, data: scalarData(value.y.bitPattern))
+        try backend.writeBuffer(id: 12, offset: 2_848, data: scalarData(value.z.bitPattern))
+    }
+    func dispatchAndRead(fenceID: UInt64) throws -> [UInt8] {
+        try backend.submitCompute(
+            pipelineID: pipelineID,
+            groupCountX: 1,
+            groupCountY: 1,
+            groupCountZ: 1,
+            bindings: bindings,
+            pushConstants: Data(),
+            fenceID: fenceID
+        )
+        guard try backend.waitFence(id: fenceID) else {
+            throw GPUBackendError.commandFailed(
+                "render-output FP64 fixture fence \(fenceID) was not signaled"
+            )
+        }
+        return Array([UInt8](try backend.readImage(id: 26)).prefix(4))
+    }
+
+    try writeOrigin(SIMD3<Double>(0.25, 0.5, 0.75))
+    let baseline = try dispatchAndRead(fenceID: 99)
+    try writeOrigin(SIMD3<Double>(0.75, 0.25, 0.5))
+    let shifted = try dispatchAndRead(fenceID: 100)
+    guard baseline != shifted else {
+        throw GPUBackendError.commandFailed(
+            "render-output FP64 origin did not affect output: \(baseline)"
+        )
+    }
+    return (baseline, shifted)
+}
+
 /// Executes the captured RTX volumetric integration shader with real 3D
 /// sampled and storage textures. A binary64 camera origin shifts every noise
 /// lookup into the bright half of a two-voxel volume; the resulting red
@@ -1415,6 +2464,250 @@ func executeIsaacFP64VolumeFixture(
     return pixel
 }
 
+/// Executes the captured Isaac shader which owns the final two UInt64
+/// compare-exchange instructions. Only pixel (0, 0) is in bounds; the bridge
+/// serializes the 16x16 logical workgroup on one Metal thread. A successful
+/// insertion changes one all-ones hash slot and increments the real counter.
+func executeIsaacAtomic64CASFixture(
+    device: any MTLDevice,
+    translator: SPIRVCrossCompiler,
+    shader: URL
+) throws -> (counter: UInt32, occupiedSlots: Int, insertedKey: UInt64) {
+    let expectedHash = "f72cb1589be7be96"
+    guard shader.deletingPathExtension().lastPathComponent == expectedHash else {
+        throw GPUBackendError.unsupported("the atomic64 fixture requires \(expectedHash).spv")
+    }
+
+    let backend = try MetalGPUBackend(device: device, spirvCompiler: translator)
+    let pipelineID: UInt64 = 1
+    let flags = try backend.createComputePipeline(
+        id: pipelineID,
+        spirv: Data(contentsOf: shader),
+        entryPoint: "main"
+    )
+    let expectedFlags = ComputePipelineFlag.softwareFP64ExecutionRequired
+        | ComputePipelineFlag.serializedAtomic64ExecutionRequired
+    guard flags & expectedFlags == expectedFlags else {
+        throw GPUBackendError.commandFailed(
+            "captured atomic shader flags \(flags) did not include software FP64 and serialized atomic64"
+        )
+    }
+
+    struct BufferResource {
+        let id: UInt64
+        let size: UInt64
+        let descriptorSet: UInt32
+        let binding: UInt32
+        let writable: Bool
+    }
+    let buffers: [BufferResource] = [
+        BufferResource(id: 100, size: 65_536, descriptorSet: 0, binding: 3, writable: false),
+        BufferResource(id: 101, size: 704, descriptorSet: 2, binding: 0, writable: false),
+        BufferResource(id: 102, size: 65_536, descriptorSet: 2, binding: 1, writable: false),
+        BufferResource(id: 103, size: 65_536, descriptorSet: 2, binding: 6, writable: false),
+        BufferResource(id: 104, size: 65_536, descriptorSet: 2, binding: 7, writable: false),
+        BufferResource(id: 105, size: 65_536, descriptorSet: 2, binding: 27, writable: false),
+        BufferResource(id: 106, size: 4_036, descriptorSet: 3, binding: 0, writable: false),
+        BufferResource(id: 107, size: 65_536, descriptorSet: 3, binding: 4, writable: true),
+        BufferResource(id: 108, size: 176, descriptorSet: 6, binding: 0, writable: false),
+        BufferResource(id: 109, size: 65_536, descriptorSet: 6, binding: 3, writable: true),
+        BufferResource(id: 110, size: 65_536, descriptorSet: 6, binding: 6, writable: true),
+        BufferResource(id: 111, size: 65_536, descriptorSet: 6, binding: 7, writable: true),
+        BufferResource(id: 112, size: 96, descriptorSet: 7, binding: 0, writable: false),
+        BufferResource(id: 113, size: 272, descriptorSet: 8, binding: 0, writable: false),
+        BufferResource(id: 114, size: 32, descriptorSet: 9, binding: 0, writable: false),
+        BufferResource(id: 115, size: 65_536, descriptorSet: 9, binding: 3, writable: true),
+        BufferResource(id: 116, size: 65_536, descriptorSet: 9, binding: 4, writable: true),
+        BufferResource(id: 117, size: 112, descriptorSet: 10, binding: 0, writable: false),
+        BufferResource(id: 118, size: 64, descriptorSet: 10, binding: 1, writable: true),
+        BufferResource(id: 119, size: 65_536, descriptorSet: 10, binding: 3, writable: true),
+        BufferResource(id: 120, size: 4, descriptorSet: 10, binding: 5, writable: true),
+    ]
+    for resource in buffers {
+        try backend.createBuffer(id: resource.id, size: resource.size, options: 0)
+    }
+
+    struct TexelResource {
+        let id: UInt64
+        let descriptorSet: UInt32
+        let binding: UInt32
+    }
+    let texels = [
+        TexelResource(id: 130, descriptorSet: 3, binding: 11),
+        TexelResource(id: 131, descriptorSet: 3, binding: 12),
+        TexelResource(id: 132, descriptorSet: 3, binding: 13),
+    ]
+    for texel in texels {
+        try backend.createBuffer(id: texel.id, size: 4_096, options: 0)
+    }
+
+    struct ImageResource {
+        let id: UInt64
+        let descriptorSet: UInt32
+        let binding: UInt32
+        let uintFormat: Bool
+        let writable: Bool
+        let texture3D: Bool
+    }
+    let images: [ImageResource] = [
+        ImageResource(id: 200, descriptorSet: 3, binding: 1, uintFormat: false, writable: true, texture3D: false),
+        ImageResource(id: 201, descriptorSet: 3, binding: 2, uintFormat: true, writable: false, texture3D: false),
+        ImageResource(id: 202, descriptorSet: 3, binding: 3, uintFormat: true, writable: false, texture3D: false),
+        ImageResource(id: 203, descriptorSet: 3, binding: 8, uintFormat: false, writable: false, texture3D: false),
+        ImageResource(id: 204, descriptorSet: 3, binding: 9, uintFormat: false, writable: false, texture3D: false),
+        ImageResource(id: 205, descriptorSet: 4, binding: 1, uintFormat: false, writable: false, texture3D: false),
+        ImageResource(id: 206, descriptorSet: 4, binding: 3, uintFormat: true, writable: false, texture3D: false),
+        ImageResource(id: 207, descriptorSet: 4, binding: 4, uintFormat: true, writable: false, texture3D: false),
+        ImageResource(id: 208, descriptorSet: 4, binding: 5, uintFormat: false, writable: false, texture3D: false),
+        ImageResource(id: 209, descriptorSet: 4, binding: 8, uintFormat: true, writable: false, texture3D: false),
+        ImageResource(id: 210, descriptorSet: 5, binding: 1, uintFormat: false, writable: false, texture3D: false),
+        ImageResource(id: 211, descriptorSet: 5, binding: 2, uintFormat: true, writable: false, texture3D: false),
+        ImageResource(id: 212, descriptorSet: 5, binding: 3, uintFormat: false, writable: false, texture3D: false),
+        ImageResource(id: 213, descriptorSet: 5, binding: 5, uintFormat: false, writable: false, texture3D: false),
+        ImageResource(id: 214, descriptorSet: 6, binding: 1, uintFormat: false, writable: false, texture3D: false),
+        ImageResource(id: 215, descriptorSet: 6, binding: 2, uintFormat: true, writable: false, texture3D: false),
+        ImageResource(id: 216, descriptorSet: 6, binding: 4, uintFormat: false, writable: false, texture3D: false),
+        ImageResource(id: 217, descriptorSet: 6, binding: 5, uintFormat: false, writable: true, texture3D: false),
+        ImageResource(id: 218, descriptorSet: 10, binding: 6, uintFormat: false, writable: true, texture3D: true),
+    ]
+    for image in images {
+        let options: UInt32 = image.texture3D
+            ? ImageOption.texture3D | (1 << ImageOption.depthShift)
+            : 0
+        try backend.createImage(
+            id: image.id,
+            width: 1,
+            height: 1,
+            format: image.uintFormat ? 8 : 1,
+            options: options
+        )
+    }
+
+    // One pixel is active. Identity transforms and unit scales keep case 7's
+    // captured key construction finite and deterministic.
+    try backend.writeBuffer(id: 106, offset: 2_960, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 106, offset: 2_964, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 106, offset: 2_916, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 106, offset: 2_920, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 106, offset: 2_928, data: scalarData(SIMD4<Float>(0, 0, 0, 1)))
+    try backend.writeBuffer(id: 106, offset: 3_728, data: scalarData(SIMD2<UInt32>(1, 1)))
+    try backend.writeBuffer(id: 106, offset: 3_736, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 106, offset: 3_744, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 106, offset: 592, data: scalarData(SIMD3<Float>(0, 0, 1)))
+    let identityFloat: [Float] = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    ]
+    let identityDouble = identityFloat.map(Double.init)
+    try backend.writeBuffer(id: 106, offset: 0, data: doubleArrayData(identityDouble))
+    try backend.writeBuffer(id: 106, offset: 128, data: doubleArrayData(identityDouble))
+    for offset: UInt64 in [2_336, 2_400, 2_464, 2_528, 2_592, 2_656, 2_720] {
+        try backend.writeBuffer(id: 106, offset: offset, data: floatArrayData(identityFloat))
+    }
+    try backend.writeBuffer(id: 108, offset: 4, data: scalarData(UInt32(7)))
+    try backend.writeBuffer(id: 108, offset: 48, data: scalarData(SIMD2<Float>(1, 1)))
+    try backend.writeBuffer(id: 108, offset: 80, data: scalarData(SIMD2<Float>(0, 0)))
+    try backend.writeBuffer(id: 108, offset: 112, data: scalarData(Float(1)))
+
+    // Eight empty UInt64 slots. Offset 100 is the 64-bit multiplicative-hash
+    // shift (64 - log2(8)); case-7 enable and finite quantization constants
+    // select the insertion path.
+    try backend.writeBuffer(id: 117, offset: 0, data: scalarData(UInt32(8)))
+    try backend.writeBuffer(id: 117, offset: 32, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 117, offset: 36, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 117, offset: 44, data: scalarData(Float(1)))
+    try backend.writeBuffer(id: 117, offset: 48, data: scalarData(UInt32(1)))
+    try backend.writeBuffer(id: 117, offset: 76, data: scalarData(Float(1)))
+    try backend.writeBuffer(id: 117, offset: 100, data: scalarData(UInt32(61)))
+    try backend.writeBuffer(id: 118, offset: 0, data: Data(repeating: 0xff, count: 64))
+
+    var bindings = buffers.map {
+        ComputeBinding(
+            descriptorSet: $0.descriptorSet,
+            binding: $0.binding,
+            arrayElement: 0,
+            kind: $0.writable ? .bufferReadWrite : .bufferRead,
+            resourceID: $0.id,
+            offset: 0,
+            length: $0.size
+        )
+    }
+    bindings.append(contentsOf: texels.map {
+        ComputeBinding(
+            descriptorSet: $0.descriptorSet,
+            binding: $0.binding,
+            arrayElement: 0,
+            kind: .texelBufferRead,
+            format: 100,
+            resourceID: $0.id,
+            offset: 0,
+            length: 4_096
+        )
+    })
+    bindings.append(contentsOf: images.map {
+        ComputeBinding(
+            descriptorSet: $0.descriptorSet,
+            binding: $0.binding,
+            arrayElement: 0,
+            kind: $0.writable ? .textureReadWrite : .textureRead,
+            resourceID: $0.id,
+            offset: 0,
+            length: 0
+        )
+    })
+    let samplerOptions: UInt32 = 1 | 2 | 4 | (1 << 3) | (1 << 6) | (1 << 9)
+    for (descriptorSet, binding) in [
+        (UInt32(6), UInt32(8)),
+        (UInt32(6), UInt32(9)),
+        (UInt32(7), UInt32(7)),
+    ] {
+        bindings.append(ComputeBinding(
+            descriptorSet: descriptorSet,
+            binding: binding,
+            arrayElement: 0,
+            kind: .sampler,
+            format: samplerOptions,
+            resourceID: 0,
+            offset: packedFloatPair(0, 16),
+            length: packedFloatPair(0, 1)
+        ))
+    }
+
+    try backend.submitCompute(
+        pipelineID: pipelineID,
+        groupCountX: 1,
+        groupCountY: 1,
+        groupCountZ: 1,
+        bindings: bindings,
+        pushConstants: Data(),
+        fenceID: 103
+    )
+    guard try backend.waitFence(id: 103) else {
+        throw GPUBackendError.commandFailed("atomic64 fixture fence was not signaled")
+    }
+    let counter = try backend.readBuffer(id: 120, offset: 0, length: 4).withUnsafeBytes {
+        UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self))
+    }
+    let table = try backend.readBuffer(id: 118, offset: 0, length: 64)
+    let slots: [UInt64] = table.withUnsafeBytes { bytes in
+        (0..<8).map {
+            UInt64(littleEndian: bytes.loadUnaligned(
+                fromByteOffset: $0 * MemoryLayout<UInt64>.size,
+                as: UInt64.self
+            ))
+        }
+    }
+    let occupied = slots.filter { $0 != UInt64.max }
+    guard counter == 1, occupied.count == 1, let insertedKey = occupied.first else {
+        throw GPUBackendError.commandFailed(
+            "captured atomic64 insertion produced counter=\(counter) slots=\(slots)"
+        )
+    }
+    return (counter, occupied.count, insertedKey)
+}
+
 guard CommandLine.arguments.count == 3 || CommandLine.arguments.count == 4 else {
     FileHandle.standardError.write(
         Data("usage: imb-shader-probe SPIRV_CROSS SHADER_DIRECTORY [LIMIT]\n".utf8)
@@ -1584,6 +2877,70 @@ do {
             print(
                 "imb-shader-probe: actualMetalDispatch=passed shader=c93eebdfc4dd964b "
                 + "volumePixel=\(pixel)"
+            )
+        case "bdd2d21d53978c2e":
+            let output = try executeIsaacFP64VolumeCompositeFixture(
+                device: device,
+                translator: translator,
+                shader: shader
+            )
+            print(
+                "imb-shader-probe: actualMetalDispatch=passed shader=bdd2d21d53978c2e "
+                + "baselinePixel=\(output.baseline) clippedPixel=\(output.clipped)"
+            )
+        case "75cdce75f76c7184":
+            let output = try executeIsaacFP64SplatRecordFixture(
+                device: device,
+                translator: translator,
+                shader: shader
+            )
+            print(
+                "imb-shader-probe: actualMetalDispatch=passed shader=75cdce75f76c7184 "
+                + "baselineCounters=\(output.baseline) clippedCounters=\(output.clipped)"
+            )
+        case "d1b78c3914cb1874":
+            let output = try executeIsaacFP64DepthConsistencyFixture(
+                device: device,
+                translator: translator,
+                shader: shader
+            )
+            print(
+                "imb-shader-probe: actualMetalDispatch=passed shader=d1b78c3914cb1874 "
+                + "baselineDepth=\(output.baselineDepth) shiftedDepth=\(output.shiftedDepth) "
+                + "neighborMarker=\(output.neighborMarker)"
+            )
+        case "0a553b2a8825d0ff":
+            let output = try executeIsaacFP64TemporalConsistencyFixture(
+                device: device,
+                translator: translator,
+                shader: shader
+            )
+            print(
+                "imb-shader-probe: actualMetalDispatch=passed shader=0a553b2a8825d0ff "
+                + "baselinePixel=\(Array(output.baseline.prefix(4))) "
+                + "shiftedPixel=\(Array(output.shifted.prefix(4)))"
+            )
+        case "d38fa4ca78558061":
+            let output = try executeIsaacFP64RenderOutputFixture(
+                device: device,
+                translator: translator,
+                shader: shader
+            )
+            print(
+                "imb-shader-probe: actualMetalDispatch=passed shader=d38fa4ca78558061 "
+                + "baselinePixel=\(output.baseline) shiftedPixel=\(output.shifted)"
+            )
+        case "f72cb1589be7be96":
+            let output = try executeIsaacAtomic64CASFixture(
+                device: device,
+                translator: translator,
+                shader: shader
+            )
+            print(
+                "imb-shader-probe: actualMetalDispatch=passed shader=f72cb1589be7be96 "
+                + "serializedAtomic64=passed counter=\(output.counter) "
+                + "occupiedSlots=\(output.occupiedSlots) "
+                + "insertedKey=0x\(String(output.insertedKey, radix: 16))"
             )
         default:
             throw GPUBackendError.unsupported(

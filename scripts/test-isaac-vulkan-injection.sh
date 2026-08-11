@@ -96,8 +96,9 @@ if ! grep -F 'VULKAN_ICD discovered="IsaacMetalBridge (' "${guest_log}" >/dev/nu
     || ! grep -F 'VULKAN_COMPUTE input=[1,2,3,4] addend=5 output=[6,7,8,9] backend=Metal fence=signaled' "${guest_log}" >/dev/null \
     || ! grep -F 'VULKAN_TEXEL_BUFFER format=R32_UINT output=[8,9,10,11] whole_size_tail=passed explicit_tail=passed backend=Metal fence=signaled' "${guest_log}" >/dev/null \
     || ! grep -F 'executed Metal compute pipeline=' "${guest_log}" >/dev/null \
+    || ! grep -F 'VULKAN_IMAGE_SNORM format=RGBA8_SNORM extent=2x2 signed_bytes=passed buffer_to_image=passed image_to_buffer=passed' "${guest_log}" >/dev/null \
     || ! grep -F 'VULKAN_RASTER triangle=64x64 format=RGBA8' "${guest_log}" >/dev/null; then
-    echo "test-isaac-vulkan-injection: injected ICD did not complete Metal compute, texel-buffer, and raster" >&2
+    echo "test-isaac-vulkan-injection: injected ICD did not complete Metal compute, texel-buffer, RGBA8_SNORM transfer, and raster" >&2
     sed -n '1,240p' "${adapter_log}" >&2
     sed -n '1,240p' "${guest_log}" >&2
     exit 1
@@ -105,4 +106,4 @@ fi
 
 sed -n '1,40p' "${adapter_log}"
 grep -E '^(VULKAN_|imb-vulkan-icd: executed Metal compute pipeline=)' "${guest_log}"
-echo "test-isaac-vulkan-injection: real Isaac Sim ARM64 image completed Metal compute, texel-buffer, and raster"
+echo "test-isaac-vulkan-injection: real Isaac Sim ARM64 image completed Metal compute, texel-buffer, RGBA8_SNORM transfer, and raster"
