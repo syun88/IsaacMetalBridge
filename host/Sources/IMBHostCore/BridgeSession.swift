@@ -71,6 +71,8 @@ public final class BridgeSession: @unchecked Sendable {
             (blockWidth, blockHeight, blockBytes) = (1, 1, 2)
         case 5:
             (blockWidth, blockHeight, blockBytes) = (1, 1, 8)
+        case 11:
+            (blockWidth, blockHeight, blockBytes) = (1, 1, 16)
         default:
             return nil
         }
@@ -262,7 +264,7 @@ public final class BridgeSession: @unchecked Sendable {
                               height > 0,
                               width <= 16_384,
                               height <= 16_384,
-                              (format >= 1 && format <= 10),
+                              (format >= 1 && format <= 11),
                               mipLevels > 0,
                               mipLevels <= 32,
                               arrayLayers > 0,
@@ -1056,13 +1058,14 @@ public final class BridgeSession: @unchecked Sendable {
                 var additionalSphereLights: [RaySphereLight] = []
                 var additionalDistantLights: [RayDistantLight] = []
                 var additionalDomeLights: [RayDomeLight] = []
+                var additionalLightResourceIDs: Set<UInt64> = []
                 if options & 32 != 0 {
                     guard let lightCount: UInt32 = try? frame.payload.readLittleEndian(at: 168),
                           let lightReserved: UInt32 = try? frame.payload.readLittleEndian(at: 172),
                           lightCount > 0,
                           lightCount <= 16,
                           lightReserved == 0,
-                          frame.payload.count == 176 + Int(lightCount) * 120
+                          frame.payload.count == 176 + Int(lightCount) * 152
                     else {
                         return failure(
                             frame,
@@ -1071,7 +1074,7 @@ public final class BridgeSession: @unchecked Sendable {
                         )
                     }
                     for lightIndex in 0..<Int(lightCount) {
-                        let lightOffset = 176 + lightIndex * 120
+                        let lightOffset = 176 + lightIndex * 152
                         guard let kind: UInt32 = try? frame.payload.readLittleEndian(at: lightOffset),
                               let schema: UInt32 = try? frame.payload.readLittleEndian(at: lightOffset + 4),
                               let pathHash: UInt64 = try? frame.payload.readLittleEndian(at: lightOffset + 72),
@@ -1119,7 +1122,78 @@ public final class BridgeSession: @unchecked Sendable {
                                 "TRACE_RAYS additional light \(lightIndex) shaping data is invalid"
                             )
                         }
+                        guard let emissionTextureResourceID: UInt64 = try?
+                                frame.payload.readLittleEndian(at: lightOffset + 120),
+                              let iesTextureResourceID: UInt64 = try?
+                                frame.payload.readLittleEndian(at: lightOffset + 128),
+                              let iesAngleScaleBits: UInt32 = try?
+                                frame.payload.readLittleEndian(at: lightOffset + 136),
+                              let iesMultiplierBits: UInt32 = try?
+                                frame.payload.readLittleEndian(at: lightOffset + 140),
+                              let lightTextureFlags: UInt32 = try?
+                                frame.payload.readLittleEndian(at: lightOffset + 144),
+                              let lightTextureReserved: UInt32 = try?
+                                frame.payload.readLittleEndian(at: lightOffset + 148),
+                              lightTextureFlags & ~UInt32(7) == 0,
+                              lightTextureReserved == 0
+                        else {
+                            return failure(
+                                frame,
+                                .invalidPayload,
+                                "TRACE_RAYS additional light \(lightIndex) texture data is invalid"
+                            )
+                        }
+                        let iesAngleScale = Float(bitPattern: iesAngleScaleBits)
+                        let iesMultiplier = Float(bitPattern: iesMultiplierBits)
                         let hasShaping = shapingFlags & 1 != 0
+                        let hasEmissionTexture = lightTextureFlags & 1 != 0
+                        let hasIES = lightTextureFlags & 2 != 0
+                        let iesNormalized = lightTextureFlags & 4 != 0
+                        let validLightImage: (UInt64) -> Bool = { resourceID in
+                            guard let resource = self.resources[resourceID] else {
+                                return false
+                            }
+                            return resource.kind == 2
+                                && resource.options == 0
+                                && resource.format == 1
+                                && resource.width > 0
+                                && resource.height > 0
+                                && resource.width <= 512
+                                && resource.height <= 512
+                        }
+                        guard iesAngleScale.isFinite,
+                              iesMultiplier.isFinite,
+                              (hasEmissionTexture
+                                  ? emissionTextureResourceID != 0
+                                      && validLightImage(emissionTextureResourceID)
+                                  : emissionTextureResourceID == 0),
+                              (hasIES
+                                  ? iesTextureResourceID != 0
+                                      && validLightImage(iesTextureResourceID)
+                                      && hasShaping
+                                      && kind == 1
+                                      && iesMultiplier >= 0
+                                      && iesMultiplier <= 1_000_000
+                                  : iesTextureResourceID == 0
+                                      && iesAngleScale == 0
+                                      && iesMultiplier == 0
+                                      && !iesNormalized),
+                              !hasEmissionTexture || (kind == 1 && schema == 2)
+                        else {
+                            return failure(
+                                frame,
+                                .invalidPayload,
+                                "TRACE_RAYS additional light \(lightIndex) texture resources are invalid"
+                            )
+                        }
+                        if emissionTextureResourceID != 0 {
+                            additionalLightResourceIDs.insert(
+                                emissionTextureResourceID
+                            )
+                        }
+                        if iesTextureResourceID != 0 {
+                            additionalLightResourceIDs.insert(iesTextureResourceID)
+                        }
                         let shapingAxisLengthSquared = shapingValues[0] * shapingValues[0]
                             + shapingValues[1] * shapingValues[1]
                             + shapingValues[2] * shapingValues[2]
@@ -1164,7 +1238,15 @@ public final class BridgeSession: @unchecked Sendable {
                             let axisVLengthSquared = values[12] * values[12]
                                 + values[13] * values[13] + values[14] * values[14]
                             if schema == 1 {
-                                guard values[8...15].allSatisfy({ $0 == 0 }) else {
+                                let hasIESBasis = hasIES
+                                    && axisULengthSquared > 0.000_001
+                                    && axisVLengthSquared > 0.000_001
+                                    && values[11] == 0
+                                    && values[15] == 0
+                                let hasNoBasis = values[8...15].allSatisfy {
+                                    $0 == 0
+                                }
+                                guard hasIESBasis || (!hasIES && hasNoBasis) else {
                                     return failure(
                                         frame,
                                         .invalidPayload,
@@ -1216,7 +1298,12 @@ public final class BridgeSession: @unchecked Sendable {
                                 shapingFocusTint: SIMD3<Float>(
                                     shapingValues[6], shapingValues[7], shapingValues[8]
                                 ),
-                                hasShaping: hasShaping
+                                hasShaping: hasShaping,
+                                emissionTextureResourceID: emissionTextureResourceID,
+                                iesTextureResourceID: iesTextureResourceID,
+                                iesAngleScale: iesAngleScale,
+                                iesMultiplier: iesMultiplier,
+                                iesNormalized: iesNormalized
                             ))
                         case 2:
                             guard schema == 4,
@@ -1300,6 +1387,7 @@ public final class BridgeSession: @unchecked Sendable {
                         frame.header.resourceID,
                         accelerationStructureID,
                     ])
+                    commandResources.formUnion(additionalLightResourceIDs)
                 }
             case 5:
                 guard frame.payload.count >= 32,

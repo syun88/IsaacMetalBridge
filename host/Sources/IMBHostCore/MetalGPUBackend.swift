@@ -233,6 +233,13 @@ public struct RaySphereLight: Sendable, Equatable {
     public let shapingFocus: Float
     public let shapingFocusTint: SIMD3<Float>
     public let hasShaping: Bool
+    /// Optional ordinary RGBA8 image containing RectLight emitter color.
+    public let emissionTextureResourceID: UInt64
+    /// Optional linear RGBA8 angular lookup decoded from an LM-63 profile.
+    public let iesTextureResourceID: UInt64
+    public let iesAngleScale: Float
+    public let iesMultiplier: Float
+    public let iesNormalized: Bool
 
     public init(
         position: SIMD3<Float>,
@@ -249,7 +256,12 @@ public struct RaySphereLight: Sendable, Equatable {
         shapingConeSoftness: Float = 0,
         shapingFocus: Float = 0,
         shapingFocusTint: SIMD3<Float> = .zero,
-        hasShaping: Bool = false
+        hasShaping: Bool = false,
+        emissionTextureResourceID: UInt64 = 0,
+        iesTextureResourceID: UInt64 = 0,
+        iesAngleScale: Float = 0,
+        iesMultiplier: Float = 0,
+        iesNormalized: Bool = false
     ) {
         self.position = position
         self.color = color
@@ -266,6 +278,11 @@ public struct RaySphereLight: Sendable, Equatable {
         self.shapingFocus = shapingFocus
         self.shapingFocusTint = shapingFocusTint
         self.hasShaping = hasShaping
+        self.emissionTextureResourceID = emissionTextureResourceID
+        self.iesTextureResourceID = iesTextureResourceID
+        self.iesAngleScale = iesAngleScale
+        self.iesMultiplier = iesMultiplier
+        self.iesNormalized = iesNormalized
     }
 }
 
@@ -784,6 +801,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     {
         const uint4 runtimeCounts = uint4(rayRuntime[0]);
         const uint materialOpacityInstanceCount = runtimeCounts.x;
+        const uint rayTextureCount = runtimeCounts.y;
         const uint additionalSphereLightCount = (cameraOptions >> 8u) & 0xfu;
         const uint additionalDistantLightCount = (cameraOptions >> 12u) & 0xfu;
         const uint additionalDomeLightCount = (cameraOptions >> 16u) & 0xfu;
@@ -1180,48 +1198,54 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         sphereLightIndex < inlineSphereLightCount
                         ? sphereLightPositionAndIntensity
                         : rayRuntime[
-                            1u + additionalIndex * 8u
+                            1u + additionalIndex * 9u
                         ];
                     const float4 activeColorAndRadius =
                         sphereLightIndex < inlineSphereLightCount
                         ? sphereLightColorAndRadius
                         : rayRuntime[
-                            1u + additionalIndex * 8u + 1u
+                            1u + additionalIndex * 9u + 1u
                         ];
                     const float4 activeAxisUAndHalfExtent =
                         sphereLightIndex < inlineSphereLightCount
                         ? float4(0.0)
                         : rayRuntime[
-                            1u + additionalIndex * 8u + 2u
+                            1u + additionalIndex * 9u + 2u
                         ];
                     const float4 activeAxisVAndHalfExtent =
                         sphereLightIndex < inlineSphereLightCount
                         ? float4(0.0)
                         : rayRuntime[
-                            1u + additionalIndex * 8u + 3u
+                            1u + additionalIndex * 9u + 3u
                         ];
                     const uint activeShape = sphereLightIndex < inlineSphereLightCount
                         ? 1u
                         : uint(rayRuntime[
-                            1u + additionalIndex * 8u + 4u
+                            1u + additionalIndex * 9u + 4u
                         ].x);
                     const float4 activeShapingAxisAndCone =
                         sphereLightIndex < inlineSphereLightCount
                         ? float4(0.0)
                         : rayRuntime[
-                            1u + additionalIndex * 8u + 5u
+                            1u + additionalIndex * 9u + 5u
                         ];
                     const float4 activeShapingSoftnessFocusTintRG =
                         sphereLightIndex < inlineSphereLightCount
                         ? float4(0.0)
                         : rayRuntime[
-                            1u + additionalIndex * 8u + 6u
+                            1u + additionalIndex * 9u + 6u
                         ];
                     const float4 activeShapingTintBAndFlags =
                         sphereLightIndex < inlineSphereLightCount
                         ? float4(0.0)
                         : rayRuntime[
-                            1u + additionalIndex * 8u + 7u
+                            1u + additionalIndex * 9u + 7u
+                        ];
+                    const float4 activeTextureIndicesAndIES =
+                        sphereLightIndex < inlineSphereLightCount
+                        ? float4(-1.0, -1.0, 0.0, 0.0)
+                        : rayRuntime[
+                            1u + additionalIndex * 9u + 8u
                         ];
                     const bool hasShaping =
                         activeShapingTintBAndFlags.y > 0.5;
@@ -1241,6 +1265,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                          ++areaSampleIndex) {
                     float3 sampledLightPosition = activePositionAndIntensity.xyz;
                     float3 emitterNormal = float3(0.0, 0.0, 1.0);
+                    float2 emitterUV = float2(0.5);
                     if (isPlanarAreaLight) {
                         const float3 axisU = normalize(activeAxisUAndHalfExtent.xyz);
                         const float3 axisV = normalize(activeAxisVAndHalfExtent.xyz);
@@ -1251,6 +1276,12 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         sampledLightPosition +=
                             axisU * activeAxisUAndHalfExtent.w * signU * sampleScale
                             + axisV * activeAxisVAndHalfExtent.w * signV * sampleScale;
+                        // UsdLuxRectLight defines texture minimum coordinates
+                        // at local (+X,+Y) and maximum at (-X,-Y).
+                        emitterUV = float2(
+                            0.5 - signU * sampleScale * 0.5,
+                            0.5 - signV * sampleScale * 0.5
+                        );
                     } else if (isCylinderLight) {
                         const float3 axisU = normalize(activeAxisUAndHalfExtent.xyz);
                         const float3 axisV = normalize(activeAxisVAndHalfExtent.xyz);
@@ -1288,6 +1319,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                     const float3 lightDirection = toLight * rsqrt(lightDistanceSquared);
                     float shapingScalar = 1.0;
                     float3 focusColor = float3(1.0);
+                    float iesScalar = 1.0;
                     if (hasShaping) {
                         const float3 shapingAxis = normalize(
                             activeShapingAxisAndCone.xyz
@@ -1326,6 +1358,61 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                             float3(0.0)
                         );
                         focusColor = mix(focusTint, float3(1.0), focusFactor);
+                        const int iesTextureIndex = int(
+                            activeTextureIndicesAndIES.y
+                        );
+                        if (iesTextureIndex >= 0
+                            && uint(iesTextureIndex) < rayTextureCount) {
+                            float iesTheta = offAxisAngle;
+                            const float angleScale =
+                                activeTextureIndicesAndIES.z;
+                            if (angleScale > 0.0) {
+                                iesTheta /= angleScale;
+                            } else if (angleScale < 0.0) {
+                                iesTheta = (iesTheta - 3.14159265358979323846)
+                                    / -angleScale + 3.14159265358979323846;
+                            }
+                            if (iesTheta < 0.0
+                                || iesTheta > 3.14159265358979323846) {
+                                iesScalar = 0.0;
+                            } else {
+                                const float3 emissionDirection = -lightDirection;
+                                const float3 iesBasisU = normalize(
+                                    isCylinderLight
+                                    ? activeAxisVAndHalfExtent.xyz
+                                    : activeAxisUAndHalfExtent.xyz
+                                );
+                                const float3 iesBasisV = normalize(
+                                    isCylinderLight
+                                    ? cross(
+                                        activeAxisUAndHalfExtent.xyz,
+                                        activeAxisVAndHalfExtent.xyz
+                                    )
+                                    : activeAxisVAndHalfExtent.xyz
+                                );
+                                float iesPhi = atan2(
+                                    dot(emissionDirection, iesBasisV),
+                                    dot(emissionDirection, iesBasisU)
+                                );
+                                if (iesPhi < 0.0) {
+                                    iesPhi += 6.28318530717958647692;
+                                }
+                                constexpr sampler lightSampler(
+                                    coord::normalized,
+                                    address::clamp_to_edge,
+                                    filter::linear
+                                );
+                                iesScalar = materialTextures[
+                                    uint(iesTextureIndex)
+                                ].sample(
+                                    lightSampler,
+                                    float2(
+                                        iesPhi / 6.28318530717958647692,
+                                        iesTheta / 3.14159265358979323846
+                                    )
+                                ).r * max(activeTextureIndicesAndIES.w, 0.0);
+                            }
+                        }
                     }
                     // Rect/Disk emit along local -Z, while Cylinder emits
                     // outward from its curved surface. lightDirection points
@@ -1455,10 +1542,28 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         0.15,
                         2.5
                     );
+                    float3 emitterTextureColor = float3(1.0);
+                    const int emissionTextureIndex = int(
+                        activeTextureIndicesAndIES.x
+                    );
+                    if (activeShape == 2u
+                        && emissionTextureIndex >= 0
+                        && uint(emissionTextureIndex) < rayTextureCount) {
+                        constexpr sampler lightSampler(
+                            coord::normalized,
+                            address::clamp_to_edge,
+                            filter::linear
+                        );
+                        emitterTextureColor = imb_srgb_to_linear(
+                            materialTextures[uint(emissionTextureIndex)].sample(
+                                lightSampler, emitterUV
+                            ).rgb
+                        );
+                    }
                     const float3 lightColor = max(
                         activeColorAndRadius.xyz,
                         float3(0.0)
-                    ) * focusColor;
+                    ) * focusColor * emitterTextureColor * iesScalar;
                     const float sampleWeight = 1.0 / float(areaSampleCount);
                     const float diffuseResponse = isAreaLight
                         ? diffuse * visibility
@@ -1494,14 +1599,14 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         distantLightIndex < inlineDistantLightCount
                         ? distantLightDirectionAndIntensity
                         : rayRuntime[
-                            1u + additionalSphereLightCount * 8u
+                            1u + additionalSphereLightCount * 9u
                                 + additionalIndex * 2u
                         ];
                     const float4 activeColorAndAngle =
                         distantLightIndex < inlineDistantLightCount
                         ? distantLightColorAndAngle
                         : rayRuntime[
-                            1u + additionalSphereLightCount * 8u
+                            1u + additionalSphereLightCount * 9u
                                 + additionalIndex * 2u + 1u
                         ];
                     // USD DistantLight angle is the full angular diameter.
@@ -1685,7 +1790,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         domeLightIndex < inlineDomeLightCount
                         ? domeLightColorAndIntensity
                         : rayRuntime[
-                            1u + additionalSphereLightCount * 8u
+                            1u + additionalSphereLightCount * 9u
                                 + additionalDistantLightCount * 2u
                                 + domeLightIndex - inlineDomeLightCount
                         ];
@@ -2105,6 +2210,8 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 throw GPUBackendError.unsupported("Metal RGBA8_sRGB is unavailable")
             }
             return format
+        case 11:
+            return .rgba32Float
         default:
             throw GPUBackendError.unsupported("unsupported sparse image format \(format)")
         }
@@ -4075,6 +4182,34 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         else {
             throw GPUBackendError.unsupported("ray dispatch requires a built top-level acceleration structure")
         }
+        var rayTextureResourceIDs = Array(
+            acceleration.materialTextureResourceIDs.prefix(126)
+        )
+        var rayTextureIndices: [UInt64: UInt32] = [:]
+        for (index, resourceID) in rayTextureResourceIDs.enumerated() {
+            rayTextureIndices[resourceID] = UInt32(index)
+        }
+        for light in additionalSphereLights {
+            for resourceID in [
+                light.emissionTextureResourceID,
+                light.iesTextureResourceID,
+            ] where resourceID != 0 {
+                guard images[resourceID] != nil else {
+                    throw GPUBackendError.resourceNotFound(resourceID)
+                }
+                if rayTextureIndices[resourceID] == nil {
+                    guard rayTextureResourceIDs.count < 126 else {
+                        throw GPUBackendError.unsupported(
+                            "combined material and light textures exceed 126 Metal slots"
+                        )
+                    }
+                    rayTextureIndices[resourceID] = UInt32(
+                        rayTextureResourceIDs.count
+                    )
+                    rayTextureResourceIDs.append(resourceID)
+                }
+            }
+        }
         guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder()
         else {
@@ -4088,10 +4223,8 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         encoder.setTexture(sceneMaterialTexture, index: 1)
         for textureIndex in 0..<126 {
             let materialTexture: any MTLTexture
-            if textureIndex < acceleration.materialTextureResourceIDs.count,
-               let resource = images[
-                    acceleration.materialTextureResourceIDs[textureIndex]
-               ] {
+            if textureIndex < rayTextureResourceIDs.count,
+               let resource = images[rayTextureResourceIDs[textureIndex]] {
                 materialTexture = resource.texture
             } else {
                 materialTexture = whiteTexture
@@ -4243,6 +4376,18 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                     0,
                     0
                 ),
+                SIMD4<Float>(
+                    $0.emissionTextureResourceID == 0
+                        ? -1
+                        : Float(rayTextureIndices[
+                            $0.emissionTextureResourceID
+                        ]!),
+                    $0.iesTextureResourceID == 0
+                        ? -1
+                        : Float(rayTextureIndices[$0.iesTextureResourceID]!),
+                    $0.iesAngleScale,
+                    $0.iesMultiplier
+                ),
             ]
         }
         let additionalDistantLightRecords = additionalDistantLights.flatMap {
@@ -4258,7 +4403,6 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         let additionalDomeLightRecords = additionalDomeLights.map {
             SIMD4<Float>($0.color.x, $0.color.y, $0.color.z, $0.intensity)
         }
-        let additionalSphereLightCount = UInt32(additionalSphereLights.count)
         let additionalDistantLightCount = UInt32(additionalDistantLights.count)
         let additionalDomeLightCount = UInt32(additionalDomeLights.count)
         encoder.setBytes(&extent, length: MemoryLayout<SIMD2<UInt32>>.size, index: 1)
@@ -4463,10 +4607,10 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             materialOpacityInstanceCount = 0
         }
         var rayRuntime = Data()
-        rayRuntime.reserveCapacity(16 + 128 * MemoryLayout<SIMD4<Float>>.size)
+        rayRuntime.reserveCapacity(16 + 144 * MemoryLayout<SIMD4<Float>>.size)
         var runtimeCounts = SIMD4<Float>(
             Float(materialOpacityInstanceCount),
-            Float(additionalSphereLightCount),
+            Float(rayTextureResourceIDs.count),
             Float(additionalDistantLightCount),
             Float(additionalDomeLightCount)
         )
@@ -4480,7 +4624,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 rayRuntime.append(contentsOf: bytes)
             }
         }
-        let rayRuntimeSize = 16 + 128 * MemoryLayout<SIMD4<Float>>.size
+        let rayRuntimeSize = 16 + 144 * MemoryLayout<SIMD4<Float>>.size
         if rayRuntime.count < rayRuntimeSize {
             rayRuntime.append(Data(
                 repeating: 0,

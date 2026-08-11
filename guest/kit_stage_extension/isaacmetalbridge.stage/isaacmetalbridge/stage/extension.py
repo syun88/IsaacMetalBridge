@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 import functools
 import json
 import math
 import os
+import re
 import struct
 import time
 import zlib
@@ -20,11 +22,11 @@ from pxr import Gf, Tf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 
 _SCENE_HEADER = struct.Struct("<IHHQ32fQII")
-_SCENE_LIGHT_RECORD = struct.Struct("<II16fQ9fI")
+_SCENE_LIGHT_RECORD = struct.Struct("<II16fQ9fIQQffII")
 _SCENE_TEXTURE_RECORD = struct.Struct("<QIII")
 _SCENE_MESH_RECORD = struct.Struct("<QII26f28I")
 _SCENE_MAGIC = 0x31434D49
-_SCENE_VERSION = 18
+_SCENE_VERSION = 19
 _CAMERA_VALID_PERSPECTIVE = 1
 _SCENE_VALID_SPHERE_LIGHT = 2
 _SCENE_HAS_MESH_MANIFEST = 4
@@ -38,6 +40,9 @@ _SCENE_HAS_EMISSION = 512
 _SCENE_HAS_PARAMETER_TEXTURES = 1024
 _SCENE_HAS_NORMAL_TEXTURES = 2048
 _LIGHT_SHAPING_APPLIED = 1
+_LIGHT_TEXTURE_RECT_EMISSION = 1
+_LIGHT_TEXTURE_IES_PROFILE = 2
+_LIGHT_TEXTURE_IES_NORMALIZED = 4
 _MESH_HAS_BOUND_MATERIAL = 1
 _MESH_HAS_BASE_COLOR = 2
 _MESH_HAS_CONNECTED_BASE_COLOR = 4
@@ -57,10 +62,13 @@ _MAX_SCENE_TEXTURE_BYTES = 128 * 1024 * 1024
 _MAX_SCENE_TEXTURE_DIMENSION = 4096
 _MAX_SCENE_TEXTURE_TRANSPORT_DIMENSION = 512
 _MAX_SCENE_MATERIAL_TEXTURES = 126
+_MAX_SCENE_LIGHT_TEXTURES = 32
+_MAX_SCENE_LIGHT_TEXTURE_BYTES = 16 * 1024 * 1024
 _MAX_SCENE_POSITIONAL_LIGHTS = 8
 _MAX_SCENE_DISTANT_LIGHTS = 4
 _MAX_SCENE_DOME_LIGHTS = 4
 _NO_SCENE_TEXTURE = 0xFFFFFFFF
+_NO_SCENE_LIGHT_TEXTURE = 0xFFFFFFFFFFFFFFFF
 
 
 def _scene_flags(sphere_light_path, distant_light_path, dome_light_path):
@@ -423,7 +431,7 @@ def _nonnegative_scalar(value, maximum: float = 1_000_000.0) -> float | None:
 
 def _light_shaping_values(prim, world: Gf.Matrix4d, sample_time, schema_code: int):
     """Return the bounded Protocol shaping tail for an applied ShapingAPI."""
-    empty = ((0.0,) * 9, 0, "")
+    empty = ((0.0,) * 9, 0, "", 0.0, False)
     try:
         if not prim.HasAPI(UsdLux.ShapingAPI):
             return empty
@@ -443,10 +451,22 @@ def _light_shaping_values(prim, world: Gf.Matrix4d, sample_time, schema_code: in
             for index in range(3)
         )
         ies_value = shaping.GetShapingIesFileAttr().Get(sample_time)
+        ies_angle_scale = _finite_scalar(
+            shaping.GetShapingIesAngleScaleAttr().Get(sample_time), 0.0
+        )
+        ies_normalize = bool(
+            shaping.GetShapingIesNormalizeAttr().Get(sample_time) or False
+        )
     except Exception:
         return empty
 
-    scalar_values = (cone_angle, cone_softness, focus, *focus_tint)
+    scalar_values = (
+        cone_angle,
+        cone_softness,
+        focus,
+        *focus_tint,
+        ies_angle_scale,
+    )
     if not all(value is not None and math.isfinite(value) for value in scalar_values):
         return empty
 
@@ -469,10 +489,29 @@ def _light_shaping_values(prim, world: Gf.Matrix4d, sample_time, schema_code: in
         min(max(float(focus), 0.0), 1_000_000.0),
         *focus_tint,
     )
-    ies_path = getattr(ies_value, "path", "")
-    if not ies_path and ies_value is not None:
-        ies_path = str(ies_value)
-    return (values, _LIGHT_SHAPING_APPLIED, str(ies_path))
+    ies_path = _resolve_prim_asset_path(prim, ies_value)
+    return (
+        values,
+        _LIGHT_SHAPING_APPLIED,
+        ies_path,
+        min(max(float(ies_angle_scale), -1_000_000.0), 1_000_000.0),
+        ies_normalize,
+    )
+
+
+def _resolve_prim_asset_path(prim: Usd.Prim, asset_value) -> str:
+    """Resolve one SdfAssetPath relative to the stage root layer."""
+
+    try:
+        if not asset_value:
+            return ""
+        resolved = str(getattr(asset_value, "resolvedPath", "") or "")
+        authored = str(getattr(asset_value, "path", "") or "")
+        if not resolved and authored:
+            resolved = prim.GetStage().GetRootLayer().ComputeAbsolutePath(authored)
+        return resolved
+    except Exception:
+        return ""
 
 
 def _connected_texture_shader(shade_property, visited: set[tuple[str, str]]):
@@ -1197,6 +1236,200 @@ def _load_rgba_texture(path: str):
             if len(pixels) != rgba.width * rgba.height * 4:
                 return None
             return rgba.width, rgba.height, pixels
+    except Exception:
+        return None
+
+
+def _ies_axis_interval(values: tuple[float, ...], value: float):
+    """Return bounded interpolation indices and weight for a sorted axis."""
+
+    if not values:
+        return None
+    if len(values) == 1 or value <= values[0]:
+        return 0, 0, 0.0
+    if value >= values[-1]:
+        last = len(values) - 1
+        return last, last, 0.0
+    upper = bisect.bisect_right(values, value)
+    lower = upper - 1
+    span = values[upper] - values[lower]
+    if span <= 0.0:
+        return lower, lower, 0.0
+    return lower, upper, (value - values[lower]) / span
+
+
+def _ies_horizontal_angle(angle: float, angles: tuple[float, ...]) -> float:
+    """Apply the common LM-63 Type-C horizontal symmetry conventions."""
+
+    if len(angles) <= 1:
+        return angles[0] if angles else 0.0
+    angle = math.fmod(angle, 360.0)
+    if angle < 0.0:
+        angle += 360.0
+    maximum = angles[-1]
+    if maximum <= 90.0001:
+        quadrant = math.fmod(angle, 180.0)
+        return min(quadrant, 180.0 - quadrant)
+    if maximum <= 180.0001:
+        return angle if angle <= 180.0 else 360.0 - angle
+    return angle
+
+
+def _sample_ies_type_c(
+    vertical_angles: tuple[float, ...],
+    horizontal_angles: tuple[float, ...],
+    candela_rows: tuple[tuple[float, ...], ...],
+    theta_degrees: float,
+    phi_degrees: float,
+) -> float:
+    """Bilinearly sample a bounded LM-63 Type-C candela table."""
+
+    vertical = _ies_axis_interval(vertical_angles, theta_degrees)
+    horizontal_value = _ies_horizontal_angle(phi_degrees, horizontal_angles)
+    horizontal = _ies_axis_interval(horizontal_angles, horizontal_value)
+    if vertical is None or horizontal is None:
+        return 0.0
+    v0, v1, vertical_weight = vertical
+    h0, h1, horizontal_weight = horizontal
+    lower = candela_rows[h0][v0] + (
+        candela_rows[h0][v1] - candela_rows[h0][v0]
+    ) * vertical_weight
+    upper = candela_rows[h1][v0] + (
+        candela_rows[h1][v1] - candela_rows[h1][v0]
+    ) * vertical_weight
+    return max(lower + (upper - lower) * horizontal_weight, 0.0)
+
+
+@functools.lru_cache(maxsize=64)
+def _load_ies_profile(path: str, normalize: bool):
+    """Decode an LM-63 Type-C profile into a linear angular RGBA8 LUT.
+
+    The LUT stores candela divided by the profile maximum.  A separate finite
+    multiplier restores authored candela response, or applies the OpenUSD
+    energy-preserving normalization requested by shaping:ies:normalize.
+    """
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as source:
+            lines = source.read().replace("\r", "").split("\n")
+        tilt_index = next(
+            index
+            for index, line in enumerate(lines)
+            if line.strip().upper().startswith("TILT=")
+        )
+        tilt_mode = lines[tilt_index].split("=", 1)[1].strip().upper()
+        if tilt_mode not in ("NONE", "INCLUDE"):
+            return None
+        numeric_text = " ".join(lines[tilt_index + 1 :])
+        number_strings = re.findall(
+            r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][-+]?\d+)?",
+            numeric_text,
+        )
+        numbers = [float(value) for value in number_strings]
+        offset = 0
+        if tilt_mode == "INCLUDE":
+            if len(numbers) < 2:
+                return None
+            pair_count = int(numbers[1])
+            if pair_count < 0 or pair_count > 4096:
+                return None
+            offset = 2 + pair_count * 2
+        if len(numbers) < offset + 13:
+            return None
+        header = numbers[offset : offset + 13]
+        offset += 13
+        candela_multiplier = float(header[2])
+        vertical_count = int(header[3])
+        horizontal_count = int(header[4])
+        photometric_type = int(header[5])
+        if (
+            photometric_type != 1
+            or vertical_count <= 0
+            or horizontal_count <= 0
+            or vertical_count > 721
+            or horizontal_count > 721
+            or not math.isfinite(candela_multiplier)
+            or candela_multiplier <= 0.0
+        ):
+            return None
+        required = vertical_count + horizontal_count
+        required += vertical_count * horizontal_count
+        if len(numbers) < offset + required:
+            return None
+        vertical_angles = tuple(
+            float(value) for value in numbers[offset : offset + vertical_count]
+        )
+        offset += vertical_count
+        horizontal_angles = tuple(
+            float(value) for value in numbers[offset : offset + horizontal_count]
+        )
+        offset += horizontal_count
+        if (
+            not all(math.isfinite(value) for value in vertical_angles)
+            or not all(math.isfinite(value) for value in horizontal_angles)
+            or any(
+                vertical_angles[index] >= vertical_angles[index + 1]
+                for index in range(len(vertical_angles) - 1)
+            )
+            or any(
+                horizontal_angles[index] >= horizontal_angles[index + 1]
+                for index in range(len(horizontal_angles) - 1)
+            )
+        ):
+            return None
+        rows = []
+        maximum = 0.0
+        for horizontal_index in range(horizontal_count):
+            row = tuple(
+                max(float(value) * candela_multiplier, 0.0)
+                for value in numbers[
+                    offset
+                    + horizontal_index * vertical_count : offset
+                    + (horizontal_index + 1) * vertical_count
+                ]
+            )
+            if not all(math.isfinite(value) for value in row):
+                return None
+            maximum = max(maximum, max(row))
+            rows.append(row)
+        if maximum <= 0.0:
+            return None
+        candela_rows = tuple(rows)
+        width = 128
+        height = 64
+        sampled_values = []
+        integral = 0.0
+        theta_step = math.pi / height
+        phi_step = 2.0 * math.pi / width
+        for y in range(height):
+            theta = (y + 0.5) * theta_step
+            for x in range(width):
+                phi = (x + 0.5) * phi_step
+                sample = _sample_ies_type_c(
+                    vertical_angles,
+                    horizontal_angles,
+                    candela_rows,
+                    math.degrees(theta),
+                    math.degrees(phi),
+                )
+                sampled_values.append(sample)
+                integral += sample * math.sin(theta) * theta_step * phi_step
+        if not math.isfinite(integral) or integral <= 0.0:
+            return None
+        multiplier = (
+            maximum * 4.0 * math.pi / integral if normalize else maximum
+        )
+        if not math.isfinite(multiplier) or multiplier < 0.0:
+            return None
+        multiplier = min(multiplier, 1_000_000.0)
+        pixels = bytearray(width * height * 4)
+        for index, sample in enumerate(sampled_values):
+            encoded = int(round(min(max(sample / maximum, 0.0), 1.0) * 255.0))
+            pixel_offset = index * 4
+            pixels[pixel_offset : pixel_offset + 4] = bytes(
+                (encoded, encoded, encoded, 255)
+            )
+        return width, height, bytes(pixels), multiplier
     except Exception:
         return None
 
@@ -2082,6 +2315,7 @@ class StartupStageExtension(omni.ext.IExt):
                     + static_scene["dome_light_values"]
                     + (
                         static_scene["additional_light_payload"],
+                        static_scene["light_texture_payload"],
                         static_scene["mesh_payload"],
                     )
                 )
@@ -2104,6 +2338,7 @@ class StartupStageExtension(omni.ext.IExt):
                 )
                 payload += (
                     static_scene["additional_light_payload"]
+                    + static_scene["light_texture_payload"]
                     + static_scene["mesh_payload"]
                 )
                 temporary_path = f"{self._camera_state_path}.tmp.{os.getpid()}"
@@ -2693,7 +2928,33 @@ class StartupStageExtension(omni.ext.IExt):
                 mesh_paths.append(mesh_path)
 
             positional_lights = []
-            ignored_shaping_ies_paths = []
+            light_texture_indices = {}
+            light_textures = []
+            light_texture_bytes = 0
+            rejected_light_assets = []
+
+            def append_light_texture(key, decoded):
+                nonlocal light_texture_bytes
+                if key in light_texture_indices:
+                    return light_texture_indices[key]
+                if decoded is None or len(decoded) < 3:
+                    return _NO_SCENE_LIGHT_TEXTURE
+                width, height, pixels = decoded[:3]
+                if (
+                    len(light_textures) >= _MAX_SCENE_LIGHT_TEXTURES
+                    or width <= 0
+                    or height <= 0
+                    or len(pixels) != width * height * 4
+                    or light_texture_bytes + len(pixels)
+                    > _MAX_SCENE_LIGHT_TEXTURE_BYTES
+                ):
+                    return _NO_SCENE_LIGHT_TEXTURE
+                index = len(light_textures)
+                light_texture_indices[key] = index
+                light_textures.append((key, width, height, pixels))
+                light_texture_bytes += len(pixels)
+                return index
+
             for prim in _stage_prims(stage):
                 if len(positional_lights) >= _MAX_SCENE_POSITIONAL_LIGHTS:
                     break
@@ -2703,6 +2964,14 @@ class StartupStageExtension(omni.ext.IExt):
                     radius = light.GetRadiusAttr().Get(sample_time)
                     schema_name = "SphereLight"
                     schema_code = 1
+                    world_u = world.TransformDir(Gf.Vec3d(1.0, 0.0, 0.0))
+                    world_v = world.TransformDir(Gf.Vec3d(0.0, 1.0, 0.0))
+                    scale_u = math.sqrt(sum(float(value) ** 2 for value in world_u))
+                    scale_v = math.sqrt(sum(float(value) ** 2 for value in world_v))
+                    if scale_u <= 0.000001 or scale_v <= 0.000001:
+                        continue
+                    ies_axis_u = tuple(float(value) / scale_u for value in world_u)
+                    ies_axis_v = tuple(float(value) / scale_v for value in world_v)
                     axis_u = (0.0, 0.0, 0.0)
                     axis_v = (0.0, 0.0, 0.0)
                     half_extent_u = 0.0
@@ -2721,6 +2990,8 @@ class StartupStageExtension(omni.ext.IExt):
                         continue
                     axis_u = tuple(float(value) / scale_u for value in world_u)
                     axis_v = tuple(float(value) / scale_v for value in world_v)
+                    ies_axis_u = axis_u
+                    ies_axis_v = axis_v
                     half_extent_u = max(float(width), 0.0) * scale_u * 0.5
                     half_extent_v = max(float(height), 0.0) * scale_v * 0.5
                     radius = math.sqrt(
@@ -2741,6 +3012,8 @@ class StartupStageExtension(omni.ext.IExt):
                         continue
                     axis_u = tuple(float(value) / scale_u for value in world_u)
                     axis_v = tuple(float(value) / scale_v for value in world_v)
+                    ies_axis_u = axis_u
+                    ies_axis_v = axis_v
                     half_extent_u = max(float(radius or 0.0), 0.0) * scale_u
                     half_extent_v = max(float(radius or 0.0), 0.0) * scale_v
                     radius = math.sqrt(max(half_extent_u * half_extent_v, 0.0))
@@ -2767,6 +3040,13 @@ class StartupStageExtension(omni.ext.IExt):
                         continue
                     axis_u = tuple(float(value) / scale_u for value in world_u)
                     axis_v = tuple(float(value) / scale_v for value in world_v)
+                    ies_axis_u = axis_v
+                    ies_axis_v = tuple(
+                        float(value)
+                        for value in world.TransformDir(
+                            Gf.Vec3d(0.0, 0.0, 1.0)
+                        ).GetNormalized()
+                    )
                     half_extent_u = max(float(length), 0.0) * scale_u * 0.5
                     if bool(treat_as_line):
                         half_extent_v = 0.0
@@ -2814,16 +3094,73 @@ class StartupStageExtension(omni.ext.IExt):
                     axis_u[0], axis_u[1], axis_u[2], half_extent_u,
                     axis_v[0], axis_v[1], axis_v[2], half_extent_v,
                 )
-                shaping_values, shaping_flags, shaping_ies_path = (
+                (
+                    shaping_values,
+                    shaping_flags,
+                    shaping_ies_path,
+                    shaping_ies_angle_scale,
+                    shaping_ies_normalize,
+                ) = (
                     _light_shaping_values(
                         prim, world, sample_time, schema_code
                     )
                 )
                 if all(math.isfinite(value) for value in wire_values):
-                    if shaping_ies_path:
-                        ignored_shaping_ies_paths.append(
-                            (str(prim.GetPath()), shaping_ies_path)
+                    emission_texture_index = _NO_SCENE_LIGHT_TEXTURE
+                    ies_texture_index = _NO_SCENE_LIGHT_TEXTURE
+                    ies_multiplier = 0.0
+                    light_texture_flags = 0
+                    if schema_code == 2:
+                        try:
+                            texture_value = light.GetTextureFileAttr().Get(
+                                sample_time
+                            )
+                        except Exception:
+                            texture_value = None
+                        texture_path = _resolve_prim_asset_path(
+                            prim, texture_value
                         )
+                        if texture_path:
+                            emission_texture_index = append_light_texture(
+                                "rect:" + texture_path,
+                                _load_rgba_texture(texture_path),
+                            )
+                            if emission_texture_index != _NO_SCENE_LIGHT_TEXTURE:
+                                light_texture_flags |= _LIGHT_TEXTURE_RECT_EMISSION
+                            else:
+                                rejected_light_assets.append(
+                                    (str(prim.GetPath()), "RectLight texture", texture_path)
+                                )
+                    if shaping_ies_path:
+                        ies_profile = _load_ies_profile(
+                            shaping_ies_path, shaping_ies_normalize
+                        )
+                        ies_texture_index = append_light_texture(
+                            "ies:" + shaping_ies_path,
+                            ies_profile,
+                        )
+                        if (
+                            ies_texture_index != _NO_SCENE_LIGHT_TEXTURE
+                            and ies_profile is not None
+                        ):
+                            ies_multiplier = ies_profile[3]
+                            light_texture_flags |= _LIGHT_TEXTURE_IES_PROFILE
+                            if shaping_ies_normalize:
+                                light_texture_flags |= (
+                                    _LIGHT_TEXTURE_IES_NORMALIZED
+                                )
+                            if schema_code == 1:
+                                wire_values = (
+                                    *wire_values[:8],
+                                    *ies_axis_u,
+                                    0.0,
+                                    *ies_axis_v,
+                                    0.0,
+                                )
+                        else:
+                            rejected_light_assets.append(
+                                (str(prim.GetPath()), "ShapingAPI IES", shaping_ies_path)
+                            )
                     positional_lights.append(
                         (
                             schema_code,
@@ -2833,6 +3170,13 @@ class StartupStageExtension(omni.ext.IExt):
                             wire_values,
                             shaping_values,
                             shaping_flags,
+                            emission_texture_index,
+                            ies_texture_index,
+                            shaping_ies_angle_scale
+                            if light_texture_flags & _LIGHT_TEXTURE_IES_PROFILE
+                            else 0.0,
+                            ies_multiplier,
+                            light_texture_flags,
                         )
                     )
 
@@ -2918,10 +3262,10 @@ class StartupStageExtension(omni.ext.IExt):
             dome_light_values = dome_lights[0][3] if dome_lights else (0.0,) * 4
             dome_light_path = dome_lights[0][2] if dome_lights else ""
 
-            # Scene-state v18 publishes one complete list. The fixed first-light
+            # Scene-state v19 publishes one complete list. The fixed first-light
             # slots remain populated only so older state readers retain a stable
-            # header shape; the v18 ICD suppresses those legacy slots when it
-            # submits the rich list to Protocol 1.20.
+            # header shape; the v19 ICD suppresses those legacy slots when it
+            # submits the rich list to Protocol 1.21.
             additional_light_records = []
             additional_light_descriptions = []
             for (
@@ -2932,6 +3276,11 @@ class StartupStageExtension(omni.ext.IExt):
                 wire_values,
                 shaping_values,
                 shaping_flags,
+                emission_texture_index,
+                ies_texture_index,
+                ies_angle_scale,
+                ies_multiplier,
+                light_texture_flags,
             ) in positional_lights:
                 additional_light_records.append(
                     _SCENE_LIGHT_RECORD.pack(
@@ -2941,6 +3290,12 @@ class StartupStageExtension(omni.ext.IExt):
                         _fnv1a_64(path),
                         *shaping_values,
                         shaping_flags,
+                        emission_texture_index,
+                        ies_texture_index,
+                        ies_angle_scale,
+                        ies_multiplier,
+                        light_texture_flags,
+                        0,
                     )
                 )
                 additional_light_descriptions.append(f"{schema_name}:{path}")
@@ -2957,6 +3312,9 @@ class StartupStageExtension(omni.ext.IExt):
                         0.0, 0.0, 0.0, 0.0,
                         0.0, 0.0, 0.0, 0.0, 0.0,
                         0,
+                        _NO_SCENE_LIGHT_TEXTURE,
+                        _NO_SCENE_LIGHT_TEXTURE,
+                        0.0, 0.0, 0, 0,
                     )
                 )
                 additional_light_descriptions.append(f"{schema_name}:{path}")
@@ -2973,10 +3331,26 @@ class StartupStageExtension(omni.ext.IExt):
                         0.0, 0.0, 0.0, 0.0,
                         0.0, 0.0, 0.0, 0.0, 0.0,
                         0,
+                        _NO_SCENE_LIGHT_TEXTURE,
+                        _NO_SCENE_LIGHT_TEXTURE,
+                        0.0, 0.0, 0, 0,
                     )
                 )
                 additional_light_descriptions.append(f"{schema_name}:{path}")
             additional_light_payload = b"".join(additional_light_records)
+
+            light_texture_records = [struct.pack("<I", len(light_textures))]
+            for texture_key, width, height, pixels in light_textures:
+                light_texture_records.append(
+                    _SCENE_TEXTURE_RECORD.pack(
+                        _fnv1a_64(texture_key),
+                        width,
+                        height,
+                        len(pixels),
+                    )
+                    + pixels
+                )
+            light_texture_payload = b"".join(light_texture_records)
 
             texture_table_records = [struct.pack("<I", len(scene_textures))]
             for texture_path, width, height, pixels in scene_textures:
@@ -3001,6 +3375,7 @@ class StartupStageExtension(omni.ext.IExt):
                 distant_light_values,
                 dome_light_values,
                 additional_light_payload,
+                light_texture_payload,
                 mesh_payload,
                 len(mesh_records),
             )
@@ -3019,6 +3394,7 @@ class StartupStageExtension(omni.ext.IExt):
                 "dome_light_values": dome_light_values,
                 "additional_light_payload": additional_light_payload,
                 "additional_light_count": len(additional_light_records),
+                "light_texture_payload": light_texture_payload,
                 "mesh_payload": mesh_payload,
                 "mesh_count": len(mesh_records),
                 "point_instance_count": len(point_instance_keys),
@@ -3031,7 +3407,7 @@ class StartupStageExtension(omni.ext.IExt):
                 + sphere_light_values
                 + distant_light_values
                 + dome_light_values
-                + (additional_light_payload, mesh_payload)
+                + (additional_light_payload, light_texture_payload, mesh_payload)
             )
             if scene_values == self._last_scene_values:
                 return
@@ -3050,7 +3426,9 @@ class StartupStageExtension(omni.ext.IExt):
                 len(mesh_records),
                 len(additional_light_records),
             )
-            payload += additional_light_payload + mesh_payload
+            payload += (
+                additional_light_payload + light_texture_payload + mesh_payload
+            )
             temporary_path = (
                 f"{self._camera_state_path}.tmp.{os.getpid()}"
             )
@@ -3097,6 +3475,11 @@ class StartupStageExtension(omni.ext.IExt):
                     wire_values,
                     shaping_values,
                     shaping_flags,
+                    emission_texture_index,
+                    ies_texture_index,
+                    ies_angle_scale,
+                    ies_multiplier,
+                    light_texture_flags,
                 ) in positional_lights:
                     if schema_code != 1:
                         cylinder_details = (
@@ -3125,10 +3508,24 @@ class StartupStageExtension(omni.ext.IExt):
                             f"focusTint=({shaping_values[6]:.3f},"
                             f"{shaping_values[7]:.3f},{shaping_values[8]:.3f})"
                         )
-                for light_path, ies_path in ignored_shaping_ies_paths:
+                    if light_texture_flags & _LIGHT_TEXTURE_RECT_EMISSION:
+                        carb.log_warn(
+                            "isaacmetalbridge.stage: RectLight emission texture "
+                            f"published: path={path} textureIndex="
+                            f"{emission_texture_index}"
+                        )
+                    if light_texture_flags & _LIGHT_TEXTURE_IES_PROFILE:
+                        carb.log_warn(
+                            "isaacmetalbridge.stage: ShapingAPI IES profile "
+                            f"published: path={path} textureIndex="
+                            f"{ies_texture_index} angleScale={ies_angle_scale:.3f} "
+                            f"multiplier={ies_multiplier:.6f} normalize="
+                            f"{bool(light_texture_flags & _LIGHT_TEXTURE_IES_NORMALIZED)}"
+                        )
+                for light_path, asset_kind, asset_path in rejected_light_assets:
                     carb.log_warn(
-                        "isaacmetalbridge.stage: ShapingAPI IES profile is not "
-                        f"transported yet: path={light_path} ies={ies_path}"
+                        f"isaacmetalbridge.stage: {asset_kind} rejected by "
+                        f"bounded decoder: path={light_path} asset={asset_path}"
                     )
                 if distant_light_path:
                     carb.log_warn(

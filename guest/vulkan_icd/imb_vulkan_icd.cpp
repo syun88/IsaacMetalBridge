@@ -64,7 +64,8 @@ constexpr std::uint16_t kSceneStateLightArrayVersion = 15;
 constexpr std::uint16_t kSceneStateAreaLightVersion = 16;
 constexpr std::uint16_t kSceneStateCylinderLightVersion = 17;
 constexpr std::uint16_t kSceneStateShapingVersion = 18;
-constexpr std::uint16_t kSceneStateVersion = kSceneStateShapingVersion;
+constexpr std::uint16_t kSceneStateLightTextureVersion = 19;
+constexpr std::uint16_t kSceneStateVersion = kSceneStateLightTextureVersion;
 constexpr std::size_t kCameraStateSize = 96;
 constexpr std::size_t kSceneStatePreviousHeaderSize = 100;
 constexpr std::size_t kSceneStatePreviousFixedHeaderSize = 148;
@@ -72,7 +73,8 @@ constexpr std::size_t kSceneStateSplitSequenceHeaderSize = 156;
 constexpr std::size_t kSceneStateHeaderSize = 160;
 constexpr std::size_t kSceneLegacyLightRecordSize = 48;
 constexpr std::size_t kSceneAreaLightRecordSize = 80;
-constexpr std::size_t kSceneLightRecordSize = 120;
+constexpr std::size_t kSceneShapingLightRecordSize = 120;
+constexpr std::size_t kSceneLightRecordSize = 152;
 constexpr std::size_t kSceneMeshRecordSize = 88;
 constexpr std::size_t kSceneMeshGeometryRecordSize = 96;
 constexpr std::size_t kSceneMeshNormalsRecordSize = 100;
@@ -88,6 +90,8 @@ constexpr std::uint32_t kMaxSceneMeshCount = 4096;
 constexpr std::uint32_t kMaxSceneTextureCount = 126;
 constexpr std::uint32_t kMaxSceneLegacyAdditionalLightCount = 13;
 constexpr std::uint32_t kMaxSceneLightCount = 16;
+constexpr std::uint32_t kMaxSceneLightTextureCount = 32;
+constexpr std::size_t kMaxSceneLightTextureBytes = 16U * 1024U * 1024U;
 constexpr std::uint32_t kMaxSceneMeshVertexCount = 16U * 1024U * 1024U;
 constexpr std::uint32_t kMaxSceneMeshIndexCount = 48U * 1024U * 1024U;
 constexpr std::size_t kMaxSceneStateBytes = 512U * 1024U * 1024U;
@@ -117,6 +121,19 @@ struct BridgeAdditionalLight {
     float shapingFocus = 0.0f;
     std::array<float, 3> shapingFocusTint{};
     std::uint32_t shapingFlags = IMB_TRACE_LIGHT_SHAPING_NONE;
+    std::uint64_t emissionTextureIndex = UINT64_MAX;
+    std::uint64_t iesTextureIndex = UINT64_MAX;
+    float iesAngleScale = 0.0f;
+    float iesMultiplier = 0.0f;
+    std::uint32_t textureFlags = IMB_TRACE_LIGHT_TEXTURE_NONE;
+    std::uint64_t emissionTextureResourceID = 0;
+    std::uint64_t iesTextureResourceID = 0;
+    std::uint32_t emissionTextureWidth = 0;
+    std::uint32_t emissionTextureHeight = 0;
+    std::shared_ptr<const std::vector<std::uint8_t>> emissionTextureRGBA8;
+    std::uint32_t iesTextureWidth = 0;
+    std::uint32_t iesTextureHeight = 0;
+    std::shared_ptr<const std::vector<std::uint8_t>> iesTextureRGBA8;
 };
 
 struct BridgeRayCamera {
@@ -281,11 +298,13 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                     return std::nullopt;
                 }
                 const std::size_t lightRecordSize =
-                    headerVersion >= kSceneStateShapingVersion
+                    headerVersion >= kSceneStateLightTextureVersion
                     ? kSceneLightRecordSize
+                    : (headerVersion >= kSceneStateShapingVersion
+                    ? kSceneShapingLightRecordSize
                     : (headerVersion >= kSceneStateAreaLightVersion
                         ? kSceneAreaLightRecordSize
-                        : kSceneLegacyLightRecordSize);
+                        : kSceneLegacyLightRecordSize));
                 const std::size_t additionalBytes =
                     static_cast<std::size_t>(additionalLightCount)
                     * lightRecordSize;
@@ -298,6 +317,80 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                 allBytes.resize(
                     originalSize + static_cast<std::size_t>(input.gcount())
                 );
+                if (allBytes.size() != originalSize + additionalBytes) {
+                    return std::nullopt;
+                }
+                if (headerVersion >= kSceneStateLightTextureVersion) {
+                    std::array<std::uint8_t, sizeof(std::uint32_t)> countBytes{};
+                    input.read(
+                        reinterpret_cast<char*>(countBytes.data()),
+                        static_cast<std::streamsize>(countBytes.size())
+                    );
+                    if (static_cast<std::size_t>(input.gcount())
+                        != countBytes.size()) {
+                        return std::nullopt;
+                    }
+                    std::uint32_t textureCount = 0;
+                    for (std::size_t index = 0; index < countBytes.size(); ++index) {
+                        textureCount |= static_cast<std::uint32_t>(countBytes[index])
+                            << (index * 8);
+                    }
+                    if (textureCount > kMaxSceneLightTextureCount) {
+                        return std::nullopt;
+                    }
+                    allBytes.insert(
+                        allBytes.end(), countBytes.begin(), countBytes.end()
+                    );
+                    std::size_t texturePayloadBytes = 0;
+                    for (std::uint32_t textureIndex = 0;
+                         textureIndex < textureCount; ++textureIndex) {
+                        std::array<std::uint8_t, kSceneTextureRecordSize> record{};
+                        input.read(
+                            reinterpret_cast<char*>(record.data()),
+                            static_cast<std::streamsize>(record.size())
+                        );
+                        if (static_cast<std::size_t>(input.gcount())
+                            != record.size()) {
+                            return std::nullopt;
+                        }
+                        const auto recordU32 = [&record](std::size_t offset) {
+                            std::uint32_t result = 0;
+                            for (std::size_t index = 0; index < 4; ++index) {
+                                result |= static_cast<std::uint32_t>(
+                                    record[offset + index]
+                                ) << (index * 8);
+                            }
+                            return result;
+                        };
+                        const std::uint32_t width = recordU32(8);
+                        const std::uint32_t height = recordU32(12);
+                        const std::uint32_t byteCount = recordU32(16);
+                        const std::uint64_t expectedBytes =
+                            static_cast<std::uint64_t>(width) * height * 4;
+                        if (width == 0 || height == 0
+                            || width > 512 || height > 512
+                            || expectedBytes != byteCount
+                            || byteCount > kMaxSceneLightTextureBytes
+                                - texturePayloadBytes) {
+                            return std::nullopt;
+                        }
+                        allBytes.insert(
+                            allBytes.end(), record.begin(), record.end()
+                        );
+                        const std::size_t payloadOffset = allBytes.size();
+                        allBytes.resize(payloadOffset + byteCount);
+                        input.read(
+                            reinterpret_cast<char*>(
+                                allBytes.data() + payloadOffset
+                            ),
+                            static_cast<std::streamsize>(byteCount)
+                        );
+                        if (static_cast<std::size_t>(input.gcount()) != byteCount) {
+                            return std::nullopt;
+                        }
+                        texturePayloadBytes += byteCount;
+                    }
+                }
             }
         }
     }
@@ -444,6 +537,7 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
 
     std::uint32_t additionalLightCount = 0;
     std::size_t additionalLightBytes = 0;
+    std::size_t lightTextureBytes = 0;
     if (version >= kSceneStateLightArrayVersion) {
         camera.completeLightList = version >= kSceneStateAreaLightVersion;
         additionalLightCount = readAllU32(156);
@@ -454,11 +548,13 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
             return std::nullopt;
         }
         const std::size_t lightRecordSize =
-            version >= kSceneStateShapingVersion
+            version >= kSceneStateLightTextureVersion
             ? kSceneLightRecordSize
+            : (version >= kSceneStateShapingVersion
+            ? kSceneShapingLightRecordSize
             : (camera.completeLightList
                 ? kSceneAreaLightRecordSize
-                : kSceneLegacyLightRecordSize);
+                : kSceneLegacyLightRecordSize));
         additionalLightBytes =
             static_cast<std::size_t>(additionalLightCount)
             * lightRecordSize;
@@ -505,6 +601,16 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                 }
                 light.shapingFlags = readAllU32(lightOffset + 116);
             }
+            if (version >= kSceneStateLightTextureVersion) {
+                light.emissionTextureIndex = readAllU64(lightOffset + 120);
+                light.iesTextureIndex = readAllU64(lightOffset + 128);
+                light.iesAngleScale = readAllFloat(lightOffset + 136);
+                light.iesMultiplier = readAllFloat(lightOffset + 140);
+                light.textureFlags = readAllU32(lightOffset + 144);
+                if (readAllU32(lightOffset + 148) != 0) {
+                    return std::nullopt;
+                }
+            }
             if (light.pathHash == 0
                 || !std::all_of(
                     light.values.begin(),
@@ -516,14 +622,52 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                 || !std::isfinite(light.shapingConeSoftness)
                 || !std::isfinite(light.shapingFocus)
                 || !finiteVector(light.shapingFocusTint)
+                || !std::isfinite(light.iesAngleScale)
+                || !std::isfinite(light.iesMultiplier)
                 || (light.shapingFlags
                     & ~static_cast<std::uint32_t>(
                         IMB_TRACE_LIGHT_SHAPING_APPLIED
-                    )) != 0) {
+                    )) != 0
+                || (light.textureFlags
+                    & ~(static_cast<std::uint32_t>(
+                            IMB_TRACE_LIGHT_TEXTURE_RECT_EMISSION
+                        )
+                        | static_cast<std::uint32_t>(
+                            IMB_TRACE_LIGHT_TEXTURE_IES_PROFILE
+                        )
+                        | static_cast<std::uint32_t>(
+                            IMB_TRACE_LIGHT_TEXTURE_IES_NORMALIZED
+                        ))) != 0) {
                 return std::nullopt;
             }
             const bool hasShaping =
                 (light.shapingFlags & IMB_TRACE_LIGHT_SHAPING_APPLIED) != 0;
+            const bool hasEmissionTexture =
+                (light.textureFlags
+                    & IMB_TRACE_LIGHT_TEXTURE_RECT_EMISSION) != 0;
+            const bool hasIES =
+                (light.textureFlags & IMB_TRACE_LIGHT_TEXTURE_IES_PROFILE) != 0;
+            const bool normalizedIES =
+                (light.textureFlags
+                    & IMB_TRACE_LIGHT_TEXTURE_IES_NORMALIZED) != 0;
+            if ((hasEmissionTexture
+                    ? light.emissionTextureIndex == UINT64_MAX
+                    : light.emissionTextureIndex != UINT64_MAX)
+                || (hasIES
+                    ? light.iesTextureIndex == UINT64_MAX
+                    : light.iesTextureIndex != UINT64_MAX)
+                || (!hasIES && (normalizedIES
+                    || light.iesAngleScale != 0.0f
+                    || light.iesMultiplier != 0.0f))
+                || (hasIES && (!hasShaping
+                    || light.kind != IMB_TRACE_LIGHT_KIND_POSITIONAL
+                    || light.iesMultiplier < 0.0f
+                    || light.iesMultiplier > 1000000.0f))
+                || (hasEmissionTexture
+                    && (light.kind != IMB_TRACE_LIGHT_KIND_POSITIONAL
+                        || light.schema != IMB_TRACE_LIGHT_SCHEMA_RECT))) {
+                return std::nullopt;
+            }
             if (hasShaping) {
                 if (light.kind != IMB_TRACE_LIGHT_KIND_POSITIONAL
                     || vectorLengthSquared(light.shapingAxis) <= 0.000001f
@@ -581,11 +725,17 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                         light.values[12], light.values[13], light.values[14]
                     };
                     if (light.schema == IMB_TRACE_LIGHT_SCHEMA_SPHERE) {
-                        if (std::any_of(
-                                light.values.begin() + 8,
-                                light.values.end(),
-                                [](float value) { return value != 0.0f; }
-                            )) {
+                        const bool hasIESBasis = hasIES
+                            && vectorLengthSquared(axisU) > 0.000001f
+                            && vectorLengthSquared(axisV) > 0.000001f
+                            && light.values[11] == 0.0f
+                            && light.values[15] == 0.0f;
+                        const bool hasNoBasis = std::all_of(
+                            light.values.begin() + 8,
+                            light.values.end(),
+                            [](float value) { return value == 0.0f; }
+                        );
+                        if (!(hasIESBasis || (!hasIES && hasNoBasis))) {
                             return std::nullopt;
                         }
                     } else {
@@ -640,6 +790,90 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
         }
     }
 
+    if (version >= kSceneStateLightTextureVersion) {
+        std::size_t textureOffset = kSceneStateHeaderSize
+            + additionalLightBytes;
+        if (textureOffset > allBytes.size()
+            || sizeof(std::uint32_t) > allBytes.size() - textureOffset) {
+            return std::nullopt;
+        }
+        const std::size_t tableStart = textureOffset;
+        const std::uint32_t textureCount = readAllU32(textureOffset);
+        textureOffset += sizeof(std::uint32_t);
+        if (textureCount > kMaxSceneLightTextureCount) {
+            return std::nullopt;
+        }
+        std::vector<BridgeSceneTextureMap> lightTextures;
+        std::size_t texturePayloadBytes = 0;
+        try {
+            lightTextures.reserve(textureCount);
+            for (std::uint32_t textureIndex = 0;
+                 textureIndex < textureCount; ++textureIndex) {
+                if (textureOffset > allBytes.size()
+                    || kSceneTextureRecordSize
+                        > allBytes.size() - textureOffset) {
+                    return std::nullopt;
+                }
+                const std::uint32_t width = readAllU32(textureOffset + 8);
+                const std::uint32_t height = readAllU32(textureOffset + 12);
+                const std::uint32_t byteCount = readAllU32(textureOffset + 16);
+                const std::uint64_t expectedBytes =
+                    static_cast<std::uint64_t>(width) * height * 4;
+                textureOffset += kSceneTextureRecordSize;
+                if (width == 0 || height == 0
+                    || width > 512 || height > 512
+                    || expectedBytes != byteCount
+                    || byteCount > kMaxSceneLightTextureBytes
+                        - texturePayloadBytes
+                    || textureOffset > allBytes.size()
+                    || byteCount > allBytes.size() - textureOffset) {
+                    return std::nullopt;
+                }
+                BridgeSceneTextureMap texture{};
+                texture.width = width;
+                texture.height = height;
+                texture.rgba8 = std::make_shared<
+                    const std::vector<std::uint8_t>
+                >(
+                    allBytes.begin() + textureOffset,
+                    allBytes.begin() + textureOffset + byteCount
+                );
+                lightTextures.push_back(std::move(texture));
+                textureOffset += byteCount;
+                texturePayloadBytes += byteCount;
+            }
+        } catch (const std::bad_alloc&) {
+            return std::nullopt;
+        }
+        lightTextureBytes = textureOffset - tableStart;
+        for (auto& light : camera.additionalLights) {
+            if ((light.textureFlags
+                    & IMB_TRACE_LIGHT_TEXTURE_RECT_EMISSION) != 0) {
+                if (light.emissionTextureIndex >= lightTextures.size()) {
+                    return std::nullopt;
+                }
+                const auto& texture = lightTextures[
+                    static_cast<std::size_t>(light.emissionTextureIndex)
+                ];
+                light.emissionTextureWidth = texture.width;
+                light.emissionTextureHeight = texture.height;
+                light.emissionTextureRGBA8 = texture.rgba8;
+            }
+            if ((light.textureFlags
+                    & IMB_TRACE_LIGHT_TEXTURE_IES_PROFILE) != 0) {
+                if (light.iesTextureIndex >= lightTextures.size()) {
+                    return std::nullopt;
+                }
+                const auto& texture = lightTextures[
+                    static_cast<std::size_t>(light.iesTextureIndex)
+                ];
+                light.iesTextureWidth = texture.width;
+                light.iesTextureHeight = texture.height;
+                light.iesTextureRGBA8 = texture.rgba8;
+            }
+        }
+    }
+
     if (version == kSceneStatePreviousVersion
         || (version >= kSceneStateLightingVersion
             && version <= kSceneStateVersion)) {
@@ -652,7 +886,7 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                 ? kSceneStatePreviousFixedHeaderSize
                 : kSceneStatePreviousHeaderSize));
         const std::size_t scenePayloadOffset =
-            sceneHeaderSize + additionalLightBytes;
+            sceneHeaderSize + additionalLightBytes + lightTextureBytes;
         const std::size_t meshCountOffset =
             version >= kSceneStateSplitSequenceVersion
             ? 152
@@ -2534,6 +2768,14 @@ public:
                 appendFloat(light.shapingFocus);
                 for (float value : light.shapingFocusTint) appendFloat(value);
                 imb::appendLittleEndian(payload, light.shapingFlags);
+                imb::appendLittleEndian(
+                    payload, light.emissionTextureResourceID
+                );
+                imb::appendLittleEndian(payload, light.iesTextureResourceID);
+                appendFloat(light.iesAngleScale);
+                appendFloat(light.iesMultiplier);
+                imb::appendLittleEndian(payload, light.textureFlags);
+                imb::appendLittleEndian(payload, std::uint32_t{0});
             }
         }
         const auto reply = exchange(IMB_MSG_SUBMIT_COMMAND, std::move(payload), imageID);
@@ -3182,6 +3424,17 @@ void releaseSceneTextureResourceLocked(std::uint64_t resourceID) {
     gState.sceneMetalTextures.erase(found);
 }
 
+struct BridgeSceneTextureReferenceGuard {
+    std::vector<std::uint64_t> resourceIDs;
+
+    ~BridgeSceneTextureReferenceGuard() {
+        for (auto iterator = resourceIDs.rbegin();
+             iterator != resourceIDs.rend(); ++iterator) {
+            releaseSceneTextureResourceLocked(*iterator);
+        }
+    }
+};
+
 template <typename Handle>
 Handle makeDispatchableHandle() {
     auto* data = new VK_LOADER_DATA{};
@@ -3511,6 +3764,8 @@ std::uint32_t bridgeImageFormat(VkFormat format) {
         return IMB_IMAGE_FORMAT_RGBA8_SNORM;
     case VK_FORMAT_R8G8B8A8_SRGB:
         return IMB_IMAGE_FORMAT_RGBA8_SRGB;
+    case VK_FORMAT_R32G32B32A32_SFLOAT:
+        return IMB_IMAGE_FORMAT_RGBA32_SFLOAT;
     default:
         return 0;
     }
@@ -15352,10 +15607,62 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
             const bool isViewportSceneRayTrace = isSceneRayTrace
                 && metalRayTrace->width == 1280
                 && metalRayTrace->height == 720;
-            const std::optional<BridgeRayCamera> liveCamera =
+            std::optional<BridgeRayCamera> liveCamera =
                 isSceneRayTrace
                 ? readLiveCameraState()
                 : std::nullopt;
+            BridgeSceneTextureReferenceGuard lightTextureReferences;
+            if (liveCamera.has_value()) {
+                for (auto& light : liveCamera->additionalLights) {
+                    const auto acquireLightTexture = [device,
+                        &lightTextureReferences](
+                        std::uint32_t width,
+                        std::uint32_t height,
+                        const std::shared_ptr<
+                            const std::vector<std::uint8_t>
+                        >& rgba8
+                    ) {
+                        BridgeSceneTextureMap texture{};
+                        texture.width = width;
+                        texture.height = height;
+                        texture.rgba8 = rgba8;
+                        const std::uint64_t resourceID =
+                            acquireSceneTextureResourceLocked(device, texture);
+                        if (resourceID != 0) {
+                            lightTextureReferences.resourceIDs.push_back(
+                                resourceID
+                            );
+                        }
+                        return resourceID;
+                    };
+                    if ((light.textureFlags
+                            & IMB_TRACE_LIGHT_TEXTURE_RECT_EMISSION) != 0) {
+                        light.emissionTextureResourceID = acquireLightTexture(
+                            light.emissionTextureWidth,
+                            light.emissionTextureHeight,
+                            light.emissionTextureRGBA8
+                        );
+                        if (light.emissionTextureResourceID == 0) {
+                            throw std::runtime_error(
+                                "RectLight texture Metal resource creation failed"
+                            );
+                        }
+                    }
+                    if ((light.textureFlags
+                            & IMB_TRACE_LIGHT_TEXTURE_IES_PROFILE) != 0) {
+                        light.iesTextureResourceID = acquireLightTexture(
+                            light.iesTextureWidth,
+                            light.iesTextureHeight,
+                            light.iesTextureRGBA8
+                        );
+                        if (light.iesTextureResourceID == 0) {
+                            throw std::runtime_error(
+                                "IES profile Metal resource creation failed"
+                            );
+                        }
+                    }
+                }
+            }
             if (rayTracingTraceEnabled() && liveCamera.has_value()) {
                 static std::uint64_t lastLoggedCameraSequence = 0;
                 if (liveCamera->sequence != lastLoggedCameraSequence) {
@@ -15467,6 +15774,21 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                                     light.shapingFocusTint[0],
                                     light.shapingFocusTint[1],
                                     light.shapingFocusTint[2]
+                                );
+                            }
+                            if (light.textureFlags != 0) {
+                                std::fprintf(
+                                    stderr,
+                                    " lightTextures=%#x rect=%llu ies=%llu angleScale=%.3f multiplier=%.6f",
+                                    light.textureFlags,
+                                    static_cast<unsigned long long>(
+                                        light.emissionTextureResourceID
+                                    ),
+                                    static_cast<unsigned long long>(
+                                        light.iesTextureResourceID
+                                    ),
+                                    light.iesAngleScale,
+                                    light.iesMultiplier
                                 );
                             }
                         }

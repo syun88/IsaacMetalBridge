@@ -2264,4 +2264,130 @@ private func appendUIVertex(
     #expect(Int(focusedTint[0]) > Int(focusedTint[1]) + 8)
     #expect(Int(focusedTint[0]) > Int(focusedTint[2]) + 8)
 }
+
+@Test func metalRectLightTextureAndIESProfileAffectRadiance() throws {
+    let backend = try #require(MetalGPUBackend.makeDefault())
+    #expect(backend.supportsRayDispatch)
+
+    try backend.createBuffer(id: 800, size: 36, options: 0)
+    var vertices = Data()
+    for point: SIMD3<Float> in [
+        SIMD3<Float>(-1, -1, 0),
+        SIMD3<Float>(1, -1, 0),
+        SIMD3<Float>(0, 1, 0),
+    ] {
+        appendFloat(point.x, to: &vertices)
+        appendFloat(point.y, to: &vertices)
+        appendFloat(point.z, to: &vertices)
+    }
+    try backend.writeBuffer(id: 800, offset: 0, data: vertices)
+    try backend.createAccelerationStructure(id: 801, type: 1, requestedSize: 4096)
+    try backend.buildPrimitiveAccelerationStructure(
+        id: 801,
+        buildFlags: 0x4,
+        geometries: [PrimitiveAccelerationStructureGeometry(
+            kind: .triangles,
+            flags: 1,
+            dataResourceID: 800,
+            dataOffset: 0,
+            primitiveCount: 1,
+            stride: 12,
+            vertexFormat: 1
+        )]
+    )
+    try backend.createAccelerationStructure(id: 802, type: 0, requestedSize: 4096)
+    try backend.buildInstanceAccelerationStructure(
+        id: 802,
+        buildFlags: 0x4,
+        instances: [InstanceAccelerationStructureInstance(
+            transformationMatrix: [
+                1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, 0,
+            ],
+            options: 0,
+            mask: 0xff,
+            intersectionFunctionTableOffset: 0,
+            userID: 0x00bf_8080,
+            accelerationStructureResourceID: 801
+        )]
+    )
+
+    try backend.createImage(id: 810, width: 2, height: 2, format: 1, options: 0)
+    try backend.writeImage(
+        id: 810,
+        data: Data([255, 0, 0, 255, 255, 0, 0, 255,
+                    255, 0, 0, 255, 255, 0, 0, 255])
+    )
+    try backend.createImage(id: 811, width: 2, height: 2, format: 1, options: 0)
+    try backend.writeImage(
+        id: 811,
+        data: Data(repeating: 255, count: 16)
+    )
+    try backend.createImage(id: 812, width: 2, height: 2, format: 1, options: 0)
+    var blackIES = Data()
+    for _ in 0..<4 { blackIES.append(contentsOf: [0, 0, 0, 255]) }
+    try backend.writeImage(id: 812, data: blackIES)
+
+    let camera = RayCamera(
+        position: SIMD3<Float>(0, 0, -2),
+        forward: SIMD3<Float>(0, 0, 1),
+        up: SIMD3<Float>(0, 1, 0),
+        verticalFOVRadians: 0.9,
+        nearDistance: 0.01,
+        farDistance: 100
+    )
+    func light(iesTexture: UInt64) -> RaySphereLight {
+        RaySphereLight(
+            position: SIMD3<Float>(0, 0, -1),
+            color: SIMD3<Float>(1, 1, 1),
+            intensity: 1_000,
+            radius: 0.4,
+            shape: .rectangle,
+            axisU: SIMD3<Float>(1, 0, 0),
+            axisV: SIMD3<Float>(0, -1, 0),
+            halfExtentU: 0.7,
+            halfExtentV: 0.7,
+            shapingAxis: SIMD3<Float>(0, 0, 1),
+            shapingConeAngleDegrees: 90,
+            shapingConeSoftness: 0,
+            shapingFocus: 0,
+            shapingFocusTint: SIMD3<Float>(1, 1, 1),
+            hasShaping: true,
+            emissionTextureResourceID: 810,
+            iesTextureResourceID: iesTexture,
+            iesAngleScale: 0,
+            iesMultiplier: 1
+        )
+    }
+    func render(imageID: UInt64, fenceID: UInt64, iesTexture: UInt64) throws -> [UInt8] {
+        try backend.createImage(
+            id: imageID, width: 64, height: 64, format: 1, options: 0
+        )
+        try backend.submitRayTrace(
+            imageID: imageID,
+            accelerationStructureID: 802,
+            width: 64,
+            height: 64,
+            missRGBA8: 0xff00_0000,
+            hitRGBA8: 0xffe0_8c30,
+            camera: camera,
+            sphereLight: nil,
+            distantLight: nil,
+            domeLight: nil,
+            additionalSphereLights: [light(iesTexture: iesTexture)],
+            additionalDistantLights: [],
+            additionalDomeLights: [],
+            fenceID: fenceID
+        )
+        #expect(try backend.waitFence(id: fenceID))
+        let center = (32 * 64 + 32) * 4
+        return Array(try backend.readImage(id: imageID)[center..<(center + 4)])
+    }
+
+    let lit = try render(imageID: 813, fenceID: 801, iesTexture: 811)
+    let rejectedByIES = try render(imageID: 814, fenceID: 802, iesTexture: 812)
+    #expect(Int(lit[0]) > Int(lit[1]) + 8)
+    #expect(Int(lit[0]) > Int(rejectedByIES[0]) + 8)
+}
 #endif

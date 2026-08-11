@@ -78,15 +78,15 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         textureType: UInt32,
         sampleCount: UInt32
     ) throws -> SparseImageProperties {
-        guard (format >= 1 && format <= 10),
+        guard (format >= 1 && format <= 11),
               textureType == 1,
               sampleCount == 1
         else {
             throw GPUBackendError.unsupported("invalid test sparse image query")
         }
         return SparseImageProperties(
-            tileWidth: (format == 3 || format == 4 || format == 6 || format == 7) ? 128 : 64,
-            tileHeight: format == 5 ? 32 : (format == 4 ? 64 : ((format == 3 || format == 6 || format == 7) ? 128 : 64)),
+            tileWidth: format == 11 ? 32 : ((format == 3 || format == 4 || format == 6 || format == 7) ? 128 : 64),
+            tileHeight: format == 11 ? 32 : (format == 5 ? 32 : (format == 4 ? 64 : ((format == 3 || format == 6 || format == 7) ? 128 : 64))),
             tileDepth: 1,
             tileSizeBytes: 16_384
         )
@@ -104,7 +104,7 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         textureType: UInt32
     ) throws {
         guard virtualSize > 0, width > 0, height > 0,
-              (format >= 1 && format <= 10),
+              (format >= 1 && format <= 11),
               mipLevels > 0, arrayLayers > 0, sampleCount == 1, textureType == 1
         else {
             throw GPUBackendError.unsupported("invalid test sparse image")
@@ -113,7 +113,7 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         let blockHeight = blockWidth
         let blockBytes = (format == 3 || format == 6 || format == 7)
             ? 16
-            : (format == 4 ? 2 : (format == 5 ? 8 : 4))
+            : (format == 4 ? 2 : (format == 5 ? 8 : (format == 11 ? 16 : 4)))
         var mipWidth = Int(width)
         var mipHeight = Int(height)
         var layerBytes = 0
@@ -529,8 +529,8 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     #expect(pong.payload == bytes)
 }
 
-@Test func compressedAndRGBA8SRGBSparseFormatsReachTheMetalBackend() throws {
-    for (index, format) in [UInt32(6), UInt32(7), UInt32(10)].enumerated() {
+@Test func extendedSparseFormatsReachTheMetalBackend() throws {
+    for (index, format) in [UInt32(6), UInt32(7), UInt32(10), UInt32(11)].enumerated() {
         let backend = TestGPUBackend()
         let session = BridgeSession(metal: testMetal, backend: backend)
         negotiate(session)
@@ -545,7 +545,7 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
             payload: query
         )).response
         #expect(queried.header.messageType == MessageType.querySparseImageProperties.rawValue)
-        let expectedTileDimension: UInt32 = format == 10 ? 64 : 128
+        let expectedTileDimension: UInt32 = format == 11 ? 32 : (format == 10 ? 64 : 128)
         #expect(
             try queried.payload.readLittleEndian(at: 0) as UInt32
                 == expectedTileDimension
@@ -575,7 +575,7 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
         #expect(created.header.messageType == MessageType.createResource.rawValue)
         #expect(created.header.resourceID != 0)
 
-        let byteCount = format == 10 ? 1_024 : 256
+        let byteCount = format == 11 ? 4_096 : (format == 10 ? 1_024 : 256)
         let pixels = Data(
             (0..<byteCount).map { UInt8(($0 + index) & 0xff) }
         )
@@ -1040,6 +1040,21 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     imageCreate.appendLittleEndian(UInt32(0))
     let image = session.handle(request(.createResource, id: 2, payload: imageCreate)).response
 
+    var lightImageCreate = Data()
+    lightImageCreate.appendLittleEndian(UInt64(2 * 2 * 4))
+    lightImageCreate.appendLittleEndian(UInt32(2))
+    lightImageCreate.appendLittleEndian(UInt32(0))
+    lightImageCreate.appendLittleEndian(UInt32(2))
+    lightImageCreate.appendLittleEndian(UInt32(2))
+    lightImageCreate.appendLittleEndian(UInt32(1))
+    lightImageCreate.appendLittleEndian(UInt32(0))
+    let rectLightTexture = session.handle(request(
+        .createResource, id: 20, payload: lightImageCreate
+    )).response
+    let iesLightTexture = session.handle(request(
+        .createResource, id: 21, payload: lightImageCreate
+    )).response
+
     var accelerationCreate = Data()
     accelerationCreate.appendLittleEndian(UInt64(4096))
     accelerationCreate.appendLittleEndian(UInt32(0))
@@ -1138,7 +1153,7 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
         color: SIMD3<Float>(0.4, 0.7, 1),
         intensity: 3_200,
         radius: 0.5,
-        shape: .disk,
+        shape: .rectangle,
         axisU: SIMD3<Float>(1, 0, 0),
         axisV: SIMD3<Float>(0, 1, 0),
         halfExtentU: 0.75,
@@ -1148,7 +1163,12 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
         shapingConeSoftness: 0.25,
         shapingFocus: 3,
         shapingFocusTint: SIMD3<Float>(0.2, 0.4, 0.8),
-        hasShaping: true
+        hasShaping: true,
+        emissionTextureResourceID: rectLightTexture.header.resourceID,
+        iesTextureResourceID: iesLightTexture.header.resourceID,
+        iesAngleScale: 0.75,
+        iesMultiplier: 2.5,
+        iesNormalized: true
     )
     let expectedCylinderLight = RaySphereLight(
         position: SIMD3<Float>(1, -2, 3),
@@ -1174,7 +1194,7 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     )
     let additionalRecords: [(UInt32, UInt32, [Float], UInt64, [Float], UInt32)] = [
         (
-            1, 3,
+            1, 2,
             [
                 expectedAdditionalSphereLight.position.x,
                 expectedAdditionalSphereLight.position.y,
@@ -1265,7 +1285,7 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     ]
     command.appendLittleEndian(UInt32(additionalRecords.count))
     command.appendLittleEndian(UInt32(0))
-    for record in additionalRecords {
+    for (recordIndex, record) in additionalRecords.enumerated() {
         command.appendLittleEndian(record.0)
         command.appendLittleEndian(record.1)
         for value in record.2 {
@@ -1276,8 +1296,22 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
             command.appendLittleEndian(value.bitPattern)
         }
         command.appendLittleEndian(record.5)
+        if recordIndex == 0 {
+            command.appendLittleEndian(rectLightTexture.header.resourceID)
+            command.appendLittleEndian(iesLightTexture.header.resourceID)
+            command.appendLittleEndian(Float(0.75).bitPattern)
+            command.appendLittleEndian(Float(2.5).bitPattern)
+            command.appendLittleEndian(UInt32(7))
+        } else {
+            command.appendLittleEndian(UInt64(0))
+            command.appendLittleEndian(UInt64(0))
+            command.appendLittleEndian(Float(0).bitPattern)
+            command.appendLittleEndian(Float(0).bitPattern)
+            command.appendLittleEndian(UInt32(0))
+        }
+        command.appendLittleEndian(UInt32(0))
     }
-    #expect(command.count == 656)
+    #expect(command.count == 784)
     let submitted = session.handle(request(
         .submitCommand,
         id: 4,
@@ -1313,7 +1347,7 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     // Cylinder radial extents must either both be positive or both be zero for
     // treatAsLine. Reject a malformed record with only local-Z radius zero.
     var mismatchedCylinderRadii = command
-    mismatchedCylinderRadii.replaceSubrange(332..<336, with: [0, 0, 0, 0])
+    mismatchedCylinderRadii.replaceSubrange(364..<368, with: [0, 0, 0, 0])
     let invalidCylinder = session.handle(request(
         .submitCommand,
         id: 7,
@@ -1335,6 +1369,21 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
         payload: reservedShapingFlag
     )).response
     #expect(try errorCode(invalidShapingFlag) == ErrorCode.invalidPayload.rawValue)
+
+    // Bits 0-2 are the complete light-texture flag set. Reserved bits fail
+    // before a resource can reach Metal.
+    var reservedLightTextureFlag = command
+    reservedLightTextureFlag.replaceSubrange(
+        320..<324,
+        with: withUnsafeBytes(of: UInt32(8).littleEndian) { Data($0) }
+    )
+    let invalidLightTextureFlag = session.handle(request(
+        .submitCommand,
+        id: 9,
+        resourceID: image.header.resourceID,
+        payload: reservedLightTextureFlag
+    )).response
+    #expect(try errorCode(invalidLightTextureFlag) == ErrorCode.invalidPayload.rawValue)
 }
 
 @Test func emptyStageGridUsesMetalWithoutAnAccelerationStructure() throws {

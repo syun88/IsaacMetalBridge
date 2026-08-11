@@ -3,7 +3,7 @@ import Foundation
 public enum IMBProtocol {
     public static let magic: UInt32 = 0x3142_4d49
     public static let major: UInt16 = 1
-    public static let minor: UInt16 = 20
+    public static let minor: UInt16 = 21
     public static let headerSize = 32
     public static let maxPayloadLength = 16 * 1024 * 1024
     public static let responseFlag: UInt16 = 1

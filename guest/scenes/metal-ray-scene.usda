@@ -347,15 +347,16 @@ def Xform "World"
         uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
     }
 
-    # Protocol 1.20 preserves this RectLight's transformed local XY axes and
-    # dimensions; Metal evaluates its one-sided -Z emission with four bounded
-    # area samples.
+    # Protocol 1.21 preserves this RectLight's transformed local XY axes,
+    # dimensions, and authored emitter texture. Metal evaluates its one-sided
+    # -Z emission with four bounded area samples.
     def RectLight "WindowLight"
     {
         float inputs:intensity = 650
         color3f inputs:color = (0.65, 0.82, 1.0)
         float inputs:width = 2.4
         float inputs:height = 1.2
+        asset inputs:texture:file = @./rect-light-color.png@
         double3 xformOp:translate = (-2.5, 1.5, 3.5)
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }
@@ -371,7 +372,7 @@ def Xform "World"
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 
-    # CylinderLight is centered on its local X axis. Scene-state v18 carries
+    # CylinderLight is centered on its local X axis. Scene-state v19 carries
     # the transformed axis, half-length, and both radial extents; Metal samples
     # the outward-emitting curved surface.
     def CylinderLight "TubeLight"
@@ -389,9 +390,10 @@ def Xform "World"
         ]
     }
 
-    # A real UsdLuxShapingAPI spotlight regression. Protocol 1.20 transports
-    # the applied-schema flag separately from its fallback values so an
-    # ordinary unshaped SphereLight remains omnidirectional.
+    # A real UsdLuxShapingAPI spotlight and LM-63 Type-C profile regression.
+    # Protocol 1.21 transports the applied-schema flag separately from its
+    # fallback values so an ordinary unshaped SphereLight remains
+    # omnidirectional.
     def SphereLight "SpotLight" (
         prepend apiSchemas = ["ShapingAPI"]
     )
@@ -403,6 +405,9 @@ def Xform "World"
         float inputs:shaping:cone:softness = 0.35
         float inputs:shaping:focus = 4
         color3f inputs:shaping:focusTint = (0.12, 0.28, 1.0)
+        asset inputs:shaping:ies:file = @./spot-profile.ies@
+        float inputs:shaping:ies:angleScale = 1
+        bool inputs:shaping:ies:normalize = true
         double3 xformOp:translate = (0.0, 0.0, 4.4)
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }

@@ -10,7 +10,7 @@ extern "C" {
 
 #define IMB_PROTOCOL_MAGIC UINT32_C(0x31424d49) /* little-endian bytes: I M B 1 */
 #define IMB_PROTOCOL_VERSION_MAJOR UINT16_C(1)
-#define IMB_PROTOCOL_VERSION_MINOR UINT16_C(20)
+#define IMB_PROTOCOL_VERSION_MINOR UINT16_C(21)
 #define IMB_PROTOCOL_HEADER_SIZE UINT32_C(32)
 #define IMB_PROTOCOL_MAX_PAYLOAD UINT32_C(16777216)
 
@@ -95,7 +95,8 @@ enum imb_image_format {
     IMB_IMAGE_FORMAT_BC5_UNORM = 7,
     IMB_IMAGE_FORMAT_RGBA8_UINT = 8,
     IMB_IMAGE_FORMAT_RGBA8_SNORM = 9,
-    IMB_IMAGE_FORMAT_RGBA8_SRGB = 10
+    IMB_IMAGE_FORMAT_RGBA8_SRGB = 10,
+    IMB_IMAGE_FORMAT_RGBA32_SFLOAT = 11
 };
 
 enum imb_image_options {
@@ -204,6 +205,16 @@ enum imb_trace_light_schema {
 enum imb_trace_light_shaping_flags {
     IMB_TRACE_LIGHT_SHAPING_NONE = 0,
     IMB_TRACE_LIGHT_SHAPING_APPLIED = 1u << 0
+};
+
+enum imb_trace_light_texture_flags {
+    IMB_TRACE_LIGHT_TEXTURE_NONE = 0,
+    /* UsdLuxRectLight inputs:texture:file, sampled in the emitter plane. */
+    IMB_TRACE_LIGHT_TEXTURE_RECT_EMISSION = 1u << 0,
+    /* UsdLuxShapingAPI inputs:shaping:ies:file angular lookup. */
+    IMB_TRACE_LIGHT_TEXTURE_IES_PROFILE = 1u << 1,
+    /* The authored inputs:shaping:ies:normalize value was true. */
+    IMB_TRACE_LIGHT_TEXTURE_IES_NORMALIZED = 1u << 2
 };
 
 #define IMB_TRACE_RAYS_MAX_ADDITIONAL_LIGHTS UINT32_C(16)
@@ -468,6 +479,19 @@ typedef struct imb_trace_light_payload {
     float shaping_focus;
     float shaping_focus_tint[3];
     uint32_t shaping_flags;
+    /*
+     * Optional ordinary RGBA8 image resources. Rect emission is interpreted
+     * as sRGB color. IES is a linear single-channel angular LUT replicated to
+     * RGB; ies_multiplier restores its authored or energy-normalized range.
+     * ies_angle_scale follows UsdLuxShapingAPI exactly. All fields and flags
+     * must be zero when the corresponding resource is absent.
+     */
+    uint64_t emission_texture_resource_id;
+    uint64_t ies_texture_resource_id;
+    float ies_angle_scale;
+    float ies_multiplier;
+    uint32_t texture_flags;
+    uint32_t reserved;
 } imb_trace_light_payload;
 
 typedef struct imb_dispatch_compute_command_payload {
@@ -556,7 +580,7 @@ static_assert(sizeof(imb_draw_triangle_command_payload) == 16, "IMB DRAW_TRIANGL
 static_assert(sizeof(imb_draw_indexed_ui_command_payload) == 56, "IMB DRAW_INDEXED_UI ABI changed");
 static_assert(sizeof(imb_trace_rays_command_payload) == 168, "IMB TRACE_RAYS ABI changed");
 static_assert(sizeof(imb_trace_rays_light_list_header) == 8, "IMB TRACE_RAYS light-list ABI changed");
-static_assert(sizeof(imb_trace_light_payload) == 120, "IMB TRACE light ABI changed");
+static_assert(sizeof(imb_trace_light_payload) == 152, "IMB TRACE light ABI changed");
 static_assert(sizeof(imb_dispatch_compute_command_payload) == 32, "IMB DISPATCH_COMPUTE ABI changed");
 static_assert(sizeof(imb_compute_binding_payload) == 48, "IMB compute binding ABI changed");
 static_assert(sizeof(imb_ui_draw_payload) == 40, "IMB UI draw ABI changed");
