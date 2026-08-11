@@ -63,14 +63,16 @@ constexpr std::uint16_t kSceneStateOpacityVersion = 14;
 constexpr std::uint16_t kSceneStateLightArrayVersion = 15;
 constexpr std::uint16_t kSceneStateAreaLightVersion = 16;
 constexpr std::uint16_t kSceneStateCylinderLightVersion = 17;
-constexpr std::uint16_t kSceneStateVersion = kSceneStateCylinderLightVersion;
+constexpr std::uint16_t kSceneStateShapingVersion = 18;
+constexpr std::uint16_t kSceneStateVersion = kSceneStateShapingVersion;
 constexpr std::size_t kCameraStateSize = 96;
 constexpr std::size_t kSceneStatePreviousHeaderSize = 100;
 constexpr std::size_t kSceneStatePreviousFixedHeaderSize = 148;
 constexpr std::size_t kSceneStateSplitSequenceHeaderSize = 156;
 constexpr std::size_t kSceneStateHeaderSize = 160;
 constexpr std::size_t kSceneLegacyLightRecordSize = 48;
-constexpr std::size_t kSceneLightRecordSize = 80;
+constexpr std::size_t kSceneAreaLightRecordSize = 80;
+constexpr std::size_t kSceneLightRecordSize = 120;
 constexpr std::size_t kSceneMeshRecordSize = 88;
 constexpr std::size_t kSceneMeshGeometryRecordSize = 96;
 constexpr std::size_t kSceneMeshNormalsRecordSize = 100;
@@ -109,6 +111,12 @@ struct BridgeAdditionalLight {
     std::uint32_t schema = 0;
     std::array<float, 16> values{};
     std::uint64_t pathHash = 0;
+    std::array<float, 3> shapingAxis{};
+    float shapingConeAngleDegrees = 0.0f;
+    float shapingConeSoftness = 0.0f;
+    float shapingFocus = 0.0f;
+    std::array<float, 3> shapingFocusTint{};
+    std::uint32_t shapingFlags = IMB_TRACE_LIGHT_SHAPING_NONE;
 };
 
 struct BridgeRayCamera {
@@ -273,9 +281,11 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                     return std::nullopt;
                 }
                 const std::size_t lightRecordSize =
-                    headerVersion >= kSceneStateAreaLightVersion
+                    headerVersion >= kSceneStateShapingVersion
                     ? kSceneLightRecordSize
-                    : kSceneLegacyLightRecordSize;
+                    : (headerVersion >= kSceneStateAreaLightVersion
+                        ? kSceneAreaLightRecordSize
+                        : kSceneLegacyLightRecordSize);
                 const std::size_t additionalBytes =
                     static_cast<std::size_t>(additionalLightCount)
                     * lightRecordSize;
@@ -443,9 +453,12 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
         if (additionalLightCount > maximumLightCount) {
             return std::nullopt;
         }
-        const std::size_t lightRecordSize = camera.completeLightList
+        const std::size_t lightRecordSize =
+            version >= kSceneStateShapingVersion
             ? kSceneLightRecordSize
-            : kSceneLegacyLightRecordSize;
+            : (camera.completeLightList
+                ? kSceneAreaLightRecordSize
+                : kSceneLegacyLightRecordSize);
         additionalLightBytes =
             static_cast<std::size_t>(additionalLightCount)
             * lightRecordSize;
@@ -476,12 +489,70 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
             light.pathHash = readAllU64(
                 lightOffset + (camera.completeLightList ? 72 : 40)
             );
+            if (version >= kSceneStateShapingVersion) {
+                for (std::size_t index = 0; index < 3; ++index) {
+                    light.shapingAxis[index] = readAllFloat(
+                        lightOffset + 80 + index * 4
+                    );
+                }
+                light.shapingConeAngleDegrees = readAllFloat(lightOffset + 92);
+                light.shapingConeSoftness = readAllFloat(lightOffset + 96);
+                light.shapingFocus = readAllFloat(lightOffset + 100);
+                for (std::size_t index = 0; index < 3; ++index) {
+                    light.shapingFocusTint[index] = readAllFloat(
+                        lightOffset + 104 + index * 4
+                    );
+                }
+                light.shapingFlags = readAllU32(lightOffset + 116);
+            }
             if (light.pathHash == 0
                 || !std::all_of(
                     light.values.begin(),
                     light.values.end(),
                     [](float value) { return std::isfinite(value); }
-                )) {
+                )
+                || !finiteVector(light.shapingAxis)
+                || !std::isfinite(light.shapingConeAngleDegrees)
+                || !std::isfinite(light.shapingConeSoftness)
+                || !std::isfinite(light.shapingFocus)
+                || !finiteVector(light.shapingFocusTint)
+                || (light.shapingFlags
+                    & ~static_cast<std::uint32_t>(
+                        IMB_TRACE_LIGHT_SHAPING_APPLIED
+                    )) != 0) {
+                return std::nullopt;
+            }
+            const bool hasShaping =
+                (light.shapingFlags & IMB_TRACE_LIGHT_SHAPING_APPLIED) != 0;
+            if (hasShaping) {
+                if (light.kind != IMB_TRACE_LIGHT_KIND_POSITIONAL
+                    || vectorLengthSquared(light.shapingAxis) <= 0.000001f
+                    || light.shapingConeAngleDegrees < 0.0f
+                    || light.shapingConeAngleDegrees > 180.0f
+                    || light.shapingConeSoftness < 0.0f
+                    || light.shapingConeSoftness > 1.0f
+                    || light.shapingFocus < 0.0f
+                    || std::any_of(
+                        light.shapingFocusTint.begin(),
+                        light.shapingFocusTint.end(),
+                        [](float value) { return value < 0.0f; }
+                    )) {
+                    return std::nullopt;
+                }
+            } else if (version >= kSceneStateShapingVersion
+                && (std::any_of(
+                        light.shapingAxis.begin(),
+                        light.shapingAxis.end(),
+                        [](float value) { return value != 0.0f; }
+                    )
+                    || light.shapingConeAngleDegrees != 0.0f
+                    || light.shapingConeSoftness != 0.0f
+                    || light.shapingFocus != 0.0f
+                    || std::any_of(
+                        light.shapingFocusTint.begin(),
+                        light.shapingFocusTint.end(),
+                        [](float value) { return value != 0.0f; }
+                    ))) {
                 return std::nullopt;
             }
             const auto nonnegativeColor = [&light](std::size_t offset) {
@@ -524,7 +595,10 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                             || vectorLengthSquared(axisV) <= 0.000001f
                             || light.values[11] <= 0.0f
                             || (cylinder
-                                ? light.values[15] < 0.0f
+                                ? !((light.values[7] > 0.0f
+                                        && light.values[15] > 0.0f)
+                                    || (light.values[7] == 0.0f
+                                        && light.values[15] == 0.0f))
                                 : light.values[15] <= 0.0f)) {
                             return std::nullopt;
                         }
@@ -2454,6 +2528,12 @@ public:
                 imb::appendLittleEndian(payload, light.schema);
                 for (float value : light.values) appendFloat(value);
                 imb::appendLittleEndian(payload, light.pathHash);
+                for (float value : light.shapingAxis) appendFloat(value);
+                appendFloat(light.shapingConeAngleDegrees);
+                appendFloat(light.shapingConeSoftness);
+                appendFloat(light.shapingFocus);
+                for (float value : light.shapingFocusTint) appendFloat(value);
+                imb::appendLittleEndian(payload, light.shapingFlags);
             }
         }
         const auto reply = exchange(IMB_MSG_SUBMIT_COMMAND, std::move(payload), imageID);
@@ -15372,6 +15452,22 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                                         light.values[7]
                                     );
                                 }
+                            }
+                            if ((light.shapingFlags
+                                    & IMB_TRACE_LIGHT_SHAPING_APPLIED) != 0) {
+                                std::fprintf(
+                                    stderr,
+                                    " shapingAxis=(%.3f,%.3f,%.3f) cone=%.3f softness=%.3f focus=%.3f focusTint=(%.3f,%.3f,%.3f)",
+                                    light.shapingAxis[0],
+                                    light.shapingAxis[1],
+                                    light.shapingAxis[2],
+                                    light.shapingConeAngleDegrees,
+                                    light.shapingConeSoftness,
+                                    light.shapingFocus,
+                                    light.shapingFocusTint[0],
+                                    light.shapingFocusTint[1],
+                                    light.shapingFocusTint[2]
+                                );
                             }
                         }
                         std::fputc('\n', stderr);

@@ -1142,7 +1142,25 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
         axisU: SIMD3<Float>(1, 0, 0),
         axisV: SIMD3<Float>(0, 1, 0),
         halfExtentU: 0.75,
-        halfExtentV: 0.5
+        halfExtentV: 0.5,
+        shapingAxis: SIMD3<Float>(0, 0, -1),
+        shapingConeAngleDegrees: 35,
+        shapingConeSoftness: 0.25,
+        shapingFocus: 3,
+        shapingFocusTint: SIMD3<Float>(0.2, 0.4, 0.8),
+        hasShaping: true
+    )
+    let expectedCylinderLight = RaySphereLight(
+        position: SIMD3<Float>(1, -2, 3),
+        color: SIMD3<Float>(0.9, 0.55, 0.25),
+        intensity: 1_200,
+        // Cylinder uses this word for its transformed local-Z radius.
+        radius: 0.4,
+        shape: .cylinder,
+        axisU: SIMD3<Float>(1, 0, 0),
+        axisV: SIMD3<Float>(0, 1, 0),
+        halfExtentU: 1.2,
+        halfExtentV: 0.3
     )
     let expectedAdditionalDistantLight = RayDistantLight(
         direction: SIMD3<Float>(-0.5, 0.25, -1),
@@ -1154,7 +1172,7 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
         color: SIMD3<Float>(0.12, 0.16, 0.22),
         intensity: 75
     )
-    let additionalRecords: [(UInt32, UInt32, [Float], UInt64)] = [
+    let additionalRecords: [(UInt32, UInt32, [Float], UInt64, [Float], UInt32)] = [
         (
             1, 3,
             [
@@ -1175,7 +1193,43 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
                 expectedAdditionalSphereLight.axisV.z,
                 expectedAdditionalSphereLight.halfExtentV,
             ],
-            0x1001
+            0x1001,
+            [
+                expectedAdditionalSphereLight.shapingAxis.x,
+                expectedAdditionalSphereLight.shapingAxis.y,
+                expectedAdditionalSphereLight.shapingAxis.z,
+                expectedAdditionalSphereLight.shapingConeAngleDegrees,
+                expectedAdditionalSphereLight.shapingConeSoftness,
+                expectedAdditionalSphereLight.shapingFocus,
+                expectedAdditionalSphereLight.shapingFocusTint.x,
+                expectedAdditionalSphereLight.shapingFocusTint.y,
+                expectedAdditionalSphereLight.shapingFocusTint.z,
+            ],
+            1
+        ),
+        (
+            1, 6,
+            [
+                expectedCylinderLight.position.x,
+                expectedCylinderLight.position.y,
+                expectedCylinderLight.position.z,
+                expectedCylinderLight.intensity,
+                expectedCylinderLight.color.x,
+                expectedCylinderLight.color.y,
+                expectedCylinderLight.color.z,
+                expectedCylinderLight.radius,
+                expectedCylinderLight.axisU.x,
+                expectedCylinderLight.axisU.y,
+                expectedCylinderLight.axisU.z,
+                expectedCylinderLight.halfExtentU,
+                expectedCylinderLight.axisV.x,
+                expectedCylinderLight.axisV.y,
+                expectedCylinderLight.axisV.z,
+                expectedCylinderLight.halfExtentV,
+            ],
+            0x1004,
+            [0, 0, 0, 0, 0, 0, 0, 0, 0],
+            0
         ),
         (
             2, 4,
@@ -1190,7 +1244,9 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
                 expectedAdditionalDistantLight.angleDegrees,
                 0, 0, 0, 0, 0, 0, 0, 0,
             ],
-            0x1002
+            0x1002,
+            [0, 0, 0, 0, 0, 0, 0, 0, 0],
+            0
         ),
         (
             3, 5,
@@ -1202,7 +1258,9 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
                 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0,
             ],
-            0x1003
+            0x1003,
+            [0, 0, 0, 0, 0, 0, 0, 0, 0],
+            0
         ),
     ]
     command.appendLittleEndian(UInt32(additionalRecords.count))
@@ -1214,8 +1272,12 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
             command.appendLittleEndian(value.bitPattern)
         }
         command.appendLittleEndian(record.3)
+        for value in record.4 {
+            command.appendLittleEndian(value.bitPattern)
+        }
+        command.appendLittleEndian(record.5)
     }
-    #expect(command.count == 416)
+    #expect(command.count == 656)
     let submitted = session.handle(request(
         .submitCommand,
         id: 4,
@@ -1227,7 +1289,10 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     #expect(backend.lastRaySphereLight == expectedSphereLight)
     #expect(backend.lastRayDistantLight == expectedDistantLight)
     #expect(backend.lastRayDomeLight == expectedDomeLight)
-    #expect(backend.lastRayAdditionalSphereLights == [expectedAdditionalSphereLight])
+    #expect(backend.lastRayAdditionalSphereLights == [
+        expectedAdditionalSphereLight,
+        expectedCylinderLight,
+    ])
     #expect(backend.lastRayAdditionalDistantLights == [expectedAdditionalDistantLight])
     #expect(backend.lastRayAdditionalDomeLights == [expectedAdditionalDomeLight])
 
@@ -1244,6 +1309,32 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
         resourceID: submitted.header.resourceID
     )).response
     #expect(try waited.payload.readLittleEndian(at: 0) as UInt32 == 1)
+
+    // Cylinder radial extents must either both be positive or both be zero for
+    // treatAsLine. Reject a malformed record with only local-Z radius zero.
+    var mismatchedCylinderRadii = command
+    mismatchedCylinderRadii.replaceSubrange(332..<336, with: [0, 0, 0, 0])
+    let invalidCylinder = session.handle(request(
+        .submitCommand,
+        id: 7,
+        resourceID: image.header.resourceID,
+        payload: mismatchedCylinderRadii
+    )).response
+    #expect(try errorCode(invalidCylinder) == ErrorCode.invalidPayload.rawValue)
+
+    // Only bit zero is defined. Reserved shaping flags must be rejected.
+    var reservedShapingFlag = command
+    reservedShapingFlag.replaceSubrange(
+        292..<296,
+        with: withUnsafeBytes(of: UInt32(2).littleEndian) { Data($0) }
+    )
+    let invalidShapingFlag = session.handle(request(
+        .submitCommand,
+        id: 8,
+        resourceID: image.header.resourceID,
+        payload: reservedShapingFlag
+    )).response
+    #expect(try errorCode(invalidShapingFlag) == ErrorCode.invalidPayload.rawValue)
 }
 
 @Test func emptyStageGridUsesMetalWithoutAnAccelerationStructure() throws {

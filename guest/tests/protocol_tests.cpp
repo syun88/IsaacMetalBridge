@@ -26,7 +26,7 @@ int main() {
     static_assert(sizeof(imb_acceleration_structure_instance_payload) == 80);
     static_assert(sizeof(imb_trace_rays_command_payload) == 168);
     static_assert(sizeof(imb_trace_rays_light_list_header) == 8);
-    static_assert(sizeof(imb_trace_light_payload) == 80);
+    static_assert(sizeof(imb_trace_light_payload) == 120);
     static_assert(sizeof(imb_add_u32_command_payload) == 16);
     static_assert(sizeof(imb_draw_triangle_command_payload) == 16);
     static_assert(sizeof(imb_draw_indexed_ui_command_payload) == 56);
@@ -34,7 +34,8 @@ int main() {
     static_assert(sizeof(imb_write_resource_payload) == 16);
     static_assert(sizeof(imb_read_resource_payload) == 16);
 
-    require(IMB_PROTOCOL_VERSION_MAJOR == 1 && IMB_PROTOCOL_VERSION_MINOR == 19, "unexpected protocol version");
+    require(IMB_PROTOCOL_VERSION_MAJOR == 1 && IMB_PROTOCOL_VERSION_MINOR == 20, "unexpected protocol version");
+    require(IMB_TRACE_LIGHT_SHAPING_APPLIED == 1, "unexpected shaping flag");
     require(IMB_IMAGE_OPTION_3D == 2, "unexpected ordinary 3D image option");
     require(IMB_IMAGE_OPTION_DEPTH_SHIFT == 16, "unexpected ordinary image depth shift");
     require(IMB_IMAGE_OPTION_DEPTH_MASK == 0xffff0000U, "unexpected ordinary image depth mask");

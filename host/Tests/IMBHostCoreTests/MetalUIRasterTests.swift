@@ -1997,4 +1997,271 @@ private func appendUIVertex(
     #expect(conePartiallyVisible[0] < coneFullyVisible[0])
     #expect(conePartiallyVisible[0] < parallelUnblocked[0])
 }
+
+@Test func metalCylinderLightUsesOutwardSurfaceAndPartialVisibility() throws {
+    let backend = try #require(MetalGPUBackend.makeDefault())
+    #expect(backend.supportsRayDispatch)
+
+    // Cylinder axis is local X. Its near (+Z radial) side emits toward the
+    // receiver at z=0. The blocker covers one of the four contributing near
+    // samples but misses the camera ray and the other cylinder samples.
+    try backend.createBuffer(id: 600, size: 72, options: 0)
+    var vertices = Data()
+    for point: SIMD3<Float> in [
+        SIMD3<Float>(-1, -1, 0),
+        SIMD3<Float>(1, -1, 0),
+        SIMD3<Float>(0, 1, 0),
+        SIMD3<Float>(0.20, 0.06, -0.4),
+        SIMD3<Float>(0.34, 0.06, -0.4),
+        SIMD3<Float>(0.27, 0.17, -0.4),
+    ] {
+        appendFloat(point.x, to: &vertices)
+        appendFloat(point.y, to: &vertices)
+        appendFloat(point.z, to: &vertices)
+    }
+    try backend.writeBuffer(id: 600, offset: 0, data: vertices)
+
+    func buildTriangle(id: UInt64, offset: UInt64) throws {
+        try backend.createAccelerationStructure(id: id, type: 1, requestedSize: 4096)
+        try backend.buildPrimitiveAccelerationStructure(
+            id: id,
+            buildFlags: 0x4,
+            geometries: [PrimitiveAccelerationStructureGeometry(
+                kind: .triangles,
+                flags: 1,
+                dataResourceID: 600,
+                dataOffset: offset,
+                primitiveCount: 1,
+                stride: 12,
+                vertexFormat: 1
+            )]
+        )
+    }
+    try buildTriangle(id: 601, offset: 0)
+    try buildTriangle(id: 602, offset: 36)
+
+    let identity: [Float] = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+    ]
+    func instance(_ accelerationID: UInt64) -> InstanceAccelerationStructureInstance {
+        InstanceAccelerationStructureInstance(
+            transformationMatrix: identity,
+            options: 0,
+            mask: 0xff,
+            intersectionFunctionTableOffset: 0,
+            userID: 0x0080_00ff,
+            accelerationStructureResourceID: accelerationID
+        )
+    }
+    try backend.createAccelerationStructure(id: 603, type: 0, requestedSize: 4096)
+    try backend.buildInstanceAccelerationStructure(
+        id: 603, buildFlags: 0x4, instances: [instance(601)]
+    )
+    try backend.createAccelerationStructure(id: 604, type: 0, requestedSize: 4096)
+    try backend.buildInstanceAccelerationStructure(
+        id: 604, buildFlags: 0x4, instances: [instance(601), instance(602)]
+    )
+
+    let camera = RayCamera(
+        position: SIMD3<Float>(0, 0, -2),
+        forward: SIMD3<Float>(0, 0, 1),
+        up: SIMD3<Float>(0, 1, 0),
+        verticalFOVRadians: 0.9,
+        nearDistance: 0.01,
+        farDistance: 100
+    )
+    let cylinder = RaySphereLight(
+        position: SIMD3<Float>(0, 0, -1),
+        color: SIMD3<Float>(1, 0.72, 0.35),
+        intensity: 1_000,
+        radius: 0.3,
+        shape: .cylinder,
+        axisU: SIMD3<Float>(1, 0, 0),
+        axisV: SIMD3<Float>(0, 1, 0),
+        halfExtentU: 0.8,
+        halfExtentV: 0.3
+    )
+    func render(
+        imageID: UInt64,
+        accelerationID: UInt64,
+        fenceID: UInt64
+    ) throws -> [UInt8] {
+        try backend.createImage(id: imageID, width: 64, height: 64, format: 1, options: 0)
+        try backend.submitRayTrace(
+            imageID: imageID,
+            accelerationStructureID: accelerationID,
+            width: 64,
+            height: 64,
+            missRGBA8: 0xff00_0000,
+            hitRGBA8: 0xffe0_8c30,
+            camera: camera,
+            sphereLight: nil,
+            distantLight: nil,
+            domeLight: nil,
+            additionalSphereLights: [cylinder],
+            additionalDistantLights: [],
+            additionalDomeLights: [],
+            fenceID: fenceID
+        )
+        #expect(try backend.waitFence(id: fenceID))
+        let center = (32 * 64 + 32) * 4
+        return Array(try backend.readImage(id: imageID)[center..<(center + 4)])
+    }
+
+    let fullyVisible = try render(
+        imageID: 605, accelerationID: 603, fenceID: 601
+    )
+    let partiallyVisible = try render(
+        imageID: 606, accelerationID: 604, fenceID: 602
+    )
+    #expect(partiallyVisible[0] < fullyVisible[0])
+}
+
+@Test func metalShapingAPIUsesConeSoftnessFocusAndTint() throws {
+    let backend = try #require(MetalGPUBackend.makeDefault())
+    #expect(backend.supportsRayDispatch)
+
+    try backend.createBuffer(id: 700, size: 36, options: 0)
+    var vertices = Data()
+    for point: SIMD3<Float> in [
+        SIMD3<Float>(-1, -1, 0),
+        SIMD3<Float>(1, -1, 0),
+        SIMD3<Float>(0, 1, 0),
+    ] {
+        appendFloat(point.x, to: &vertices)
+        appendFloat(point.y, to: &vertices)
+        appendFloat(point.z, to: &vertices)
+    }
+    try backend.writeBuffer(id: 700, offset: 0, data: vertices)
+    try backend.createAccelerationStructure(id: 701, type: 1, requestedSize: 4096)
+    try backend.buildPrimitiveAccelerationStructure(
+        id: 701,
+        buildFlags: 0x4,
+        geometries: [PrimitiveAccelerationStructureGeometry(
+            kind: .triangles,
+            flags: 1,
+            dataResourceID: 700,
+            dataOffset: 0,
+            primitiveCount: 1,
+            stride: 12,
+            vertexFormat: 1
+        )]
+    )
+    try backend.createAccelerationStructure(id: 702, type: 0, requestedSize: 4096)
+    try backend.buildInstanceAccelerationStructure(
+        id: 702,
+        buildFlags: 0x4,
+        instances: [InstanceAccelerationStructureInstance(
+            transformationMatrix: [
+                1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, 0,
+            ],
+            options: 0,
+            mask: 0xff,
+            intersectionFunctionTableOffset: 0,
+            userID: 0x00bf_8080,
+            accelerationStructureResourceID: 701
+        )]
+    )
+
+    let camera = RayCamera(
+        position: SIMD3<Float>(0, 0, -2),
+        forward: SIMD3<Float>(0, 0, 1),
+        up: SIMD3<Float>(0, 1, 0),
+        verticalFOVRadians: 0.9,
+        nearDistance: 0.01,
+        farDistance: 100
+    )
+    func shapedLight(
+        axis: SIMD3<Float>,
+        angle: Float,
+        softness: Float,
+        focus: Float = 0,
+        tint: SIMD3<Float> = .zero
+    ) -> RaySphereLight {
+        RaySphereLight(
+            position: SIMD3<Float>(0, 0, -1),
+            color: SIMD3<Float>(1, 1, 1),
+            intensity: 80,
+            radius: 0.3,
+            shapingAxis: axis,
+            shapingConeAngleDegrees: angle,
+            shapingConeSoftness: softness,
+            shapingFocus: focus,
+            shapingFocusTint: tint,
+            hasShaping: true
+        )
+    }
+    func render(
+        imageID: UInt64,
+        fenceID: UInt64,
+        light: RaySphereLight
+    ) throws -> [UInt8] {
+        try backend.createImage(
+            id: imageID, width: 64, height: 64, format: 1, options: 0
+        )
+        try backend.submitRayTrace(
+            imageID: imageID,
+            accelerationStructureID: 702,
+            width: 64,
+            height: 64,
+            missRGBA8: 0xff00_0000,
+            hitRGBA8: 0xffe0_8c30,
+            camera: camera,
+            sphereLight: nil,
+            distantLight: nil,
+            domeLight: nil,
+            additionalSphereLights: [light],
+            additionalDistantLights: [],
+            additionalDomeLights: [],
+            fenceID: fenceID
+        )
+        #expect(try backend.waitFence(id: fenceID))
+        let center = (32 * 64 + 32) * 4
+        return Array(try backend.readImage(id: imageID)[center..<(center + 4)])
+    }
+
+    let onAxis = try render(
+        imageID: 703,
+        fenceID: 701,
+        light: shapedLight(axis: SIMD3<Float>(0, 0, 1), angle: 30, softness: 0)
+    )
+    let outsideCone = try render(
+        imageID: 704,
+        fenceID: 702,
+        light: shapedLight(axis: SIMD3<Float>(1, 0, 0), angle: 30, softness: 0)
+    )
+    let tiltedAxis = SIMD3<Float>(0.406_736, 0, 0.913_545)
+    let hardEdge = try render(
+        imageID: 705,
+        fenceID: 703,
+        light: shapedLight(axis: tiltedAxis, angle: 30, softness: 0)
+    )
+    let softEdge = try render(
+        imageID: 706,
+        fenceID: 704,
+        light: shapedLight(axis: tiltedAxis, angle: 30, softness: 0.5)
+    )
+    let focusedTint = try render(
+        imageID: 707,
+        fenceID: 705,
+        light: shapedLight(
+            axis: SIMD3<Float>(0.866_025, 0, 0.5),
+            angle: 90,
+            softness: 0,
+            focus: 4,
+            tint: SIMD3<Float>(1, 0, 0)
+        )
+    )
+
+    #expect(outsideCone[0] < softEdge[0])
+    #expect(softEdge[0] < hardEdge[0])
+    #expect(hardEdge[0] <= onAxis[0])
+    #expect(outsideCone[0] < onAxis[0])
+    #expect(Int(focusedTint[0]) > Int(focusedTint[1]) + 8)
+    #expect(Int(focusedTint[0]) > Int(focusedTint[2]) + 8)
+}
 #endif

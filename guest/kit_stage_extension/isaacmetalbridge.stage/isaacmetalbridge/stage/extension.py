@@ -20,11 +20,11 @@ from pxr import Gf, Tf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 
 _SCENE_HEADER = struct.Struct("<IHHQ32fQII")
-_SCENE_LIGHT_RECORD = struct.Struct("<II16fQ")
+_SCENE_LIGHT_RECORD = struct.Struct("<II16fQ9fI")
 _SCENE_TEXTURE_RECORD = struct.Struct("<QIII")
 _SCENE_MESH_RECORD = struct.Struct("<QII26f28I")
 _SCENE_MAGIC = 0x31434D49
-_SCENE_VERSION = 17
+_SCENE_VERSION = 18
 _CAMERA_VALID_PERSPECTIVE = 1
 _SCENE_VALID_SPHERE_LIGHT = 2
 _SCENE_HAS_MESH_MANIFEST = 4
@@ -37,6 +37,7 @@ _SCENE_HAS_MATERIAL_PARAMETERS = 256
 _SCENE_HAS_EMISSION = 512
 _SCENE_HAS_PARAMETER_TEXTURES = 1024
 _SCENE_HAS_NORMAL_TEXTURES = 2048
+_LIGHT_SHAPING_APPLIED = 1
 _MESH_HAS_BOUND_MATERIAL = 1
 _MESH_HAS_BASE_COLOR = 2
 _MESH_HAS_CONNECTED_BASE_COLOR = 4
@@ -418,6 +419,60 @@ def _nonnegative_scalar(value, maximum: float = 1_000_000.0) -> float | None:
     if not math.isfinite(result):
         return None
     return min(max(result, 0.0), maximum)
+
+
+def _light_shaping_values(prim, world: Gf.Matrix4d, sample_time, schema_code: int):
+    """Return the bounded Protocol shaping tail for an applied ShapingAPI."""
+    empty = ((0.0,) * 9, 0, "")
+    try:
+        if not prim.HasAPI(UsdLux.ShapingAPI):
+            return empty
+        shaping = UsdLux.ShapingAPI(prim)
+        cone_angle = _finite_scalar(
+            shaping.GetShapingConeAngleAttr().Get(sample_time), 90.0
+        )
+        cone_softness = _finite_scalar(
+            shaping.GetShapingConeSoftnessAttr().Get(sample_time), 0.0
+        )
+        focus = _finite_scalar(
+            shaping.GetShapingFocusAttr().Get(sample_time), 0.0
+        )
+        focus_tint_value = shaping.GetShapingFocusTintAttr().Get(sample_time)
+        focus_tint = tuple(
+            min(max(float(focus_tint_value[index]), 0.0), 1_000_000.0)
+            for index in range(3)
+        )
+        ies_value = shaping.GetShapingIesFileAttr().Get(sample_time)
+    except Exception:
+        return empty
+
+    scalar_values = (cone_angle, cone_softness, focus, *focus_tint)
+    if not all(value is not None and math.isfinite(value) for value in scalar_values):
+        return empty
+
+    # CylinderLight's primary emission axis is local +X. Other supported
+    # positional lights follow the UsdLux convention and emit along local -Z.
+    local_axis = (
+        Gf.Vec3d(1.0, 0.0, 0.0)
+        if schema_code == 6
+        else Gf.Vec3d(0.0, 0.0, -1.0)
+    )
+    world_axis = world.TransformDir(local_axis)
+    axis_length = math.sqrt(sum(float(value) ** 2 for value in world_axis))
+    if not math.isfinite(axis_length) or axis_length <= 0.000001:
+        return empty
+    axis = tuple(float(value) / axis_length for value in world_axis)
+    values = (
+        *axis,
+        min(max(float(cone_angle), 0.0), 180.0),
+        min(max(float(cone_softness), 0.0), 1.0),
+        min(max(float(focus), 0.0), 1_000_000.0),
+        *focus_tint,
+    )
+    ies_path = getattr(ies_value, "path", "")
+    if not ies_path and ies_value is not None:
+        ies_path = str(ies_value)
+    return (values, _LIGHT_SHAPING_APPLIED, str(ies_path))
 
 
 def _connected_texture_shader(shade_property, visited: set[tuple[str, str]]):
@@ -2638,6 +2693,7 @@ class StartupStageExtension(omni.ext.IExt):
                 mesh_paths.append(mesh_path)
 
             positional_lights = []
+            ignored_shaping_ies_paths = []
             for prim in _stage_prims(stage):
                 if len(positional_lights) >= _MAX_SCENE_POSITIONAL_LIGHTS:
                     break
@@ -2758,7 +2814,16 @@ class StartupStageExtension(omni.ext.IExt):
                     axis_u[0], axis_u[1], axis_u[2], half_extent_u,
                     axis_v[0], axis_v[1], axis_v[2], half_extent_v,
                 )
+                shaping_values, shaping_flags, shaping_ies_path = (
+                    _light_shaping_values(
+                        prim, world, sample_time, schema_code
+                    )
+                )
                 if all(math.isfinite(value) for value in wire_values):
+                    if shaping_ies_path:
+                        ignored_shaping_ies_paths.append(
+                            (str(prim.GetPath()), shaping_ies_path)
+                        )
                     positional_lights.append(
                         (
                             schema_code,
@@ -2766,6 +2831,8 @@ class StartupStageExtension(omni.ext.IExt):
                             str(prim.GetPath()),
                             values,
                             wire_values,
+                            shaping_values,
+                            shaping_flags,
                         )
                     )
 
@@ -2851,19 +2918,29 @@ class StartupStageExtension(omni.ext.IExt):
             dome_light_values = dome_lights[0][3] if dome_lights else (0.0,) * 4
             dome_light_path = dome_lights[0][2] if dome_lights else ""
 
-            # Scene-state v17 publishes one complete list. The fixed first-light
+            # Scene-state v18 publishes one complete list. The fixed first-light
             # slots remain populated only so older state readers retain a stable
-            # header shape; the v16 ICD suppresses those legacy slots when it
-            # submits the rich list to Protocol 1.19.
+            # header shape; the v18 ICD suppresses those legacy slots when it
+            # submits the rich list to Protocol 1.20.
             additional_light_records = []
             additional_light_descriptions = []
-            for schema_code, schema_name, path, _, wire_values in positional_lights:
+            for (
+                schema_code,
+                schema_name,
+                path,
+                _,
+                wire_values,
+                shaping_values,
+                shaping_flags,
+            ) in positional_lights:
                 additional_light_records.append(
                     _SCENE_LIGHT_RECORD.pack(
                         1,
                         schema_code,
                         *wire_values,
                         _fnv1a_64(path),
+                        *shaping_values,
+                        shaping_flags,
                     )
                 )
                 additional_light_descriptions.append(f"{schema_name}:{path}")
@@ -2877,6 +2954,9 @@ class StartupStageExtension(omni.ext.IExt):
                         0.0, 0.0, 0.0, 0.0,
                         0.0, 0.0, 0.0, 0.0,
                         _fnv1a_64(path),
+                        0.0, 0.0, 0.0, 0.0,
+                        0.0, 0.0, 0.0, 0.0, 0.0,
+                        0,
                     )
                 )
                 additional_light_descriptions.append(f"{schema_name}:{path}")
@@ -2890,6 +2970,9 @@ class StartupStageExtension(omni.ext.IExt):
                         0.0, 0.0, 0.0, 0.0,
                         0.0, 0.0, 0.0, 0.0,
                         _fnv1a_64(path),
+                        0.0, 0.0, 0.0, 0.0,
+                        0.0, 0.0, 0.0, 0.0, 0.0,
+                        0,
                     )
                 )
                 additional_light_descriptions.append(f"{schema_name}:{path}")
@@ -3006,22 +3089,46 @@ class StartupStageExtension(omni.ext.IExt):
                         f"intensity={sphere_light_values[6]:.3f} "
                         f"radius={sphere_light_values[7]:.3f}"
                     )
-                for schema_code, schema_name, path, _, wire_values in positional_lights:
-                    if schema_code == 1:
-                        continue
-                    cylinder_details = (
-                        f" radialW={wire_values[7]:.3f}"
-                        if schema_code == 6
-                        else ""
-                    )
+                for (
+                    schema_code,
+                    schema_name,
+                    path,
+                    _,
+                    wire_values,
+                    shaping_values,
+                    shaping_flags,
+                ) in positional_lights:
+                    if schema_code != 1:
+                        cylinder_details = (
+                            f" radialW={wire_values[7]:.3f}"
+                            if schema_code == 6
+                            else ""
+                        )
+                        carb.log_warn(
+                            "isaacmetalbridge.stage: oriented USD area/line light published: "
+                            f"schema={schema_name} path={path} "
+                            f"axisU=({wire_values[8]:.3f},{wire_values[9]:.3f},"
+                            f"{wire_values[10]:.3f}) halfExtentU={wire_values[11]:.3f} "
+                            f"axisV=({wire_values[12]:.3f},{wire_values[13]:.3f},"
+                            f"{wire_values[14]:.3f}) halfExtentV={wire_values[15]:.3f}"
+                            f"{cylinder_details}"
+                        )
+                    if shaping_flags & _LIGHT_SHAPING_APPLIED:
+                        carb.log_warn(
+                            "isaacmetalbridge.stage: UsdLuxShapingAPI published: "
+                            f"schema={schema_name} path={path} "
+                            f"axis=({shaping_values[0]:.3f},"
+                            f"{shaping_values[1]:.3f},{shaping_values[2]:.3f}) "
+                            f"cone={shaping_values[3]:.3f}deg "
+                            f"softness={shaping_values[4]:.3f} "
+                            f"focus={shaping_values[5]:.3f} "
+                            f"focusTint=({shaping_values[6]:.3f},"
+                            f"{shaping_values[7]:.3f},{shaping_values[8]:.3f})"
+                        )
+                for light_path, ies_path in ignored_shaping_ies_paths:
                     carb.log_warn(
-                        "isaacmetalbridge.stage: oriented USD area/line light published: "
-                        f"schema={schema_name} path={path} "
-                        f"axisU=({wire_values[8]:.3f},{wire_values[9]:.3f},"
-                        f"{wire_values[10]:.3f}) halfExtentU={wire_values[11]:.3f} "
-                        f"axisV=({wire_values[12]:.3f},{wire_values[13]:.3f},"
-                        f"{wire_values[14]:.3f}) halfExtentV={wire_values[15]:.3f}"
-                        f"{cylinder_details}"
+                        "isaacmetalbridge.stage: ShapingAPI IES profile is not "
+                        f"transported yet: path={light_path} ies={ies_path}"
                     )
                 if distant_light_path:
                     carb.log_warn(

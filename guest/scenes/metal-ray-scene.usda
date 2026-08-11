@@ -347,7 +347,7 @@ def Xform "World"
         uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
     }
 
-    # Protocol 1.18 preserves this RectLight's transformed local XY axes and
+    # Protocol 1.20 preserves this RectLight's transformed local XY axes and
     # dimensions; Metal evaluates its one-sided -Z emission with four bounded
     # area samples.
     def RectLight "WindowLight"
@@ -368,6 +368,42 @@ def Xform "World"
         color3f inputs:color = (1.0, 0.42, 0.16)
         float inputs:radius = 0.55
         double3 xformOp:translate = (2.5, -1.5, 2.8)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    # CylinderLight is centered on its local X axis. Scene-state v18 carries
+    # the transformed axis, half-length, and both radial extents; Metal samples
+    # the outward-emitting curved surface.
+    def CylinderLight "TubeLight"
+    {
+        float inputs:intensity = 420
+        color3f inputs:color = (0.38, 1.0, 0.55)
+        float inputs:length = 1.8
+        float inputs:radius = 0.32
+        bool inputs:treatAsLine = false
+        double3 xformOp:translate = (0.0, -2.4, 2.1)
+        double3 xformOp:rotateXYZ = (15, 20, 25)
+        uniform token[] xformOpOrder = [
+            "xformOp:translate",
+            "xformOp:rotateXYZ"
+        ]
+    }
+
+    # A real UsdLuxShapingAPI spotlight regression. Protocol 1.20 transports
+    # the applied-schema flag separately from its fallback values so an
+    # ordinary unshaped SphereLight remains omnidirectional.
+    def SphereLight "SpotLight" (
+        prepend apiSchemas = ["ShapingAPI"]
+    )
+    {
+        float inputs:intensity = 900
+        color3f inputs:color = (1.0, 0.88, 0.66)
+        float inputs:radius = 0.22
+        float inputs:shaping:cone:angle = 35
+        float inputs:shaping:cone:softness = 0.35
+        float inputs:shaping:focus = 4
+        color3f inputs:shaping:focusTint = (0.12, 0.28, 1.0)
+        double3 xformOp:translate = (0.0, 0.0, 4.4)
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 

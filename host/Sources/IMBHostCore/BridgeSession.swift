@@ -1062,7 +1062,7 @@ public final class BridgeSession: @unchecked Sendable {
                           lightCount > 0,
                           lightCount <= 16,
                           lightReserved == 0,
-                          frame.payload.count == 176 + Int(lightCount) * 80
+                          frame.payload.count == 176 + Int(lightCount) * 120
                     else {
                         return failure(
                             frame,
@@ -1071,7 +1071,7 @@ public final class BridgeSession: @unchecked Sendable {
                         )
                     }
                     for lightIndex in 0..<Int(lightCount) {
-                        let lightOffset = 176 + lightIndex * 80
+                        let lightOffset = 176 + lightIndex * 120
                         guard let kind: UInt32 = try? frame.payload.readLittleEndian(at: lightOffset),
                               let schema: UInt32 = try? frame.payload.readLittleEndian(at: lightOffset + 4),
                               let pathHash: UInt64 = try? frame.payload.readLittleEndian(at: lightOffset + 72),
@@ -1098,12 +1098,60 @@ public final class BridgeSession: @unchecked Sendable {
                                 "TRACE_RAYS additional light \(lightIndex) values are invalid"
                             )
                         }
+                        let shapingValues: [Float] = (0..<9).compactMap { valueIndex in
+                            guard let bits: UInt32 = try? frame.payload.readLittleEndian(
+                                at: lightOffset + 80 + valueIndex * 4
+                            ) else {
+                                return nil
+                            }
+                            return Float(bitPattern: bits)
+                        }
+                        guard let shapingFlags: UInt32 = try? frame.payload.readLittleEndian(
+                                at: lightOffset + 116
+                              ),
+                              shapingValues.count == 9,
+                              shapingValues.allSatisfy(\.isFinite),
+                              shapingFlags & ~UInt32(1) == 0
+                        else {
+                            return failure(
+                                frame,
+                                .invalidPayload,
+                                "TRACE_RAYS additional light \(lightIndex) shaping data is invalid"
+                            )
+                        }
+                        let hasShaping = shapingFlags & 1 != 0
+                        let shapingAxisLengthSquared = shapingValues[0] * shapingValues[0]
+                            + shapingValues[1] * shapingValues[1]
+                            + shapingValues[2] * shapingValues[2]
+                        if hasShaping {
+                            guard kind == 1,
+                                  shapingAxisLengthSquared > 0.000_001,
+                                  shapingValues[3] >= 0, shapingValues[3] <= 180,
+                                  shapingValues[4] >= 0, shapingValues[4] <= 1,
+                                  shapingValues[5] >= 0,
+                                  shapingValues[6] >= 0,
+                                  shapingValues[7] >= 0,
+                                  shapingValues[8] >= 0
+                            else {
+                                return failure(
+                                    frame,
+                                    .invalidPayload,
+                                    "TRACE_RAYS additional light \(lightIndex) ShapingAPI is invalid"
+                                )
+                            }
+                        } else if !shapingValues.allSatisfy({ $0 == 0 }) {
+                            return failure(
+                                frame,
+                                .invalidPayload,
+                                "TRACE_RAYS additional light \(lightIndex) has unflagged shaping data"
+                            )
+                        }
                         switch kind {
                         case 1:
-                            guard schema >= 1, schema <= 3,
+                            guard (schema >= 1 && schema <= 3) || schema == 6,
                                   values[3] >= 0,
                                   values[4] >= 0, values[5] >= 0, values[6] >= 0,
-                                  values[7] > 0
+                                  (schema == 6 ? values[7] >= 0 : values[7] > 0)
                             else {
                                 return failure(
                                     frame,
@@ -1121,6 +1169,19 @@ public final class BridgeSession: @unchecked Sendable {
                                         frame,
                                         .invalidPayload,
                                         "TRACE_RAYS SphereLight shape values are invalid"
+                                    )
+                                }
+                            } else if schema == 6 {
+                                guard axisULengthSquared > 0.000_001,
+                                      axisVLengthSquared > 0.000_001,
+                                      values[11] > 0,
+                                      ((values[7] > 0 && values[15] > 0)
+                                          || (values[7] == 0 && values[15] == 0))
+                                else {
+                                    return failure(
+                                        frame,
+                                        .invalidPayload,
+                                        "TRACE_RAYS CylinderLight basis is invalid"
                                     )
                                 }
                             } else {
@@ -1145,7 +1206,17 @@ public final class BridgeSession: @unchecked Sendable {
                                 axisU: SIMD3<Float>(values[8], values[9], values[10]),
                                 axisV: SIMD3<Float>(values[12], values[13], values[14]),
                                 halfExtentU: values[11],
-                                halfExtentV: values[15]
+                                halfExtentV: values[15],
+                                shapingAxis: SIMD3<Float>(
+                                    shapingValues[0], shapingValues[1], shapingValues[2]
+                                ),
+                                shapingConeAngleDegrees: shapingValues[3],
+                                shapingConeSoftness: shapingValues[4],
+                                shapingFocus: shapingValues[5],
+                                shapingFocusTint: SIMD3<Float>(
+                                    shapingValues[6], shapingValues[7], shapingValues[8]
+                                ),
+                                hasShaping: hasShaping
                             ))
                         case 2:
                             guard schema == 4,
