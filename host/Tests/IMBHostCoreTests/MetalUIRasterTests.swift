@@ -517,6 +517,12 @@ private func appendUIVertex(
         )]
     )
 
+    let authoredDistantLight = RayDistantLight(
+        direction: SIMD3<Float>(0, 0, 1),
+        color: SIMD3<Float>(1, 1, 1),
+        intensity: 1,
+        angleDegrees: 0
+    )
     try backend.createImage(id: 33, width: 64, height: 64, format: 1, options: 0)
     try backend.submitRayTrace(
         imageID: 33,
@@ -534,12 +540,7 @@ private func appendUIVertex(
             farDistance: 100
         ),
         sphereLight: nil,
-        distantLight: RayDistantLight(
-            direction: SIMD3<Float>(0, 0, 1),
-            color: SIMD3<Float>(1, 1, 1),
-            intensity: 1,
-            angleDegrees: 0
-        ),
+        distantLight: authoredDistantLight,
         domeLight: nil,
         fenceID: 34
     )
@@ -553,6 +554,99 @@ private func appendUIVertex(
     #expect(left[0] > 0)
     #expect(right[0] > 0)
     #expect(left[0] < right[0])
+
+    // The same authored light sent through the protocol 1.17 light-list tail
+    // must shade identically to the legacy inline slot.
+    try backend.createImage(id: 35, width: 64, height: 64, format: 1, options: 0)
+    try backend.submitRayTrace(
+        imageID: 35,
+        accelerationStructureID: 32,
+        width: 64,
+        height: 64,
+        missRGBA8: 0xff00_0000,
+        hitRGBA8: 0xffe0_8c30,
+        camera: RayCamera(
+            position: SIMD3<Float>(0, 0, -2),
+            forward: SIMD3<Float>(0, 0, 1),
+            up: SIMD3<Float>(0, 1, 0),
+            verticalFOVRadians: 0.9,
+            nearDistance: 0.01,
+            farDistance: 100
+        ),
+        sphereLight: nil,
+        distantLight: nil,
+        domeLight: nil,
+        additionalSphereLights: [],
+        additionalDistantLights: [authoredDistantLight],
+        additionalDomeLights: [],
+        fenceID: 36
+    )
+    #expect(try backend.waitFence(id: 36))
+    let additionalPixels = try backend.readImage(id: 35)
+    let additionalLeft = Array(
+        additionalPixels[leftOffset..<(leftOffset + 4)]
+    )
+    let additionalRight = Array(
+        additionalPixels[rightOffset..<(rightOffset + 4)]
+    )
+    #expect(additionalLeft == left)
+    #expect(additionalRight == right)
+
+    // Exercise the packed record offsets for all three light kinds together.
+    let authoredSphereLight = RaySphereLight(
+        position: SIMD3<Float>(0, 0, -1),
+        color: SIMD3<Float>(0.7, 0.8, 1),
+        intensity: 1,
+        radius: 0.5
+    )
+    let authoredDomeLight = RayDomeLight(
+        color: SIMD3<Float>(0.15, 0.2, 0.3),
+        intensity: 1
+    )
+    let comparisonCamera = RayCamera(
+        position: SIMD3<Float>(0, 0, -2),
+        forward: SIMD3<Float>(0, 0, 1),
+        up: SIMD3<Float>(0, 1, 0),
+        verticalFOVRadians: 0.9,
+        nearDistance: 0.01,
+        farDistance: 100
+    )
+    try backend.createImage(id: 37, width: 64, height: 64, format: 1, options: 0)
+    try backend.submitRayTrace(
+        imageID: 37,
+        accelerationStructureID: 32,
+        width: 64,
+        height: 64,
+        missRGBA8: 0xff00_0000,
+        hitRGBA8: 0xffe0_8c30,
+        camera: comparisonCamera,
+        sphereLight: authoredSphereLight,
+        distantLight: authoredDistantLight,
+        domeLight: authoredDomeLight,
+        fenceID: 38
+    )
+    #expect(try backend.waitFence(id: 38))
+    try backend.createImage(id: 39, width: 64, height: 64, format: 1, options: 0)
+    try backend.submitRayTrace(
+        imageID: 39,
+        accelerationStructureID: 32,
+        width: 64,
+        height: 64,
+        missRGBA8: 0xff00_0000,
+        hitRGBA8: 0xffe0_8c30,
+        camera: comparisonCamera,
+        sphereLight: nil,
+        distantLight: nil,
+        domeLight: nil,
+        additionalSphereLights: [authoredSphereLight],
+        additionalDistantLights: [authoredDistantLight],
+        additionalDomeLights: [authoredDomeLight],
+        fenceID: 40
+    )
+    #expect(try backend.waitFence(id: 40))
+    let inlineCombined = try backend.readImage(id: 37)
+    let additionalCombined = try backend.readImage(id: 39)
+    #expect(additionalCombined == inlineCombined)
 }
 
 @Test func metalRayShadingSamplesFileTextureUVs() throws {

@@ -39,6 +39,9 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     private(set) var lastRaySphereLight: RaySphereLight?
     private(set) var lastRayDistantLight: RayDistantLight?
     private(set) var lastRayDomeLight: RayDomeLight?
+    private(set) var lastRayAdditionalSphereLights: [RaySphereLight] = []
+    private(set) var lastRayAdditionalDistantLights: [RayDistantLight] = []
+    private(set) var lastRayAdditionalDomeLights: [RayDomeLight] = []
     private(set) var lastEmptyStageGridCamera: RayCamera?
 
     var supportsSPIRVCompute: Bool { true }
@@ -331,6 +334,40 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         domeLight: RayDomeLight?,
         fenceID: UInt64
     ) throws {
+        try submitRayTrace(
+            imageID: imageID,
+            accelerationStructureID: accelerationStructureID,
+            width: width,
+            height: height,
+            missRGBA8: missRGBA8,
+            hitRGBA8: hitRGBA8,
+            camera: camera,
+            sphereLight: sphereLight,
+            distantLight: distantLight,
+            domeLight: domeLight,
+            additionalSphereLights: [],
+            additionalDistantLights: [],
+            additionalDomeLights: [],
+            fenceID: fenceID
+        )
+    }
+
+    func submitRayTrace(
+        imageID: UInt64,
+        accelerationStructureID: UInt64,
+        width: UInt32,
+        height: UInt32,
+        missRGBA8: UInt32,
+        hitRGBA8: UInt32,
+        camera: RayCamera?,
+        sphereLight: RaySphereLight?,
+        distantLight: RayDistantLight?,
+        domeLight: RayDomeLight?,
+        additionalSphereLights: [RaySphereLight],
+        additionalDistantLights: [RayDistantLight],
+        additionalDomeLights: [RayDomeLight],
+        fenceID: UInt64
+    ) throws {
         guard var image = images[imageID],
               accelerationStructures.contains(accelerationStructureID),
               image.width == Int(width), image.height == Int(height)
@@ -354,6 +391,9 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         lastRaySphereLight = sphereLight
         lastRayDistantLight = distantLight
         lastRayDomeLight = domeLight
+        lastRayAdditionalSphereLights = additionalSphereLights
+        lastRayAdditionalDistantLights = additionalDistantLights
+        lastRayAdditionalDomeLights = additionalDomeLights
         fences.insert(fenceID)
     }
 
@@ -1017,7 +1057,7 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     command.appendLittleEndian(UInt32(16))
     command.appendLittleEndian(UInt32(0xff00_0000))
     command.appendLittleEndian(UInt32(0xff00_ff00))
-    command.appendLittleEndian(UInt32(15))
+    command.appendLittleEndian(UInt32(47))
     command.appendLittleEndian(UInt32(0))
     let expectedCamera = RayCamera(
         position: SIMD3<Float>(7, 8, 9),
@@ -1091,6 +1131,74 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     ] {
         command.appendLittleEndian(value.bitPattern)
     }
+    let expectedAdditionalSphereLight = RaySphereLight(
+        position: SIMD3<Float>(-3, 2, 5),
+        color: SIMD3<Float>(0.4, 0.7, 1),
+        intensity: 3_200,
+        radius: 0.5
+    )
+    let expectedAdditionalDistantLight = RayDistantLight(
+        direction: SIMD3<Float>(-0.5, 0.25, -1),
+        color: SIMD3<Float>(0.8, 0.9, 1),
+        intensity: 900,
+        angleDegrees: 2.5
+    )
+    let expectedAdditionalDomeLight = RayDomeLight(
+        color: SIMD3<Float>(0.12, 0.16, 0.22),
+        intensity: 75
+    )
+    let additionalRecords: [(UInt32, UInt32, [Float], UInt64)] = [
+        (
+            1, 3,
+            [
+                expectedAdditionalSphereLight.position.x,
+                expectedAdditionalSphereLight.position.y,
+                expectedAdditionalSphereLight.position.z,
+                expectedAdditionalSphereLight.intensity,
+                expectedAdditionalSphereLight.color.x,
+                expectedAdditionalSphereLight.color.y,
+                expectedAdditionalSphereLight.color.z,
+                expectedAdditionalSphereLight.radius,
+            ],
+            0x1001
+        ),
+        (
+            2, 4,
+            [
+                expectedAdditionalDistantLight.direction.x,
+                expectedAdditionalDistantLight.direction.y,
+                expectedAdditionalDistantLight.direction.z,
+                expectedAdditionalDistantLight.intensity,
+                expectedAdditionalDistantLight.color.x,
+                expectedAdditionalDistantLight.color.y,
+                expectedAdditionalDistantLight.color.z,
+                expectedAdditionalDistantLight.angleDegrees,
+            ],
+            0x1002
+        ),
+        (
+            3, 5,
+            [
+                expectedAdditionalDomeLight.color.x,
+                expectedAdditionalDomeLight.color.y,
+                expectedAdditionalDomeLight.color.z,
+                expectedAdditionalDomeLight.intensity,
+                0, 0, 0, 0,
+            ],
+            0x1003
+        ),
+    ]
+    command.appendLittleEndian(UInt32(additionalRecords.count))
+    command.appendLittleEndian(UInt32(0))
+    for record in additionalRecords {
+        command.appendLittleEndian(record.0)
+        command.appendLittleEndian(record.1)
+        for value in record.2 {
+            command.appendLittleEndian(value.bitPattern)
+        }
+        command.appendLittleEndian(record.3)
+    }
+    #expect(command.count == 320)
     let submitted = session.handle(request(
         .submitCommand,
         id: 4,
@@ -1102,6 +1210,9 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     #expect(backend.lastRaySphereLight == expectedSphereLight)
     #expect(backend.lastRayDistantLight == expectedDistantLight)
     #expect(backend.lastRayDomeLight == expectedDomeLight)
+    #expect(backend.lastRayAdditionalSphereLights == [expectedAdditionalSphereLight])
+    #expect(backend.lastRayAdditionalDistantLights == [expectedAdditionalDistantLight])
+    #expect(backend.lastRayAdditionalDomeLights == [expectedAdditionalDomeLight])
 
     let busyAcceleration = session.handle(request(
         .destroyResource,

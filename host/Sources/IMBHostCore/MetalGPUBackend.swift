@@ -364,6 +364,22 @@ public protocol BridgeGPUBackend: AnyObject {
         domeLight: RayDomeLight?,
         fenceID: UInt64
     ) throws
+    func submitRayTrace(
+        imageID: UInt64,
+        accelerationStructureID: UInt64,
+        width: UInt32,
+        height: UInt32,
+        missRGBA8: UInt32,
+        hitRGBA8: UInt32,
+        camera: RayCamera?,
+        sphereLight: RaySphereLight?,
+        distantLight: RayDistantLight?,
+        domeLight: RayDomeLight?,
+        additionalSphereLights: [RaySphereLight],
+        additionalDistantLights: [RayDistantLight],
+        additionalDomeLights: [RayDomeLight],
+        fenceID: UInt64
+    ) throws
     func submitEmptyStageGrid(
         imageID: UInt64,
         width: UInt32,
@@ -717,12 +733,17 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         const device uint *instanceNormalTextureIndices [[buffer(27)]],
         constant uint &rayPixelStep [[buffer(28)]],
         const device float2 *instanceMaterialOpacities [[buffer(29)]],
-        constant uint &materialOpacityInstanceCount [[buffer(30)]],
+        const device float4 *rayRuntime [[buffer(30)]],
         texture2d<float, access::write> output [[texture(0)]],
         texture2d<float, access::sample> sceneMaterialTexture [[texture(1)]],
         array<texture2d<float, access::sample>, 126> materialTextures [[texture(2)]],
         uint2 threadID [[thread_position_in_grid]])
     {
+        const uint4 runtimeCounts = uint4(rayRuntime[0]);
+        const uint materialOpacityInstanceCount = runtimeCounts.x;
+        const uint additionalSphereLightCount = (cameraOptions >> 8u) & 0xfu;
+        const uint additionalDistantLightCount = (cameraOptions >> 12u) & 0xfu;
+        const uint additionalDomeLightCount = (cameraOptions >> 16u) & 0xfu;
         const uint pixelStep = max(rayPixelStep, 1u);
         const uint2 pixelOrigin = threadID * pixelStep;
         if (pixelOrigin.x >= extent.x || pixelOrigin.y >= extent.y) return;
@@ -1012,7 +1033,9 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 emissiveRadiance *= emissionTexture;
             }
             const float3 baseColor = resolvedBaseColor;
-            if ((cameraOptions & (2u | 8u | 16u)) != 0) {
+            if ((cameraOptions & (2u | 8u | 16u)) != 0
+                || additionalSphereLightCount + additionalDistantLightCount
+                    + additionalDomeLightCount > 0u) {
                 const float3 hitPosition =
                     probeRay.origin + probeRay.direction * intersection.distance;
                 float3 surfaceNormal = normalize(-probeRay.direction);
@@ -1101,8 +1124,29 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                     128.0, 4.0, roughness * roughness
                 );
                 const float specularEnergy = mix(1.0, 0.18, roughness);
-                if ((cameraOptions & 2u) != 0) {
-                    const float3 toLight = sphereLightPositionAndIntensity.xyz - hitPosition;
+                const uint inlineSphereLightCount =
+                    (cameraOptions & 2u) != 0 ? 1u : 0u;
+                const uint sphereLightCount = inlineSphereLightCount
+                    + additionalSphereLightCount;
+                for (uint sphereLightIndex = 0u;
+                     sphereLightIndex < sphereLightCount;
+                     ++sphereLightIndex) {
+                    const uint additionalIndex = sphereLightIndex
+                        - min(sphereLightIndex, inlineSphereLightCount);
+                    const float4 activePositionAndIntensity =
+                        sphereLightIndex < inlineSphereLightCount
+                        ? sphereLightPositionAndIntensity
+                        : rayRuntime[
+                            1u + additionalIndex * 2u
+                        ];
+                    const float4 activeColorAndRadius =
+                        sphereLightIndex < inlineSphereLightCount
+                        ? sphereLightColorAndRadius
+                        : rayRuntime[
+                            1u + additionalIndex * 2u + 1u
+                        ];
+                    const float3 toLight =
+                        activePositionAndIntensity.xyz - hitPosition;
                     const float lightDistanceSquared = max(dot(toLight, toLight), 0.0001);
                     const float3 lightDirection = toLight * rsqrt(lightDistanceSquared);
                     const float diffuse = max(dot(surfaceNormal, lightDirection), 0.0);
@@ -1206,17 +1250,17 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                             );
                         }
                     }
-                    const float radius = max(sphereLightColorAndRadius.w, 1.0);
+                    const float radius = max(activeColorAndRadius.w, 1.0);
                     const float attenuation = 1.0 / (
                         1.0 + lightDistanceSquared / (radius * radius * 64.0)
                     );
                     const float strength = clamp(
-                        log2(1.0 + max(sphereLightPositionAndIntensity.w, 0.0)) * 0.12,
+                        log2(1.0 + max(activePositionAndIntensity.w, 0.0)) * 0.12,
                         0.15,
                         2.5
                     );
                     const float3 lightColor = max(
-                        sphereLightColorAndRadius.xyz,
+                        activeColorAndRadius.xyz,
                         float3(0.0)
                     );
                     illumination += lightColor * (0.25 + 0.75 * diffuse * visibility)
@@ -1235,14 +1279,36 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                             * specular * strength * attenuation * visibility;
                     }
                 }
-                if ((cameraOptions & 8u) != 0) {
+                const uint inlineDistantLightCount =
+                    (cameraOptions & 8u) != 0 ? 1u : 0u;
+                const uint distantLightCount = inlineDistantLightCount
+                    + additionalDistantLightCount;
+                for (uint distantLightIndex = 0u;
+                     distantLightIndex < distantLightCount;
+                     ++distantLightIndex) {
+                    const uint additionalIndex = distantLightIndex
+                        - min(distantLightIndex, inlineDistantLightCount);
+                    const float4 activeDirectionAndIntensity =
+                        distantLightIndex < inlineDistantLightCount
+                        ? distantLightDirectionAndIntensity
+                        : rayRuntime[
+                            1u + additionalSphereLightCount * 2u
+                                + additionalIndex * 2u
+                        ];
+                    const float4 activeColorAndAngle =
+                        distantLightIndex < inlineDistantLightCount
+                        ? distantLightColorAndAngle
+                        : rayRuntime[
+                            1u + additionalSphereLightCount * 2u
+                                + additionalIndex * 2u + 1u
+                        ];
                     // USD DistantLight emits along its transformed local -Z;
                     // negate that vector for the surface-to-light direction.
                     const float3 lightDirection = normalize(
-                        -distantLightDirectionAndIntensity.xyz
+                        -activeDirectionAndIntensity.xyz
                     );
                     const float angularWrap = clamp(
-                        distantLightColorAndAngle.w / 180.0,
+                        activeColorAndAngle.w / 180.0,
                         0.0,
                         1.0
                     ) * 0.12;
@@ -1346,13 +1412,13 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         }
                     }
                     const float strength = clamp(
-                        log2(1.0 + max(distantLightDirectionAndIntensity.w, 0.0))
+                        log2(1.0 + max(activeDirectionAndIntensity.w, 0.0))
                             * 0.11,
                         0.12,
                         2.5
                     );
                     const float3 lightColor = max(
-                        distantLightColorAndAngle.xyz,
+                        activeColorAndAngle.xyz,
                         float3(0.0)
                     );
                     illumination += lightColor
@@ -1371,19 +1437,33 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                             * specular * strength * visibility;
                     }
                 }
-                if ((cameraOptions & 16u) != 0) {
+                const uint inlineDomeLightCount =
+                    (cameraOptions & 16u) != 0 ? 1u : 0u;
+                const uint domeLightCount = inlineDomeLightCount
+                    + additionalDomeLightCount;
+                for (uint domeLightIndex = 0u;
+                     domeLightIndex < domeLightCount;
+                     ++domeLightIndex) {
+                    const float4 activeColorAndIntensity =
+                        domeLightIndex < inlineDomeLightCount
+                        ? domeLightColorAndIntensity
+                        : rayRuntime[
+                            1u + (additionalSphereLightCount
+                                + additionalDistantLightCount) * 2u
+                                + domeLightIndex - inlineDomeLightCount
+                        ];
                     const float strength = clamp(
-                        log2(1.0 + max(domeLightColorAndIntensity.w, 0.0)) * 0.08,
+                        log2(1.0 + max(activeColorAndIntensity.w, 0.0)) * 0.08,
                         0.10,
                         2.0
                     );
                     illumination += max(
-                        domeLightColorAndIntensity.xyz,
+                        activeColorAndIntensity.xyz,
                         float3(0.0)
                     ) * strength * 0.55;
                     if (hasMaterialParameters) {
                         specularIllumination += max(
-                            domeLightColorAndIntensity.xyz,
+                            activeColorAndIntensity.xyz,
                             float3(0.0)
                         ) * reflectance * strength
                             * mix(0.45, 0.08, roughness);
@@ -3694,6 +3774,47 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         domeLight: RayDomeLight?,
         fenceID: UInt64
     ) throws {
+        try submitRayTrace(
+            imageID: imageID,
+            accelerationStructureID: accelerationStructureID,
+            width: width,
+            height: height,
+            missRGBA8: missRGBA8,
+            hitRGBA8: hitRGBA8,
+            camera: camera,
+            sphereLight: sphereLight,
+            distantLight: distantLight,
+            domeLight: domeLight,
+            additionalSphereLights: [],
+            additionalDistantLights: [],
+            additionalDomeLights: [],
+            fenceID: fenceID
+        )
+    }
+
+    public func submitRayTrace(
+        imageID: UInt64,
+        accelerationStructureID: UInt64,
+        width: UInt32,
+        height: UInt32,
+        missRGBA8: UInt32,
+        hitRGBA8: UInt32,
+        camera: RayCamera?,
+        sphereLight: RaySphereLight?,
+        distantLight: RayDistantLight?,
+        domeLight: RayDomeLight?,
+        additionalSphereLights: [RaySphereLight],
+        additionalDistantLights: [RayDistantLight],
+        additionalDomeLights: [RayDomeLight],
+        fenceID: UInt64
+    ) throws {
+        guard additionalSphereLights.count + additionalDistantLights.count
+                + additionalDomeLights.count <= 13
+        else {
+            throw GPUBackendError.unsupported(
+                "ray dispatch supports at most 13 additional lights"
+            )
+        }
         guard let pipeline = rayTracePipeline, device.supportsRaytracing else {
             throw GPUBackendError.unavailable("Metal ray dispatch is unavailable")
         }
@@ -3778,6 +3899,9 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         if tracesHardShadows {
             cameraOptions |= 32
         }
+        cameraOptions |= UInt32(additionalSphereLights.count) << 8
+        cameraOptions |= UInt32(additionalDistantLights.count) << 12
+        cameraOptions |= UInt32(additionalDomeLights.count) << 16
         let pixelStepMode = ProcessInfo.processInfo.environment[
             "IMB_RAY_PIXEL_STEP"
         ]?.lowercased() ?? "1"
@@ -3803,6 +3927,9 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 + "pixelStep=\(rayPixelStepValue) "
                 + "pixelStepMode=\(pixelStepMode) "
                 + "instances=\(acceleration.childStructureIDs.count) "
+                + "lights=\((sphereLight == nil ? 0 : 1) + additionalSphereLights.count)"
+                + "/\((distantLight == nil ? 0 : 1) + additionalDistantLights.count)"
+                + "/\((domeLight == nil ? 0 : 1) + additionalDomeLights.count) "
                 + "adaptiveLimit=\(max(shadowInstanceLimit, 0))\n"
             FileHandle.standardError.write(Data(message.utf8))
             rayQualityReported = true
@@ -3837,6 +3964,32 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             domeLight?.color.z ?? 0,
             domeLight?.intensity ?? 0
         )
+        let additionalSphereLightRecords = additionalSphereLights.flatMap {
+            [
+                SIMD4<Float>(
+                    $0.position.x, $0.position.y, $0.position.z, $0.intensity
+                ),
+                SIMD4<Float>(
+                    $0.color.x, $0.color.y, $0.color.z, $0.radius
+                ),
+            ]
+        }
+        let additionalDistantLightRecords = additionalDistantLights.flatMap {
+            [
+                SIMD4<Float>(
+                    $0.direction.x, $0.direction.y, $0.direction.z, $0.intensity
+                ),
+                SIMD4<Float>(
+                    $0.color.x, $0.color.y, $0.color.z, $0.angleDegrees
+                ),
+            ]
+        }
+        let additionalDomeLightRecords = additionalDomeLights.map {
+            SIMD4<Float>($0.color.x, $0.color.y, $0.color.z, $0.intensity)
+        }
+        let additionalSphereLightCount = UInt32(additionalSphereLights.count)
+        let additionalDistantLightCount = UInt32(additionalDistantLights.count)
+        let additionalDomeLightCount = UInt32(additionalDomeLights.count)
         encoder.setBytes(&extent, length: MemoryLayout<SIMD2<UInt32>>.size, index: 1)
         encoder.setBytes(&colors, length: MemoryLayout<SIMD2<UInt32>>.size, index: 2)
         encoder.setBytes(
@@ -4038,11 +4191,34 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             )
             materialOpacityInstanceCount = 0
         }
-        encoder.setBytes(
-            &materialOpacityInstanceCount,
-            length: MemoryLayout<UInt32>.size,
-            index: 30
+        var rayRuntime = Data()
+        rayRuntime.reserveCapacity(16 + 26 * MemoryLayout<SIMD4<Float>>.size)
+        var runtimeCounts = SIMD4<Float>(
+            Float(materialOpacityInstanceCount),
+            Float(additionalSphereLightCount),
+            Float(additionalDistantLightCount),
+            Float(additionalDomeLightCount)
         )
+        Swift.withUnsafeBytes(of: &runtimeCounts) { bytes in
+            rayRuntime.append(contentsOf: bytes)
+        }
+        let additionalLightRecords = additionalSphereLightRecords
+            + additionalDistantLightRecords + additionalDomeLightRecords
+        for var record in additionalLightRecords {
+            Swift.withUnsafeBytes(of: &record) { bytes in
+                rayRuntime.append(contentsOf: bytes)
+            }
+        }
+        let rayRuntimeSize = 16 + 26 * MemoryLayout<SIMD4<Float>>.size
+        if rayRuntime.count < rayRuntimeSize {
+            rayRuntime.append(Data(
+                repeating: 0,
+                count: rayRuntimeSize - rayRuntime.count
+            ))
+        }
+        rayRuntime.withUnsafeBytes { bytes in
+            encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 30)
+        }
         encoder.setBytes(
             &rayPixelStep,
             length: MemoryLayout<UInt32>.size,
@@ -4906,6 +5082,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
     public func submitTriangle(imageID: UInt64, clearRGBA8: UInt32, fenceID: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
     public func submitIndexedUI(imageID: UInt64, vertexBufferID: UInt64, indexBufferID: UInt64, vertexBufferOffset: UInt64, indexBufferOffset: UInt64, width: UInt32, height: UInt32, clearRGBA8: UInt32, draws: [IndexedUIDraw], fenceID: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
     public func submitRayTrace(imageID: UInt64, accelerationStructureID: UInt64, width: UInt32, height: UInt32, missRGBA8: UInt32, hitRGBA8: UInt32, camera: RayCamera?, sphereLight: RaySphereLight?, distantLight: RayDistantLight?, domeLight: RayDomeLight?, fenceID: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
+    public func submitRayTrace(imageID: UInt64, accelerationStructureID: UInt64, width: UInt32, height: UInt32, missRGBA8: UInt32, hitRGBA8: UInt32, camera: RayCamera?, sphereLight: RaySphereLight?, distantLight: RayDistantLight?, domeLight: RayDomeLight?, additionalSphereLights: [RaySphereLight], additionalDistantLights: [RayDistantLight], additionalDomeLights: [RayDomeLight], fenceID: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
     public func submitEmptyStageGrid(imageID: UInt64, width: UInt32, height: UInt32, camera: RayCamera?, fenceID: UInt64) throws { throw GPUBackendError.unavailable("Metal is unavailable") }
     public func waitFence(id: UInt64) throws -> Bool { throw GPUBackendError.unavailable("Metal is unavailable") }
     public func reset() {}

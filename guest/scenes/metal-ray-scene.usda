@@ -360,9 +360,36 @@ def Xform "World"
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 
+    # Additional positional-light transport regression. DiskLight keeps its
+    # authored schema on the wire and is shaded as a bounded equal-radius
+    # positional emitter by Metal.
+    def DiskLight "AccentLight"
+    {
+        float inputs:intensity = 320
+        color3f inputs:color = (1.0, 0.42, 0.16)
+        float inputs:radius = 0.55
+        double3 xformOp:translate = (2.5, -1.5, 2.8)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+
+    def DistantLight "RimLight"
+    {
+        float inputs:intensity = 550
+        float inputs:angle = 2.5
+        color3f inputs:color = (0.45, 0.62, 1.0)
+        double3 xformOp:rotateXYZ = (-20, -55, -35)
+        uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
+    }
+
     def DomeLight "FillLight"
     {
         float inputs:intensity = 400
         color3f inputs:color = (0.28, 0.36, 0.5)
+    }
+
+    def DomeLight "AmbientAccent"
+    {
+        float inputs:intensity = 70
+        color3f inputs:color = (0.16, 0.08, 0.03)
     }
 }

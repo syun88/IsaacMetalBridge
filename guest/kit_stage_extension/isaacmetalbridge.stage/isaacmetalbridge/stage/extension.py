@@ -19,11 +19,12 @@ import omni.usd
 from pxr import Gf, Tf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 
-_SCENE_HEADER = struct.Struct("<IHHQ32fQI")
+_SCENE_HEADER = struct.Struct("<IHHQ32fQII")
+_SCENE_LIGHT_RECORD = struct.Struct("<II8fQ")
 _SCENE_TEXTURE_RECORD = struct.Struct("<QIII")
 _SCENE_MESH_RECORD = struct.Struct("<QII26f28I")
 _SCENE_MAGIC = 0x31434D49
-_SCENE_VERSION = 14
+_SCENE_VERSION = 15
 _CAMERA_VALID_PERSPECTIVE = 1
 _SCENE_VALID_SPHERE_LIGHT = 2
 _SCENE_HAS_MESH_MANIFEST = 4
@@ -55,6 +56,9 @@ _MAX_SCENE_TEXTURE_BYTES = 128 * 1024 * 1024
 _MAX_SCENE_TEXTURE_DIMENSION = 4096
 _MAX_SCENE_TEXTURE_TRANSPORT_DIMENSION = 512
 _MAX_SCENE_MATERIAL_TEXTURES = 126
+_MAX_SCENE_POSITIONAL_LIGHTS = 8
+_MAX_SCENE_DISTANT_LIGHTS = 4
+_MAX_SCENE_DOME_LIGHTS = 4
 _NO_SCENE_TEXTURE = 0xFFFFFFFF
 
 
@@ -2021,7 +2025,10 @@ class StartupStageExtension(omni.ext.IExt):
                     + static_scene["sphere_light_values"]
                     + static_scene["distant_light_values"]
                     + static_scene["dome_light_values"]
-                    + (static_scene["mesh_payload"],)
+                    + (
+                        static_scene["additional_light_payload"],
+                        static_scene["mesh_payload"],
+                    )
                 )
                 if scene_values == self._last_scene_values:
                     return
@@ -2038,8 +2045,12 @@ class StartupStageExtension(omni.ext.IExt):
                     *static_scene["dome_light_values"],
                     static_scene["sequence"],
                     static_scene["mesh_count"],
+                    static_scene["additional_light_count"],
                 )
-                payload += static_scene["mesh_payload"]
+                payload += (
+                    static_scene["additional_light_payload"]
+                    + static_scene["mesh_payload"]
+                )
                 temporary_path = f"{self._camera_state_path}.tmp.{os.getpid()}"
                 with open(temporary_path, "wb", buffering=0) as camera_file:
                     camera_file.write(payload)
@@ -2626,20 +2637,15 @@ class StartupStageExtension(omni.ext.IExt):
                 scene_geometry_bytes += geometry_bytes
                 mesh_paths.append(mesh_path)
 
-            sphere_light_values = (0.0,) * 8
-            sphere_light_path = ""
-            sphere_light_schema = ""
+            positional_lights = []
             for prim in _stage_prims(stage):
-                # Protocol 1.x has one bounded positional-light slot. Preserve
-                # native SphereLight data and also admit RectLight/DiskLight
-                # through an explicit hard point-light approximation at the
-                # authored center. Their area is converted to an equivalent
-                # circular radius; orientation and soft-area integration are
-                # intentionally not claimed.
+                if len(positional_lights) >= _MAX_SCENE_POSITIONAL_LIGHTS:
+                    break
                 if prim.IsA(UsdLux.SphereLight):
                     light = UsdLux.SphereLight(prim)
                     radius = light.GetRadiusAttr().Get(sample_time)
                     schema_name = "SphereLight"
+                    schema_code = 1
                 elif prim.IsA(UsdLux.RectLight):
                     light = UsdLux.RectLight(prim)
                     width = light.GetWidthAttr().Get(sample_time)
@@ -2652,10 +2658,12 @@ class StartupStageExtension(omni.ext.IExt):
                         / math.pi
                     )
                     schema_name = "RectLight"
+                    schema_code = 2
                 elif prim.IsA(UsdLux.DiskLight):
                     light = UsdLux.DiskLight(prim)
                     radius = light.GetRadiusAttr().Get(sample_time)
                     schema_name = "DiskLight"
+                    schema_code = 3
                 else:
                     continue
                 light_position = xform_cache.GetLocalToWorldTransform(
@@ -2669,7 +2677,7 @@ class StartupStageExtension(omni.ext.IExt):
                 effective_intensity = float(intensity) * math.pow(
                     2.0, float(exposure or 0.0)
                 )
-                sphere_light_values = (
+                values = (
                     float(light_position[0]),
                     float(light_position[1]),
                     float(light_position[2]),
@@ -2679,15 +2687,21 @@ class StartupStageExtension(omni.ext.IExt):
                     max(effective_intensity, 0.0),
                     max(float(radius or 0.0), 0.0001),
                 )
-                if all(math.isfinite(value) for value in sphere_light_values):
-                    sphere_light_path = str(prim.GetPath())
-                    sphere_light_schema = schema_name
-                    break
-                sphere_light_values = (0.0,) * 8
+                if all(math.isfinite(value) for value in values):
+                    positional_lights.append(
+                        (schema_code, schema_name, str(prim.GetPath()), values)
+                    )
 
-            distant_light_values = (0.0,) * 8
-            distant_light_path = ""
+            sphere_light_values = (
+                positional_lights[0][3] if positional_lights else (0.0,) * 8
+            )
+            sphere_light_path = positional_lights[0][2] if positional_lights else ""
+            sphere_light_schema = positional_lights[0][1] if positional_lights else ""
+
+            distant_lights = []
             for prim in _stage_prims(stage):
+                if len(distant_lights) >= _MAX_SCENE_DISTANT_LIGHTS:
+                    break
                 if not prim.IsA(UsdLux.DistantLight):
                     continue
                 light = UsdLux.DistantLight(prim)
@@ -2707,7 +2721,7 @@ class StartupStageExtension(omni.ext.IExt):
                 effective_intensity = float(intensity) * math.pow(
                     2.0, float(exposure or 0.0)
                 )
-                distant_light_values = (
+                values = (
                     float(light_direction[0]),
                     float(light_direction[1]),
                     float(light_direction[2]),
@@ -2718,17 +2732,23 @@ class StartupStageExtension(omni.ext.IExt):
                     max(float(angle or 0.0), 0.0),
                 )
                 if (
-                    all(math.isfinite(value) for value in distant_light_values)
-                    and sum(value * value for value in distant_light_values[:3])
+                    all(math.isfinite(value) for value in values)
+                    and sum(value * value for value in values[:3])
                     > 0.000001
                 ):
-                    distant_light_path = str(prim.GetPath())
-                    break
-                distant_light_values = (0.0,) * 8
+                    distant_lights.append(
+                        (4, "DistantLight", str(prim.GetPath()), values)
+                    )
 
-            dome_light_values = (0.0,) * 4
-            dome_light_path = ""
+            distant_light_values = (
+                distant_lights[0][3] if distant_lights else (0.0,) * 8
+            )
+            distant_light_path = distant_lights[0][2] if distant_lights else ""
+
+            dome_lights = []
             for prim in _stage_prims(stage):
+                if len(dome_lights) >= _MAX_SCENE_DOME_LIGHTS:
+                    break
                 if not prim.IsA(UsdLux.DomeLight):
                     continue
                 light = UsdLux.DomeLight(prim)
@@ -2740,16 +2760,56 @@ class StartupStageExtension(omni.ext.IExt):
                 effective_intensity = float(intensity) * math.pow(
                     2.0, float(exposure or 0.0)
                 )
-                dome_light_values = (
+                values = (
                     max(float(light_color[0]), 0.0),
                     max(float(light_color[1]), 0.0),
                     max(float(light_color[2]), 0.0),
                     max(effective_intensity, 0.0),
                 )
-                if all(math.isfinite(value) for value in dome_light_values):
-                    dome_light_path = str(prim.GetPath())
-                    break
-                dome_light_values = (0.0,) * 4
+                if all(math.isfinite(value) for value in values):
+                    dome_lights.append(
+                        (5, "DomeLight", str(prim.GetPath()), values)
+                    )
+
+            dome_light_values = dome_lights[0][3] if dome_lights else (0.0,) * 4
+            dome_light_path = dome_lights[0][2] if dome_lights else ""
+
+            additional_light_records = []
+            additional_light_descriptions = []
+            for schema_code, schema_name, path, values in positional_lights[1:]:
+                additional_light_records.append(
+                    _SCENE_LIGHT_RECORD.pack(
+                        1,
+                        schema_code,
+                        values[0], values[1], values[2], values[6],
+                        values[3], values[4], values[5], values[7],
+                        _fnv1a_64(path),
+                    )
+                )
+                additional_light_descriptions.append(f"{schema_name}:{path}")
+            for schema_code, schema_name, path, values in distant_lights[1:]:
+                additional_light_records.append(
+                    _SCENE_LIGHT_RECORD.pack(
+                        2,
+                        schema_code,
+                        values[0], values[1], values[2], values[6],
+                        values[3], values[4], values[5], values[7],
+                        _fnv1a_64(path),
+                    )
+                )
+                additional_light_descriptions.append(f"{schema_name}:{path}")
+            for schema_code, schema_name, path, values in dome_lights[1:]:
+                additional_light_records.append(
+                    _SCENE_LIGHT_RECORD.pack(
+                        3,
+                        schema_code,
+                        values[0], values[1], values[2], values[3],
+                        0.0, 0.0, 0.0, 0.0,
+                        _fnv1a_64(path),
+                    )
+                )
+                additional_light_descriptions.append(f"{schema_name}:{path}")
+            additional_light_payload = b"".join(additional_light_records)
 
             texture_table_records = [struct.pack("<I", len(scene_textures))]
             for texture_path, width, height, pixels in scene_textures:
@@ -2773,6 +2833,7 @@ class StartupStageExtension(omni.ext.IExt):
                 sphere_light_values,
                 distant_light_values,
                 dome_light_values,
+                additional_light_payload,
                 mesh_payload,
                 len(mesh_records),
             )
@@ -2789,6 +2850,8 @@ class StartupStageExtension(omni.ext.IExt):
                 "sphere_light_values": sphere_light_values,
                 "distant_light_values": distant_light_values,
                 "dome_light_values": dome_light_values,
+                "additional_light_payload": additional_light_payload,
+                "additional_light_count": len(additional_light_records),
                 "mesh_payload": mesh_payload,
                 "mesh_count": len(mesh_records),
                 "point_instance_count": len(point_instance_keys),
@@ -2801,7 +2864,7 @@ class StartupStageExtension(omni.ext.IExt):
                 + sphere_light_values
                 + distant_light_values
                 + dome_light_values
-                + (mesh_payload,)
+                + (additional_light_payload, mesh_payload)
             )
             if scene_values == self._last_scene_values:
                 return
@@ -2818,8 +2881,9 @@ class StartupStageExtension(omni.ext.IExt):
                 *dome_light_values,
                 static_scene_sequence,
                 len(mesh_records),
+                len(additional_light_records),
             )
-            payload += mesh_payload
+            payload += additional_light_payload + mesh_payload
             temporary_path = (
                 f"{self._camera_state_path}.tmp.{os.getpid()}"
             )
@@ -2879,6 +2943,12 @@ class StartupStageExtension(omni.ext.IExt):
                         f"{dome_light_values[1]:.3f},"
                         f"{dome_light_values[2]:.3f}) "
                         f"intensity={dome_light_values[3]:.3f}"
+                    )
+                if additional_light_descriptions:
+                    carb.log_warn(
+                        "isaacmetalbridge.stage: additional USD lights published: "
+                        f"count={len(additional_light_descriptions)} "
+                        f"lights={additional_light_descriptions}"
                     )
                 carb.log_warn(
                     "isaacmetalbridge.stage: visible USD Mesh manifest published: "

@@ -909,7 +909,7 @@ public final class BridgeSession: @unchecked Sendable {
                 commandResources.formUnion([frame.header.resourceID, vertexBufferID, indexBufferID])
                 commandResources.formUnion(draws.lazy.map(\.textureID).filter { $0 != 0 })
             case 4:
-                guard frame.payload.count == 168,
+                guard frame.payload.count >= 168,
                       let target = resources[frame.header.resourceID],
                       target.kind == 2,
                       let accelerationStructureID: UInt64 = try? frame.payload.readLittleEndian(at: 8),
@@ -921,7 +921,7 @@ public final class BridgeSession: @unchecked Sendable {
                       let reserved1: UInt32 = try? frame.payload.readLittleEndian(at: 36),
                       width == target.width,
                       height == target.height,
-                      options & ~UInt32(31) == 0,
+                      options & ~UInt32(63) == 0,
                       reserved1 == 0,
                       backend.supportsRayDispatch
                 else {
@@ -934,7 +934,7 @@ public final class BridgeSession: @unchecked Sendable {
                 let emptyStageGrid = options & 16 != 0
                 let accelerationStructure = resources[accelerationStructureID]
                 guard emptyStageGrid
-                    ? accelerationStructureID == 0 && options & UInt32(14) == 0
+                    ? accelerationStructureID == 0 && options & UInt32(46) == 0
                     : accelerationStructure?.kind == 4 && accelerationStructure?.format == 0
                 else {
                     return failure(
@@ -1053,6 +1053,121 @@ public final class BridgeSession: @unchecked Sendable {
                         intensity: values[3]
                     )
                 }
+                var additionalSphereLights: [RaySphereLight] = []
+                var additionalDistantLights: [RayDistantLight] = []
+                var additionalDomeLights: [RayDomeLight] = []
+                if options & 32 != 0 {
+                    guard let lightCount: UInt32 = try? frame.payload.readLittleEndian(at: 168),
+                          let lightReserved: UInt32 = try? frame.payload.readLittleEndian(at: 172),
+                          lightCount > 0,
+                          lightCount <= 13,
+                          lightReserved == 0,
+                          frame.payload.count == 176 + Int(lightCount) * 48
+                    else {
+                        return failure(
+                            frame,
+                            .invalidPayload,
+                            "TRACE_RAYS additional-light list header is invalid"
+                        )
+                    }
+                    for lightIndex in 0..<Int(lightCount) {
+                        let lightOffset = 176 + lightIndex * 48
+                        guard let kind: UInt32 = try? frame.payload.readLittleEndian(at: lightOffset),
+                              let schema: UInt32 = try? frame.payload.readLittleEndian(at: lightOffset + 4),
+                              let pathHash: UInt64 = try? frame.payload.readLittleEndian(at: lightOffset + 40),
+                              pathHash != 0
+                        else {
+                            return failure(
+                                frame,
+                                .invalidPayload,
+                                "TRACE_RAYS additional light \(lightIndex) header is invalid"
+                            )
+                        }
+                        let values: [Float] = (0..<8).compactMap { valueIndex in
+                            guard let bits: UInt32 = try? frame.payload.readLittleEndian(
+                                at: lightOffset + 8 + valueIndex * 4
+                            ) else {
+                                return nil
+                            }
+                            return Float(bitPattern: bits)
+                        }
+                        guard values.count == 8, values.allSatisfy(\.isFinite) else {
+                            return failure(
+                                frame,
+                                .invalidPayload,
+                                "TRACE_RAYS additional light \(lightIndex) values are invalid"
+                            )
+                        }
+                        switch kind {
+                        case 1:
+                            guard schema >= 1, schema <= 3,
+                                  values[3] >= 0,
+                                  values[4] >= 0, values[5] >= 0, values[6] >= 0,
+                                  values[7] > 0
+                            else {
+                                return failure(
+                                    frame,
+                                    .invalidPayload,
+                                    "TRACE_RAYS additional positional light \(lightIndex) is invalid"
+                                )
+                            }
+                            additionalSphereLights.append(RaySphereLight(
+                                position: SIMD3<Float>(values[0], values[1], values[2]),
+                                color: SIMD3<Float>(values[4], values[5], values[6]),
+                                intensity: values[3],
+                                radius: values[7]
+                            ))
+                        case 2:
+                            guard schema == 4,
+                                  values[0] * values[0] + values[1] * values[1]
+                                    + values[2] * values[2] > 0.000_001,
+                                  values[3] >= 0,
+                                  values[4] >= 0, values[5] >= 0, values[6] >= 0,
+                                  values[7] >= 0, values[7] <= 180
+                            else {
+                                return failure(
+                                    frame,
+                                    .invalidPayload,
+                                    "TRACE_RAYS additional distant light \(lightIndex) is invalid"
+                                )
+                            }
+                            additionalDistantLights.append(RayDistantLight(
+                                direction: SIMD3<Float>(values[0], values[1], values[2]),
+                                color: SIMD3<Float>(values[4], values[5], values[6]),
+                                intensity: values[3],
+                                angleDegrees: values[7]
+                            ))
+                        case 3:
+                            guard schema == 5,
+                                  values[0] >= 0, values[1] >= 0, values[2] >= 0,
+                                  values[3] >= 0,
+                                  values[4...7].allSatisfy({ $0 == 0 })
+                            else {
+                                return failure(
+                                    frame,
+                                    .invalidPayload,
+                                    "TRACE_RAYS additional dome light \(lightIndex) is invalid"
+                                )
+                            }
+                            additionalDomeLights.append(RayDomeLight(
+                                color: SIMD3<Float>(values[0], values[1], values[2]),
+                                intensity: values[3]
+                            ))
+                        default:
+                            return failure(
+                                frame,
+                                .invalidPayload,
+                                "TRACE_RAYS additional light \(lightIndex) kind is invalid"
+                            )
+                        }
+                    }
+                } else if frame.payload.count != 168 {
+                    return failure(
+                        frame,
+                        .invalidPayload,
+                        "TRACE_RAYS payload has an unflagged additional-light tail"
+                    )
+                }
                 if emptyStageGrid {
                     try backend.submitEmptyStageGrid(
                         imageID: frame.header.resourceID,
@@ -1074,6 +1189,9 @@ public final class BridgeSession: @unchecked Sendable {
                         sphereLight: sphereLight,
                         distantLight: distantLight,
                         domeLight: domeLight,
+                        additionalSphereLights: additionalSphereLights,
+                        additionalDistantLights: additionalDistantLights,
+                        additionalDomeLights: additionalDomeLights,
                         fenceID: fenceID
                     )
                     commandResources.formUnion([
