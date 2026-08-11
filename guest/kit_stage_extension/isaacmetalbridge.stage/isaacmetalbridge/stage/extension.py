@@ -21,9 +21,9 @@ from pxr import Gf, Tf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 _SCENE_HEADER = struct.Struct("<IHHQ32fQI")
 _SCENE_TEXTURE_RECORD = struct.Struct("<QIII")
-_SCENE_MESH_RECORD = struct.Struct("<QII24f28I")
+_SCENE_MESH_RECORD = struct.Struct("<QII26f28I")
 _SCENE_MAGIC = 0x31434D49
-_SCENE_VERSION = 13
+_SCENE_VERSION = 14
 _CAMERA_VALID_PERSPECTIVE = 1
 _SCENE_VALID_SPHERE_LIGHT = 2
 _SCENE_HAS_MESH_MANIFEST = 4
@@ -43,10 +43,12 @@ _MESH_HAS_FILE_TEXTURE = 8
 _MESH_HAS_MATERIAL_PARAMETERS = 16
 _MESH_HAS_EMISSION = 32
 _MESH_HAS_ALPHA_CUTOUT = 64
+_MESH_HAS_STANDARD_OPACITY = 128
 _TEXTURE_HAS_ROUGHNESS = 1
 _TEXTURE_HAS_METALLIC = 2
 _TEXTURE_HAS_EMISSION = 4
 _TEXTURE_HAS_NORMAL = 8
+_TEXTURE_HAS_OPACITY = 16
 _MAX_SCENE_MESHES = 4096
 _MAX_SCENE_GEOMETRY_BYTES = 320 * 1024 * 1024
 _MAX_SCENE_TEXTURE_BYTES = 128 * 1024 * 1024
@@ -518,6 +520,98 @@ def _bound_material_base_color(material: UsdShade.Material):
     except Exception:
         return None, False
     return None, False
+
+
+def _bound_material_opacity(material: UsdShade.Material):
+    """Resolve standard scalar opacity, cutout threshold, and texture source.
+
+    UsdPreviewSurface permits ``opacity`` to be either a finite scalar or one
+    channel of a connected UsdUVTexture.  Preserve the authored
+    ``opacityThreshold`` independently; it is not the fixed Warehouse MDL
+    threshold.  OmniPBR's direct scalar spellings are accepted as the same
+    bounded data model without attempting to execute its MDL implementation.
+    """
+
+    opacity_names = ("opacity", "opacity_constant", "opacity_amount")
+    threshold_names = ("opacityThreshold", "opacity_threshold")
+    channels = {"r": 0, "g": 1, "b": 2, "a": 3}
+    try:
+        for prim in Usd.PrimRange(material.GetPrim()):
+            if not prim.IsA(UsdShade.Shader):
+                continue
+            shader = UsdShade.Shader(prim)
+            if not _supported_surface_shader(shader):
+                continue
+
+            opacity_input = next(
+                (
+                    shader.GetInput(name)
+                    for name in opacity_names
+                    if shader.GetInput(name)
+                ),
+                None,
+            )
+            threshold_input = next(
+                (
+                    shader.GetInput(name)
+                    for name in threshold_names
+                    if shader.GetInput(name)
+                ),
+                None,
+            )
+            if opacity_input is None and threshold_input is None:
+                continue
+
+            threshold = _scalar01(
+                threshold_input.Get() if threshold_input else 0.0
+            )
+            if threshold is None:
+                continue
+            opacity = 1.0
+            opacity_texture = None
+            if opacity_input is not None and opacity_input.HasConnectedSource():
+                _connected, texture_shader, source_name = (
+                    _connected_texture_shader(opacity_input, set())
+                )
+                if texture_shader is None or source_name not in channels:
+                    continue
+                asset = _texture_asset_and_primvar(material, texture_shader)
+                if asset is not None:
+                    opacity_texture = (*asset, channels[source_name])
+                else:
+                    file_input = texture_shader.GetInput("file")
+                    file_value = file_input.Get() if file_input else None
+                    file_path = str(
+                        getattr(file_value, "path", "") or ""
+                    ) if file_value else ""
+                    fallback_input = texture_shader.GetInput("fallback")
+                    fallback = (
+                        _color4(fallback_input.Get())
+                        if fallback_input else None
+                    )
+                    if file_path or fallback is None:
+                        continue
+                    opacity = _scalar01(fallback[channels[source_name]])
+                    if opacity is None:
+                        continue
+            elif opacity_input is not None:
+                opacity = _scalar01(opacity_input.Get())
+                if opacity is None:
+                    continue
+
+            return {
+                "opacity": opacity,
+                "threshold": threshold,
+                "texture": opacity_texture,
+                "relevant": (
+                    opacity_texture is not None
+                    or opacity < 1.0
+                    or threshold > 0.0
+                ),
+            }
+    except Exception:
+        return None
+    return None
 
 
 def _supported_surface_shader(shader: UsdShade.Shader) -> bool:
@@ -1083,6 +1177,41 @@ def _resized_rgba_texture(path: str, width: int, height: int):
         return image.tobytes()
     except Exception:
         return None
+
+
+@functools.lru_cache(maxsize=256)
+def _compose_standard_opacity_texture(
+    base_path: str,
+    opacity_path: str,
+    opacity_channel: int,
+    base_color: tuple[float, float, float],
+):
+    """Bake one opacity channel into base alpha without changing base RGB."""
+
+    if opacity_channel < 0 or opacity_channel > 3:
+        return None
+    opacity_texture = _load_rgba_texture(opacity_path)
+    if opacity_texture is None:
+        return None
+    base_texture = _load_rgba_texture(base_path) if base_path else None
+    reference = base_texture or opacity_texture
+    width, height, _pixels = reference
+    opacity_pixels = _resized_rgba_texture(opacity_path, width, height)
+    if opacity_pixels is None:
+        return None
+    if base_texture is not None:
+        base_pixels = _resized_rgba_texture(base_path, width, height)
+        if base_pixels is None:
+            return None
+    else:
+        encoded = bytes(
+            _linear_to_srgb(component) for component in base_color
+        ) + b"\xff"
+        base_pixels = encoded * (width * height)
+    output = bytearray(base_pixels)
+    for offset in range(0, len(output), 4):
+        output[offset + 3] = opacity_pixels[offset + opacity_channel]
+    return width, height, bytes(output)
 
 
 @functools.lru_cache(maxsize=128)
@@ -1936,6 +2065,7 @@ class StartupStageExtension(omni.ext.IExt):
             parameter_texture_count = 0
             normal_texture_count = 0
             alpha_cutout_mesh_count = 0
+            standard_opacity_mesh_count = 0
             uv_transform_mesh_count = 0
             instance_proxy_mesh_count = 0
             point_instance_mesh_count = 0
@@ -2095,6 +2225,8 @@ class StartupStageExtension(omni.ext.IExt):
                 emission_file_texture = None
                 normal_file_texture = None
                 warehouse_bundle = None
+                standard_opacity = None
+                standard_opacity_decoded = {}
                 try:
                     material = bound_material
                     if material and material.GetPrim().IsValid():
@@ -2128,6 +2260,7 @@ class StartupStageExtension(omni.ext.IExt):
                             ("normal", "normalmap", "normal_map"),
                             color_output=True,
                         )
+                        standard_opacity = _bound_material_opacity(material)
                         warehouse_bundle = _warehouse_mdl_material_bundle(
                             material
                         )
@@ -2151,6 +2284,51 @@ class StartupStageExtension(omni.ext.IExt):
                                 material_emission = warehouse_bundle[
                                     "material_emission"
                                 ]
+                        if (
+                            standard_opacity is not None
+                            and standard_opacity["relevant"]
+                        ):
+                            opacity_texture = standard_opacity["texture"]
+                            if opacity_texture is None:
+                                material_flags |= _MESH_HAS_STANDARD_OPACITY
+                            else:
+                                (
+                                    opacity_path,
+                                    opacity_uv_source,
+                                    opacity_channel,
+                                ) = opacity_texture
+                                base_path = file_texture[0] if file_texture else ""
+                                base_uv_source = (
+                                    file_texture[1]
+                                    if file_texture else opacity_uv_source
+                                )
+                                if base_uv_source == opacity_uv_source:
+                                    if base_color is None:
+                                        base_color = (0.18, 0.18, 0.18)
+                                    decoded_opacity = (
+                                        _compose_standard_opacity_texture(
+                                            base_path,
+                                            opacity_path,
+                                            opacity_channel,
+                                            base_color,
+                                        )
+                                    )
+                                    if decoded_opacity is not None:
+                                        derived_key = (
+                                            "imb-derived:standard-opacity:"
+                                            f"{base_path}:{opacity_path}:"
+                                            f"{opacity_channel}:{base_color}"
+                                        )
+                                        file_texture = (
+                                            derived_key,
+                                            opacity_uv_source,
+                                        )
+                                        standard_opacity_decoded[
+                                            derived_key
+                                        ] = decoded_opacity
+                                        material_flags |= (
+                                            _MESH_HAS_STANDARD_OPACITY
+                                        )
                 except Exception:
                     # A missing or unsupported binding must not suppress valid
                     # geometry from the scene manifest.
@@ -2171,6 +2349,12 @@ class StartupStageExtension(omni.ext.IExt):
                     if connected_base_color:
                         material_flags |= _MESH_HAS_CONNECTED_BASE_COLOR
                     material_flags |= _pack_mesh_base_color(base_color)
+                opacity = 1.0
+                opacity_threshold = 0.0
+                if material_flags & _MESH_HAS_STANDARD_OPACITY:
+                    opacity = standard_opacity["opacity"]
+                    opacity_threshold = standard_opacity["threshold"]
+                    standard_opacity_mesh_count += 1
                 roughness = 0.5
                 metallic = 0.0
                 if material_parameters is not None:
@@ -2195,12 +2379,16 @@ class StartupStageExtension(omni.ext.IExt):
                     texture_spec_map["emission"] = emission_file_texture
                 if normal_file_texture is not None:
                     texture_spec_map["normal"] = normal_file_texture
-                predecoded_material_textures = {}
+                predecoded_material_textures = dict(
+                    standard_opacity_decoded
+                )
                 if warehouse_bundle is not None:
                     texture_spec_map.update(
                         warehouse_bundle["texture_specs"]
                     )
-                    predecoded_material_textures = warehouse_bundle["decoded"]
+                    predecoded_material_textures.update(
+                        warehouse_bundle["decoded"]
+                    )
                 texture_specs = [
                     (kind, *texture_spec_map[kind])
                     for kind in (
@@ -2308,6 +2496,8 @@ class StartupStageExtension(omni.ext.IExt):
                             )
                             material_flags |= _MESH_HAS_FILE_TEXTURE
                             file_texture_mesh_count += 1
+                            if standard_opacity_decoded:
+                                texture_flags |= _TEXTURE_HAS_OPACITY
                         if "roughness" in decoded_textures:
                             (
                                 roughness_texture_width,
@@ -2352,6 +2542,16 @@ class StartupStageExtension(omni.ext.IExt):
                     else:
                         corner_uv_values = ()
                         decoded_textures = {}
+                if (
+                    standard_opacity_decoded
+                    and texture_flags & _TEXTURE_HAS_OPACITY == 0
+                ):
+                    # Never claim a texture-driven cutout when its shared UV
+                    # or bounded image payload could not be transported.
+                    material_flags &= ~_MESH_HAS_STANDARD_OPACITY
+                    opacity = 1.0
+                    opacity_threshold = 0.0
+                    standard_opacity_mesh_count -= 1
                 vertex_payload = struct.pack(
                     f"<{len(point_values)}f", *point_values
                 )
@@ -2382,6 +2582,8 @@ class StartupStageExtension(omni.ext.IExt):
                         metallic,
                         *emission_color,
                         emission_intensity,
+                        opacity,
+                        opacity_threshold,
                         len(points),
                         len(triangle_indices),
                         len(corner_normal_values) // 3,
@@ -2426,17 +2628,42 @@ class StartupStageExtension(omni.ext.IExt):
 
             sphere_light_values = (0.0,) * 8
             sphere_light_path = ""
+            sphere_light_schema = ""
             for prim in _stage_prims(stage):
-                if not prim.IsA(UsdLux.SphereLight):
+                # Protocol 1.x has one bounded positional-light slot. Preserve
+                # native SphereLight data and also admit RectLight/DiskLight
+                # through an explicit hard point-light approximation at the
+                # authored center. Their area is converted to an equivalent
+                # circular radius; orientation and soft-area integration are
+                # intentionally not claimed.
+                if prim.IsA(UsdLux.SphereLight):
+                    light = UsdLux.SphereLight(prim)
+                    radius = light.GetRadiusAttr().Get(sample_time)
+                    schema_name = "SphereLight"
+                elif prim.IsA(UsdLux.RectLight):
+                    light = UsdLux.RectLight(prim)
+                    width = light.GetWidthAttr().Get(sample_time)
+                    height = light.GetHeightAttr().Get(sample_time)
+                    if width is None or height is None:
+                        continue
+                    radius = math.sqrt(
+                        max(float(width), 0.0)
+                        * max(float(height), 0.0)
+                        / math.pi
+                    )
+                    schema_name = "RectLight"
+                elif prim.IsA(UsdLux.DiskLight):
+                    light = UsdLux.DiskLight(prim)
+                    radius = light.GetRadiusAttr().Get(sample_time)
+                    schema_name = "DiskLight"
+                else:
                     continue
-                light = UsdLux.SphereLight(prim)
                 light_position = xform_cache.GetLocalToWorldTransform(
                     prim
                 ).ExtractTranslation()
                 light_color = light.GetColorAttr().Get(sample_time)
                 intensity = light.GetIntensityAttr().Get(sample_time)
                 exposure = light.GetExposureAttr().Get(sample_time)
-                radius = light.GetRadiusAttr().Get(sample_time)
                 if light_color is None or intensity is None:
                     continue
                 effective_intensity = float(intensity) * math.pow(
@@ -2454,6 +2681,7 @@ class StartupStageExtension(omni.ext.IExt):
                 )
                 if all(math.isfinite(value) for value in sphere_light_values):
                     sphere_light_path = str(prim.GetPath())
+                    sphere_light_schema = schema_name
                     break
                 sphere_light_values = (0.0,) * 8
 
@@ -2618,7 +2846,8 @@ class StartupStageExtension(omni.ext.IExt):
                 )
                 if sphere_light_path:
                     carb.log_warn(
-                        "isaacmetalbridge.stage: active USD SphereLight published: "
+                        "isaacmetalbridge.stage: active USD positional light "
+                        f"published: schema={sphere_light_schema} "
                         f"path={sphere_light_path} "
                         f"position=({sphere_light_values[0]:.3f},"
                         f"{sphere_light_values[1]:.3f},"
@@ -2660,6 +2889,7 @@ class StartupStageExtension(omni.ext.IExt):
                     f"parameterTextures={parameter_texture_count} "
                     f"normalTextures={normal_texture_count} "
                     f"alphaCutoutMeshes={alpha_cutout_mesh_count} "
+                    f"standardOpacityMeshes={standard_opacity_mesh_count} "
                     f"uvTransforms={uv_transform_mesh_count} "
                     f"geometryMiB={scene_geometry_bytes / 1048576.0:.1f} "
                     f"textureMiB={scene_texture_bytes / 1048576.0:.1f} "

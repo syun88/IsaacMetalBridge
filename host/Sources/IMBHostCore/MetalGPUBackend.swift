@@ -443,6 +443,10 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         let resourceIDs: [UInt64]
         let channels: SIMD4<UInt32>
         let alphaCutout: Bool
+        let standardOpacity: Bool
+        let opacityFromBaseAlpha: Bool
+        let opacity: Float
+        let opacityThreshold: Float
     }
 
     private struct AccelerationStructureResource {
@@ -470,6 +474,8 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         var instanceTangentRangeBuffer: (any MTLBuffer)?
         var tangentInstanceCount: UInt32
         var instanceNormalTextureIndexBuffer: (any MTLBuffer)?
+        var instanceMaterialOpacityBuffer: (any MTLBuffer)?
+        var materialOpacityInstanceCount: UInt32
         var materialTextureResourceIDs: [UInt64]
         var localMaterialParameters: MaterialParameterData?
         var instanceMaterialParameterBuffer: (any MTLBuffer)?
@@ -710,6 +716,8 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         constant uint &tangentInstanceCount [[buffer(26)]],
         const device uint *instanceNormalTextureIndices [[buffer(27)]],
         constant uint &rayPixelStep [[buffer(28)]],
+        const device float2 *instanceMaterialOpacities [[buffer(29)]],
+        constant uint &materialOpacityInstanceCount [[buffer(30)]],
         texture2d<float, access::write> output [[texture(0)]],
         texture2d<float, access::sample> sceneMaterialTexture [[texture(1)]],
         array<texture2d<float, access::sample>, 126> materialTextures [[texture(2)]],
@@ -768,18 +776,36 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             filter::linear,
             mip_filter::none
         );
-        auto intersection = triangleIntersector.intersect(
-            probeRay, accelerationStructure
-        );
-        bool acceptedTriangleHit = false;
-        // Metal's triangle intersector returns the nearest geometric hit.  For
-        // the explicitly tagged Warehouse masked materials, sample the baked
-        // opacity and continue the same ray past transparent triangles.  This
-        // reproduces their binary 0.3333 MDL opacity mask without treating all
-        // unrelated texture alpha channels as transparency.
-        for (uint alphaLayer = 0u; alphaLayer < 64u; ++alphaLayer) {
+        float4 color = float4(0.0, 0.0, 0.0, 1.0);
+        float3 accumulatedLinearColor = float3(0.0);
+        float remainingTransmittance = 1.0;
+        bool usedFractionalOpacity = false;
+        bool finalColorIsLinear = false;
+        for (uint translucencyLayer = 0u; translucencyLayer < 64u;
+             ++translucencyLayer) {
+            auto intersection = triangleIntersector.intersect(
+                probeRay, accelerationStructure
+            );
+            bool acceptedTriangleHit = false;
+            float acceptedOpacity = 1.0;
+            float acceptedThreshold = 0.0;
+            // Metal's triangle intersector returns the nearest geometric hit.
+            // Apply either the legacy Warehouse mask or scene-state-v14
+            // standard USD opacity/opacityThreshold, then continue the same
+            // ray past a rejected triangle. Untagged texture alpha remains
+            // ordinary color data and cannot accidentally make a material
+            // transparent.
+            for (uint alphaLayer = 0u; alphaLayer < 64u; ++alphaLayer) {
             if (intersection.type == intersection_type::none) break;
             bool rejectCutout = false;
+            float candidateOpacity = 1.0;
+            float candidateThreshold = 0.0;
+            if (intersection.instance_id < materialOpacityInstanceCount) {
+                const float2 opacityParameters =
+                    instanceMaterialOpacities[intersection.instance_id];
+                candidateOpacity = clamp(opacityParameters.x, 0.0, 1.0);
+                candidateThreshold = clamp(opacityParameters.y, 0.0, 1.0);
+            }
             if (intersection.instance_id < uvInstanceCount
                 && intersection.instance_id < textureInstanceCount) {
                 const uint candidateChannels =
@@ -788,7 +814,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                     instanceTextureIndices[intersection.instance_id];
                 const uint4 candidateUVRange =
                     instanceUVRanges[intersection.instance_id];
-                if ((candidateChannels & 0x80000000u) != 0u
+                if ((candidateChannels & 0xc0000000u) != 0u
                     && candidateTextures.x < materialTextureCount
                     && intersection.primitive_id < candidateUVRange.y
                     && candidateUVRange.z == 3u) {
@@ -804,16 +830,19 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                             * candidateBarycentric.x
                         + triangleUVs[candidateUVIndex + 2u]
                             * candidateBarycentric.y;
-                    const float candidateAlpha =
+                    candidateOpacity *=
                         materialTextures[candidateTextures.x].sample(
                             materialSampler,
                             float2(candidateUV.x, 1.0 - candidateUV.y)
                         ).a;
-                    rejectCutout = candidateAlpha < 0.3333;
                 }
             }
+            rejectCutout = candidateThreshold > 0.0
+                && candidateOpacity < candidateThreshold;
             if (!rejectCutout) {
                 acceptedTriangleHit = true;
+                acceptedOpacity = candidateOpacity;
+                acceptedThreshold = candidateThreshold;
                 break;
             }
             const float nextMinimum = intersection.distance + max(
@@ -824,7 +853,6 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 probeRay, accelerationStructure
             );
         }
-        float4 color;
         float gridDistance = INFINITY;
         if (simpleGridView && probeRay.direction.z < -0.0001) {
             gridDistance = -probeRay.origin.z / probeRay.direction.z;
@@ -1088,12 +1116,95 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                             sqrt(lightDistanceSquared) - 0.004,
                             shadowRay.min_distance
                         );
-                        const auto shadowIntersection = triangleIntersector.intersect(
-                            shadowRay,
-                            accelerationStructure
-                        );
-                        visibility = shadowIntersection.type == intersection_type::none
-                            ? 1.0 : 0.0;
+                        // Continue through authored cutouts and accumulate
+                        // standard zero-threshold opacity as shadow
+                        // transmittance. Untagged geometry remains opaque.
+                        for (uint shadowLayer = 0u; shadowLayer < 64u;
+                             ++shadowLayer) {
+                            const auto shadowIntersection =
+                                triangleIntersector.intersect(
+                                    shadowRay,
+                                    accelerationStructure
+                                );
+                            if (shadowIntersection.type
+                                == intersection_type::none) break;
+                            float shadowOpacity = 1.0;
+                            float shadowThreshold = 0.0;
+                            if (shadowIntersection.instance_id
+                                < materialOpacityInstanceCount) {
+                                const float2 opacityParameters =
+                                    instanceMaterialOpacities[
+                                        shadowIntersection.instance_id
+                                    ];
+                                shadowOpacity = clamp(
+                                    opacityParameters.x, 0.0, 1.0
+                                );
+                                shadowThreshold = clamp(
+                                    opacityParameters.y, 0.0, 1.0
+                                );
+                            }
+                            if (shadowIntersection.instance_id < uvInstanceCount
+                                && shadowIntersection.instance_id
+                                    < textureInstanceCount) {
+                                const uint shadowChannels =
+                                    instanceMaterialTextureChannels[
+                                        shadowIntersection.instance_id
+                                    ];
+                                const uint4 shadowTextures =
+                                    instanceTextureIndices[
+                                        shadowIntersection.instance_id
+                                    ];
+                                const uint4 shadowUVRange =
+                                    instanceUVRanges[
+                                        shadowIntersection.instance_id
+                                    ];
+                                if ((shadowChannels & 0xc0000000u) != 0u
+                                    && shadowTextures.x < materialTextureCount
+                                    && shadowIntersection.primitive_id
+                                        < shadowUVRange.y
+                                    && shadowUVRange.z == 3u) {
+                                    const uint shadowUVIndex = shadowUVRange.x
+                                        + shadowIntersection.primitive_id * 3u;
+                                    const float2 shadowBarycentric =
+                                        shadowIntersection
+                                            .triangle_barycentric_coord;
+                                    const float2 shadowUV =
+                                        triangleUVs[shadowUVIndex]
+                                            * (1.0 - shadowBarycentric.x
+                                                - shadowBarycentric.y)
+                                        + triangleUVs[shadowUVIndex + 1u]
+                                            * shadowBarycentric.x
+                                        + triangleUVs[shadowUVIndex + 2u]
+                                            * shadowBarycentric.y;
+                                    shadowOpacity *= materialTextures[
+                                        shadowTextures.x
+                                    ].sample(
+                                        materialSampler,
+                                        float2(shadowUV.x, 1.0 - shadowUV.y)
+                                    ).a;
+                                }
+                            }
+                            if (shadowThreshold > 0.0) {
+                                if (shadowOpacity >= shadowThreshold) {
+                                    visibility = 0.0;
+                                    break;
+                                }
+                            } else {
+                                visibility *= 1.0 - shadowOpacity;
+                                if (visibility <= 0.0001) {
+                                    visibility = 0.0;
+                                    break;
+                                }
+                            }
+                            const float nextMinimum =
+                                shadowIntersection.distance + max(
+                                    0.0001,
+                                    shadowIntersection.distance * 0.000001
+                                );
+                            shadowRay.min_distance = min(
+                                nextMinimum, shadowRay.max_distance
+                            );
+                        }
                     }
                     const float radius = max(sphereLightColorAndRadius.w, 1.0);
                     const float attenuation = 1.0 / (
@@ -1147,12 +1258,92 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         shadowRay.direction = lightDirection;
                         shadowRay.min_distance = 0.001;
                         shadowRay.max_distance = 1000000.0;
-                        const auto shadowIntersection = triangleIntersector.intersect(
-                            shadowRay,
-                            accelerationStructure
-                        );
-                        visibility = shadowIntersection.type == intersection_type::none
-                            ? 1.0 : 0.0;
+                        for (uint shadowLayer = 0u; shadowLayer < 64u;
+                             ++shadowLayer) {
+                            const auto shadowIntersection =
+                                triangleIntersector.intersect(
+                                    shadowRay,
+                                    accelerationStructure
+                                );
+                            if (shadowIntersection.type
+                                == intersection_type::none) break;
+                            float shadowOpacity = 1.0;
+                            float shadowThreshold = 0.0;
+                            if (shadowIntersection.instance_id
+                                < materialOpacityInstanceCount) {
+                                const float2 opacityParameters =
+                                    instanceMaterialOpacities[
+                                        shadowIntersection.instance_id
+                                    ];
+                                shadowOpacity = clamp(
+                                    opacityParameters.x, 0.0, 1.0
+                                );
+                                shadowThreshold = clamp(
+                                    opacityParameters.y, 0.0, 1.0
+                                );
+                            }
+                            if (shadowIntersection.instance_id < uvInstanceCount
+                                && shadowIntersection.instance_id
+                                    < textureInstanceCount) {
+                                const uint shadowChannels =
+                                    instanceMaterialTextureChannels[
+                                        shadowIntersection.instance_id
+                                    ];
+                                const uint4 shadowTextures =
+                                    instanceTextureIndices[
+                                        shadowIntersection.instance_id
+                                    ];
+                                const uint4 shadowUVRange =
+                                    instanceUVRanges[
+                                        shadowIntersection.instance_id
+                                    ];
+                                if ((shadowChannels & 0xc0000000u) != 0u
+                                    && shadowTextures.x < materialTextureCount
+                                    && shadowIntersection.primitive_id
+                                        < shadowUVRange.y
+                                    && shadowUVRange.z == 3u) {
+                                    const uint shadowUVIndex = shadowUVRange.x
+                                        + shadowIntersection.primitive_id * 3u;
+                                    const float2 shadowBarycentric =
+                                        shadowIntersection
+                                            .triangle_barycentric_coord;
+                                    const float2 shadowUV =
+                                        triangleUVs[shadowUVIndex]
+                                            * (1.0 - shadowBarycentric.x
+                                                - shadowBarycentric.y)
+                                        + triangleUVs[shadowUVIndex + 1u]
+                                            * shadowBarycentric.x
+                                        + triangleUVs[shadowUVIndex + 2u]
+                                            * shadowBarycentric.y;
+                                    shadowOpacity *= materialTextures[
+                                        shadowTextures.x
+                                    ].sample(
+                                        materialSampler,
+                                        float2(shadowUV.x, 1.0 - shadowUV.y)
+                                    ).a;
+                                }
+                            }
+                            if (shadowThreshold > 0.0) {
+                                if (shadowOpacity >= shadowThreshold) {
+                                    visibility = 0.0;
+                                    break;
+                                }
+                            } else {
+                                visibility *= 1.0 - shadowOpacity;
+                                if (visibility <= 0.0001) {
+                                    visibility = 0.0;
+                                    break;
+                                }
+                            }
+                            const float nextMinimum =
+                                shadowIntersection.distance + max(
+                                    0.0001,
+                                    shadowIntersection.distance * 0.000001
+                                );
+                            shadowRay.min_distance = min(
+                                nextMinimum, shadowRay.max_distance
+                            );
+                        }
                     }
                     const float strength = clamp(
                         log2(1.0 + max(distantLightDirectionAndIntensity.w, 0.0))
@@ -1218,9 +1409,39 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 float((packed >> 24) & 0xff)
             ) / 255.0;
         }
-        if (hasGridHit || (isaacSceneView && hasTriangleHit)) {
-            color.rgb = imb_linear_to_srgb(color.rgb);
+        const bool layerColorIsLinear =
+            hasGridHit || (isaacSceneView && hasTriangleHit);
+        const float3 linearLayerColor = layerColorIsLinear
+            ? color.rgb : imb_srgb_to_linear(color.rgb);
+        const bool fractionalOpacityHit = isaacSceneView
+            && hasTriangleHit
+            && acceptedThreshold <= 0.0
+            && acceptedOpacity < 0.999999;
+        if (fractionalOpacityHit) {
+            usedFractionalOpacity = true;
+            accumulatedLinearColor += remainingTransmittance
+                * acceptedOpacity * linearLayerColor;
+            remainingTransmittance *= 1.0 - acceptedOpacity;
+            color = float4(accumulatedLinearColor, 1.0);
+            finalColorIsLinear = true;
+            if (remainingTransmittance <= 0.0001) break;
+            const float nextMinimum = intersection.distance + max(
+                0.0001, intersection.distance * 0.000001
+            );
+            probeRay.min_distance = min(nextMinimum, probeRay.max_distance);
+            continue;
         }
+        if (usedFractionalOpacity) {
+            accumulatedLinearColor +=
+                remainingTransmittance * linearLayerColor;
+            color = float4(accumulatedLinearColor, 1.0);
+            finalColorIsLinear = true;
+        } else {
+            finalColorIsLinear = layerColorIsLinear;
+        }
+        break;
+        }
+        if (finalColorIsLinear) color.rgb = imb_linear_to_srgb(color.rgb);
         for (uint offsetY = 0; offsetY < pixelStep; ++offsetY) {
             for (uint offsetX = 0; offsetX < pixelStep; ++offsetX) {
                 const uint2 outputPixel = pixelOrigin + uint2(offsetX, offsetY);
@@ -1556,6 +1777,11 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             return .rgba8Uint
         case 9:
             return .rgba8Snorm
+        case 10:
+            guard let format = MTLPixelFormat(rawValue: 71) else {
+                throw GPUBackendError.unsupported("Metal RGBA8_sRGB is unavailable")
+            }
+            return format
         default:
             throw GPUBackendError.unsupported("unsupported sparse image format \(format)")
         }
@@ -1684,7 +1910,8 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         // Block-compressed formats are sampleable but not writable in either
         // Vulkan or Metal. Advertising shaderWrite makes Metal reject the
         // descriptor even though sparse BC residency itself is supported.
-        descriptor.usage = (format == 3 || format == 6 || format == 7)
+        descriptor.usage = (format == 3 || format == 6 || format == 7
+            || format == 10)
             ? [.shaderRead]
             : [.shaderRead, .shaderWrite]
         guard let texture = heap.makeTexture(descriptor: descriptor) else {
@@ -2028,6 +2255,8 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             instanceTangentRangeBuffer: nil,
             tangentInstanceCount: 0,
             instanceNormalTextureIndexBuffer: nil,
+            instanceMaterialOpacityBuffer: nil,
+            materialOpacityInstanceCount: 0,
             materialTextureResourceIDs: [],
             localMaterialParameters: nil,
             instanceMaterialParameterBuffer: nil,
@@ -2225,6 +2454,8 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         resource.instanceTangentRangeBuffer = nil
         resource.tangentInstanceCount = 0
         resource.instanceNormalTextureIndexBuffer = nil
+        resource.instanceMaterialOpacityBuffer = nil
+        resource.materialOpacityInstanceCount = 0
         resource.materialTextureResourceIDs = []
         resource.localMaterialParameters = geometries.count == 1
             ? try? materialParameters(for: geometries[0])
@@ -2269,10 +2500,13 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         instanceMaterialTextureChannels.reserveCapacity(instances.count)
         var instanceNormalTextureIndices: [UInt32] = []
         instanceNormalTextureIndices.reserveCapacity(instances.count)
+        var instanceMaterialOpacities: [SIMD2<Float>] = []
+        instanceMaterialOpacities.reserveCapacity(instances.count)
         var materialTextureResourceIDs: [UInt64] = []
         var instanceMaterialParameters: [SIMD4<Float>] = []
         instanceMaterialParameters.reserveCapacity(instances.count * 2)
         var hasMaterialParameters = false
+        var hasMaterialOpacity = false
         for instance in instances {
             guard instance.transformationMatrix.count == 12,
                   instance.transformationMatrix.allSatisfy(\.isFinite),
@@ -2295,6 +2529,22 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             descriptorBytes.appendLittleEndian(UInt32(instancedStructures.count))
             descriptorBytes.appendLittleEndian(instance.userID)
             instancedStructures.append(childStructure)
+            let materialDescriptor = materialTextureDescriptor(
+                userID: instance.userID
+            )
+            if let descriptor = materialDescriptor,
+               descriptor.standardOpacity {
+                instanceMaterialOpacities.append(SIMD2<Float>(
+                    descriptor.opacity,
+                    descriptor.opacityThreshold
+                ))
+                hasMaterialOpacity = true
+            } else if materialDescriptor?.alphaCutout == true {
+                instanceMaterialOpacities.append(SIMD2<Float>(1, 0.3333))
+                hasMaterialOpacity = true
+            } else {
+                instanceMaterialOpacities.append(SIMD2<Float>(1, 0))
+            }
             if let parameters = child.localMaterialParameters {
                 instanceMaterialParameters.append(SIMD4<Float>(
                     parameters.roughness, parameters.metallic, 0, 1
@@ -2371,9 +2621,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                     materialTextureResourceIDs.append(textureResourceID)
                     return textureIndex
                 }
-                if let descriptor = materialTextureDescriptor(
-                    userID: instance.userID
-                ) {
+                if let descriptor = materialDescriptor {
                     instanceTextureIndices.append(SIMD4<UInt32>(
                         appendTextureIndex(descriptor.resourceIDs[0]),
                         appendTextureIndex(descriptor.resourceIDs[1]),
@@ -2384,6 +2632,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         descriptor.channels.x
                         | (descriptor.channels.y << 4)
                         | (descriptor.channels.z << 8)
+                        | (descriptor.opacityFromBaseAlpha ? 0x4000_0000 : 0)
                         | (descriptor.alphaCutout ? 0x8000_0000 : 0)
                     )
                     instanceNormalTextureIndices.append(
@@ -2619,6 +2868,28 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             resource.instanceNormalTextureIndexBuffer = nil
             resource.materialTextureResourceIDs = []
         }
+        if hasMaterialOpacity {
+            resource.instanceMaterialOpacityBuffer =
+                instanceMaterialOpacities.withUnsafeBytes { bytes in
+                    guard let baseAddress = bytes.baseAddress else {
+                        return nil as (any MTLBuffer)?
+                    }
+                    return device.makeBuffer(
+                        bytes: baseAddress,
+                        length: bytes.count,
+                        options: .storageModeShared
+                    )
+                }
+            guard resource.instanceMaterialOpacityBuffer != nil else {
+                throw GPUBackendError.unavailable(
+                    "Metal instance-opacity lookup allocation failed"
+                )
+            }
+            resource.materialOpacityInstanceCount = UInt32(instances.count)
+        } else {
+            resource.instanceMaterialOpacityBuffer = nil
+            resource.materialOpacityInstanceCount = 0
+        }
         if hasMaterialParameters {
             resource.instanceMaterialParameterBuffer =
                 instanceMaterialParameters.withUnsafeBytes { bytes in
@@ -2663,7 +2934,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         let blockHeight: Int
         let blockBytes: Int
         switch image.format {
-        case 1, 2, 8, 9:
+        case 1, 2, 8, 9, 10:
             (blockWidth, blockHeight, blockBytes) = (1, 1, 4)
         case 3, 6, 7:
             (blockWidth, blockHeight, blockBytes) = (4, 4, 16)
@@ -3753,6 +4024,25 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             length: MemoryLayout<UInt32>.size,
             index: 26
         )
+        var fallbackMaterialOpacity = SIMD2<Float>(1, 0)
+        var materialOpacityInstanceCount =
+            acceleration.materialOpacityInstanceCount
+        if let opacityBuffer = acceleration.instanceMaterialOpacityBuffer {
+            encoder.setBuffer(opacityBuffer, offset: 0, index: 29)
+            encoder.useResource(opacityBuffer, usage: .read)
+        } else {
+            encoder.setBytes(
+                &fallbackMaterialOpacity,
+                length: MemoryLayout<SIMD2<Float>>.size,
+                index: 29
+            )
+            materialOpacityInstanceCount = 0
+        }
+        encoder.setBytes(
+            &materialOpacityInstanceCount,
+            length: MemoryLayout<UInt32>.size,
+            index: 30
+        )
         encoder.setBytes(
             &rayPixelStep,
             length: MemoryLayout<UInt32>.size,
@@ -4030,9 +4320,9 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 .assumingMemoryBound(to: UInt32.self).pointee)
         }
         let version = prefix[1]
-        let wordCount = version == 2 ? 14 : 12
+        let wordCount = version == 3 ? 16 : (version == 2 ? 14 : 12)
         guard prefix[0] == 0x314d_424d,
-              version == 1 || version == 2,
+              (1...3).contains(version),
               buffer.length >= wordCount * 4
         else {
             return nil
@@ -4042,15 +4332,19 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 .assumingMemoryBound(to: UInt32.self).pointee)
         }
         let flags = words[2]
-        let supportedFlags: UInt32 = version == 2 ? 0x3f : 0x0f
+        let supportedFlags: UInt32 = version == 3
+            ? 0xff : (version == 2 ? 0x3f : 0x0f)
+        let requiredNonBaseFlags: UInt32 = version == 3
+            ? 0xfe : (version == 2 ? 0x3e : 0x0e)
         guard flags & ~supportedFlags == 0,
-              flags & (version == 2 ? 0x3e : 0x0e) != 0
+              flags & requiredNonBaseFlags != 0,
+              (flags & 0x80 == 0 || flags & 0x41 == 0x41)
         else {
             return nil
         }
         var resourceIDs = stride(
             from: 4,
-            through: version == 2 ? 12 : 10,
+            through: version >= 2 ? 12 : 10,
             by: 2
         ).map { index in
             UInt64(words[index]) | (UInt64(words[index + 1]) << 32)
@@ -4078,12 +4372,30 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         else {
             return nil
         }
+        let standardOpacity = flags & 0x40 != 0
+        let opacity = version == 3
+            ? Float(bitPattern: words[14]) : 1
+        let opacityThreshold = version == 3
+            ? Float(bitPattern: words[15]) : 0
+        guard (!standardOpacity
+                && opacity == 1 && opacityThreshold == 0)
+                || (standardOpacity
+                    && opacity.isFinite && opacityThreshold.isFinite
+                    && (0...1).contains(opacity)
+                    && (0...1).contains(opacityThreshold))
+        else {
+            return nil
+        }
         return MaterialTextureDescriptor(
             resourceIDs: resourceIDs,
             channels: SIMD4<UInt32>(
                 roughnessChannel, metallicChannel, emissionChannel, 0
             ),
-            alphaCutout: flags & 0x20 != 0
+            alphaCutout: flags & 0x20 != 0,
+            standardOpacity: standardOpacity,
+            opacityFromBaseAlpha: flags & 0x80 != 0,
+            opacity: opacity,
+            opacityThreshold: opacityThreshold
         )
     }
 

@@ -642,7 +642,7 @@ private func appendUIVertex(
     #expect(screenRight[0] > screenRight[1])
 }
 
-@Test func metalRayShadingSkipsTaggedAlphaCutoutHit() throws {
+@Test func metalRayShadingSkipsLegacyAndStandardOpacityCutouts() throws {
     let backend = try #require(MetalGPUBackend.makeDefault())
     #expect(backend.supportsRayDispatch)
 
@@ -694,6 +694,30 @@ private func appendUIVertex(
     }
     try backend.writeBuffer(id: 113, offset: 0, data: cutoutDescriptor)
 
+    // A scene-state-v14 standard opacity layer uses its authored threshold,
+    // not the Warehouse constant. Alpha 0.4 must be rejected by threshold
+    // 0.5. MBM1 v3 carries base-alpha sampling plus both finite floats.
+    try backend.createImage(id: 119, width: 1, height: 1, format: 1, options: 0)
+    try backend.writeImage(id: 119, data: Data([0, 0, 255, 102]))
+    try backend.createBuffer(id: 120, size: 64, options: 0)
+    var standardOpacityDescriptor = Data()
+    for word: UInt32 in [
+        0x314d_424d, 3, 0xc1, 0,
+        119, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+        Float(1).bitPattern, Float(0.5).bitPattern,
+    ] {
+        standardOpacityDescriptor.appendLittleEndian(word)
+    }
+    try backend.writeBuffer(
+        id: 120,
+        offset: 0,
+        data: standardOpacityDescriptor
+    )
+
     // Opaque green triangle behind the transparent front triangle.
     try backend.createBuffer(id: 114, size: 36, options: 0)
     var backVertices = Data()
@@ -727,6 +751,11 @@ private func appendUIVertex(
         0, 1, 0, 0,
         0, 0, 1, 0,
     ]
+    let translatedBehindStandardCutout: [Float] = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0.125,
+    ]
     try backend.createAccelerationStructure(id: 116, type: 0, requestedSize: 4096)
     try backend.buildInstanceAccelerationStructure(
         id: 116,
@@ -734,6 +763,14 @@ private func appendUIVertex(
         instances: [
             InstanceAccelerationStructureInstance(
                 transformationMatrix: identity,
+                options: 0,
+                mask: 0xff,
+                intersectionFunctionTableOffset: 0,
+                userID: 0x00c0_0000 | 120,
+                accelerationStructureResourceID: 112
+            ),
+            InstanceAccelerationStructureInstance(
+                transformationMatrix: translatedBehindStandardCutout,
                 options: 0,
                 mask: 0xff,
                 intersectionFunctionTableOffset: 0,
@@ -777,6 +814,124 @@ private func appendUIVertex(
     #expect(pixel[1] > 240)
     #expect(pixel[0] < 10)
     #expect(pixel[2] < 10)
+    #expect(pixel[3] == 255)
+}
+
+@Test func metalRayShadingCompositesFractionalStandardOpacity() throws {
+    let backend = try #require(MetalGPUBackend.makeDefault())
+    #expect(backend.supportsRayDispatch)
+
+    func buildTriangle(
+        bufferID: UInt64,
+        accelerationID: UInt64,
+        z: Float
+    ) throws {
+        try backend.createBuffer(id: bufferID, size: 36, options: 0)
+        var vertices = Data()
+        for position: SIMD3<Float> in [
+            SIMD3<Float>(-1, -1, z),
+            SIMD3<Float>(1, -1, z),
+            SIMD3<Float>(0, 1, z),
+        ] {
+            for value in [position.x, position.y, position.z] {
+                appendFloat(value, to: &vertices)
+            }
+        }
+        try backend.writeBuffer(id: bufferID, offset: 0, data: vertices)
+        try backend.createAccelerationStructure(
+            id: accelerationID, type: 1, requestedSize: 4096
+        )
+        try backend.buildPrimitiveAccelerationStructure(
+            id: accelerationID,
+            buildFlags: 0x4,
+            geometries: [PrimitiveAccelerationStructureGeometry(
+                kind: .triangles,
+                flags: 1,
+                dataResourceID: bufferID,
+                dataOffset: 0,
+                primitiveCount: 1,
+                stride: 12,
+                vertexFormat: 1
+            )]
+        )
+    }
+
+    try buildTriangle(bufferID: 130, accelerationID: 131, z: 0)
+    try buildTriangle(bufferID: 132, accelerationID: 133, z: 0.25)
+
+    // MBM1 v3 bit 6 marks standard opacity. With no positive threshold and
+    // no alpha-texture flag, opacity 0.5 must linearly composite the default
+    // blue front material over the opaque green triangle behind it.
+    try backend.createBuffer(id: 134, size: 64, options: 0)
+    var opacityDescriptor = Data()
+    for word: UInt32 in [
+        0x314d_424d, 3, 0x40, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+        0, 0,
+        Float(0.5).bitPattern, Float(0).bitPattern,
+    ] {
+        opacityDescriptor.appendLittleEndian(word)
+    }
+    try backend.writeBuffer(id: 134, offset: 0, data: opacityDescriptor)
+
+    let identity: [Float] = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+    ]
+    try backend.createAccelerationStructure(id: 135, type: 0, requestedSize: 4096)
+    try backend.buildInstanceAccelerationStructure(
+        id: 135,
+        buildFlags: 0x4,
+        instances: [
+            InstanceAccelerationStructureInstance(
+                transformationMatrix: identity,
+                options: 0,
+                mask: 0xff,
+                intersectionFunctionTableOffset: 0,
+                userID: 0x00c0_0000 | 134,
+                accelerationStructureResourceID: 131
+            ),
+            InstanceAccelerationStructureInstance(
+                transformationMatrix: identity,
+                options: 0,
+                mask: 0xff,
+                intersectionFunctionTableOffset: 0,
+                userID: 0x0080_ff00,
+                accelerationStructureResourceID: 133
+            ),
+        ]
+    )
+    try backend.createImage(id: 136, width: 64, height: 64, format: 1, options: 0)
+    try backend.submitRayTrace(
+        imageID: 136,
+        accelerationStructureID: 135,
+        width: 64,
+        height: 64,
+        missRGBA8: 0xff00_0000,
+        hitRGBA8: 0xffe0_8c30,
+        camera: RayCamera(
+            position: SIMD3<Float>(0, 0, -2),
+            forward: SIMD3<Float>(0, 0, 1),
+            up: SIMD3<Float>(0, 1, 0),
+            verticalFOVRadians: 0.9,
+            nearDistance: 0.01,
+            farDistance: 100
+        ),
+        sphereLight: nil,
+        distantLight: nil,
+        domeLight: nil,
+        fenceID: 137
+    )
+    #expect(try backend.waitFence(id: 137))
+    let center = (32 * 64 + 32) * 4
+    let pixel = Array(try backend.readImage(id: 136)[center..<(center + 4)])
+    #expect((55...85).contains(Int(pixel[0])))
+    #expect((210...235).contains(Int(pixel[1])))
+    #expect((170...200).contains(Int(pixel[2])))
     #expect(pixel[3] == 255)
 }
 
@@ -1210,7 +1365,7 @@ private func appendUIVertex(
     #expect(Int(screenRight[2]) - Int(screenLeft[2]) >= 12)
 }
 
-@Test func metalRayLightingUsesRealTLASOcclusion() throws {
+@Test func metalRayLightingUsesOpacityAwareTLASOcclusion() throws {
     let backend = try #require(MetalGPUBackend.makeDefault())
     #expect(backend.supportsRayDispatch)
 
@@ -1296,6 +1451,60 @@ private func appendUIVertex(
         instances: [receiver, blocker]
     )
 
+    func materialDescriptor(
+        bufferID: UInt64,
+        opacity: Float,
+        threshold: Float
+    ) throws {
+        try backend.createBuffer(id: bufferID, size: 64, options: 0)
+        var descriptor = Data()
+        for word: UInt32 in [
+            0x314d_424d, 3, 0x40, 0,
+            0, 0,
+            0, 0,
+            0, 0,
+            0, 0,
+            0, 0,
+            opacity.bitPattern, threshold.bitPattern,
+        ] {
+            descriptor.appendLittleEndian(word)
+        }
+        try backend.writeBuffer(id: bufferID, offset: 0, data: descriptor)
+    }
+    try materialDescriptor(bufferID: 107, opacity: 0.5, threshold: 0)
+    let fractionalBlocker = InstanceAccelerationStructureInstance(
+        transformationMatrix: identity,
+        options: 0,
+        mask: 0xff,
+        intersectionFunctionTableOffset: 0,
+        userID: 0x00c0_0000 | 107,
+        accelerationStructureResourceID: 102
+    )
+    try backend.createAccelerationStructure(id: 108, type: 0, requestedSize: 4096)
+    try backend.buildInstanceAccelerationStructure(
+        id: 108,
+        buildFlags: 0x4,
+        instances: [receiver, fractionalBlocker]
+    )
+
+    // A positive-threshold blocker below its threshold is a hole for both
+    // camera and shadow rays.
+    try materialDescriptor(bufferID: 110, opacity: 0.25, threshold: 0.5)
+    let cutoutBlocker = InstanceAccelerationStructureInstance(
+        transformationMatrix: identity,
+        options: 0,
+        mask: 0xff,
+        intersectionFunctionTableOffset: 0,
+        userID: 0x00c0_0000 | 110,
+        accelerationStructureResourceID: 102
+    )
+    try backend.createAccelerationStructure(id: 111, type: 0, requestedSize: 4096)
+    try backend.buildInstanceAccelerationStructure(
+        id: 111,
+        buildFlags: 0x4,
+        instances: [receiver, cutoutBlocker]
+    )
+
     let camera = RayCamera(
         position: SIMD3<Float>(0, 0, -2),
         forward: SIMD3<Float>(0, 0, 1),
@@ -1307,7 +1516,9 @@ private func appendUIVertex(
     let light = RaySphereLight(
         position: SIMD3<Float>(1, 0, -1),
         color: SIMD3<Float>(1, 1, 1),
-        intensity: 100_000,
+        // Keep the intermediate 0.5-transmittance result below sRGB
+        // saturation so the three visibility levels remain distinguishable.
+        intensity: 1_000,
         radius: 0.25
     )
     try backend.createImage(id: 105, width: 64, height: 64, format: 1, options: 0)
@@ -1341,11 +1552,100 @@ private func appendUIVertex(
     )
     #expect(try backend.waitFence(id: 201))
 
+    try backend.createImage(id: 109, width: 64, height: 64, format: 1, options: 0)
+    try backend.submitRayTrace(
+        imageID: 109,
+        accelerationStructureID: 108,
+        width: 64,
+        height: 64,
+        missRGBA8: 0xff00_0000,
+        hitRGBA8: 0xffe0_8c30,
+        camera: camera,
+        sphereLight: light,
+        distantLight: nil,
+        domeLight: nil,
+        fenceID: 202
+    )
+    #expect(try backend.waitFence(id: 202))
+
+    try backend.createImage(id: 112, width: 64, height: 64, format: 1, options: 0)
+    try backend.submitRayTrace(
+        imageID: 112,
+        accelerationStructureID: 111,
+        width: 64,
+        height: 64,
+        missRGBA8: 0xff00_0000,
+        hitRGBA8: 0xffe0_8c30,
+        camera: camera,
+        sphereLight: light,
+        distantLight: nil,
+        domeLight: nil,
+        fenceID: 203
+    )
+    #expect(try backend.waitFence(id: 203))
+
     let center = (32 * 64 + 32) * 4
     let lit = Array(try backend.readImage(id: 105)[center..<(center + 4)])
     let shadowed = Array(try backend.readImage(id: 106)[center..<(center + 4)])
+    let translucent = Array(
+        try backend.readImage(id: 109)[center..<(center + 4)]
+    )
+    let cutout = Array(try backend.readImage(id: 112)[center..<(center + 4)])
     #expect(lit[0] > 0)
     #expect(shadowed[0] > 0)
     #expect(shadowed[0] < lit[0])
+    #expect(translucent[0] > shadowed[0])
+    #expect(translucent[0] < lit[0])
+    #expect(abs(Int(cutout[0]) - Int(lit[0])) <= 1)
+
+    let distantLight = RayDistantLight(
+        // The shader negates USD's emission direction to obtain the
+        // surface-to-light direction through the same diagonal blocker.
+        direction: SIMD3<Float>(-1, 0, 1),
+        color: SIMD3<Float>(1, 1, 1),
+        intensity: 1_000,
+        angleDegrees: 1
+    )
+    func renderDistant(
+        imageID: UInt64,
+        accelerationID: UInt64,
+        fenceID: UInt64
+    ) throws -> [UInt8] {
+        try backend.createImage(
+            id: imageID, width: 64, height: 64, format: 1, options: 0
+        )
+        try backend.submitRayTrace(
+            imageID: imageID,
+            accelerationStructureID: accelerationID,
+            width: 64,
+            height: 64,
+            missRGBA8: 0xff00_0000,
+            hitRGBA8: 0xffe0_8c30,
+            camera: camera,
+            sphereLight: nil,
+            distantLight: distantLight,
+            domeLight: nil,
+            fenceID: fenceID
+        )
+        #expect(try backend.waitFence(id: fenceID))
+        return Array(
+            try backend.readImage(id: imageID)[center..<(center + 4)]
+        )
+    }
+    let distantLit = try renderDistant(
+        imageID: 113, accelerationID: 103, fenceID: 204
+    )
+    let distantShadowed = try renderDistant(
+        imageID: 114, accelerationID: 104, fenceID: 205
+    )
+    let distantTranslucent = try renderDistant(
+        imageID: 115, accelerationID: 108, fenceID: 206
+    )
+    let distantCutout = try renderDistant(
+        imageID: 116, accelerationID: 111, fenceID: 207
+    )
+    #expect(distantShadowed[0] < distantTranslucent[0])
+    #expect(distantTranslucent[0] < distantLit[0])
+    #expect(abs(Int(distantCutout[0]) - Int(distantLit[0])) <= 1)
 }
 #endif

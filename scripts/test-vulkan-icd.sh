@@ -151,6 +151,12 @@ if ! grep -F 'VULKAN_SPARSE_IMAGE format=RGBA8 tile=128x128 map=passed unmap=pas
     sed -n '1,240p' "${guest_log}" >&2
     exit 1
 fi
+if ! grep -F 'VULKAN_SPARSE_IMAGE format=RGBA8_SRGB tile=128x128 map=passed unmap=passed backend=Metal' "${guest_log}" >/dev/null; then
+    echo "test-vulkan-icd: Vulkan RGBA8 sRGB sparse image tiles did not map and unmap through Metal" >&2
+    sed -n '1,240p' "${adapter_log}" >&2
+    sed -n '1,240p' "${guest_log}" >&2
+    exit 1
+fi
 for sparse_format in BC3_SRGB BC5_UNORM; do
     if ! grep -E "VULKAN_SPARSE_IMAGE format=${sparse_format} tile=[1-9][0-9]*x[1-9][0-9]* map=passed upload=passed unmap=passed backend=Metal" "${guest_log}" >/dev/null; then
         echo "test-vulkan-icd: Vulkan ${sparse_format} sparse image data did not upload, map, and unmap through Metal" >&2

@@ -75,7 +75,7 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         textureType: UInt32,
         sampleCount: UInt32
     ) throws -> SparseImageProperties {
-        guard (format >= 1 && format <= 7),
+        guard (format >= 1 && format <= 10),
               textureType == 1,
               sampleCount == 1
         else {
@@ -101,7 +101,7 @@ private final class TestGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         textureType: UInt32
     ) throws {
         guard virtualSize > 0, width > 0, height > 0,
-              (format >= 1 && format <= 7),
+              (format >= 1 && format <= 10),
               mipLevels > 0, arrayLayers > 0, sampleCount == 1, textureType == 1
         else {
             throw GPUBackendError.unsupported("invalid test sparse image")
@@ -489,8 +489,8 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     #expect(pong.payload == bytes)
 }
 
-@Test func compressedSparseImageFormatsReachTheMetalBackend() throws {
-    for (index, format) in [UInt32(6), UInt32(7)].enumerated() {
+@Test func compressedAndRGBA8SRGBSparseFormatsReachTheMetalBackend() throws {
+    for (index, format) in [UInt32(6), UInt32(7), UInt32(10)].enumerated() {
         let backend = TestGPUBackend()
         let session = BridgeSession(metal: testMetal, backend: backend)
         negotiate(session)
@@ -505,8 +505,15 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
             payload: query
         )).response
         #expect(queried.header.messageType == MessageType.querySparseImageProperties.rawValue)
-        #expect(try queried.payload.readLittleEndian(at: 0) as UInt32 == 128)
-        #expect(try queried.payload.readLittleEndian(at: 4) as UInt32 == 128)
+        let expectedTileDimension: UInt32 = format == 10 ? 64 : 128
+        #expect(
+            try queried.payload.readLittleEndian(at: 0) as UInt32
+                == expectedTileDimension
+        )
+        #expect(
+            try queried.payload.readLittleEndian(at: 4) as UInt32
+                == expectedTileDimension
+        )
 
         var create = Data()
         create.appendLittleEndian(UInt64(4096))
@@ -528,14 +535,20 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
         #expect(created.header.messageType == MessageType.createResource.rawValue)
         #expect(created.header.resourceID != 0)
 
-        let pixels = Data((0..<256).map { UInt8(($0 + index) & 0xff) })
+        let byteCount = format == 10 ? 1_024 : 256
+        let pixels = Data(
+            (0..<byteCount).map { UInt8(($0 + index) & 0xff) }
+        )
         for chunkIndex in 0..<2 {
-            let offset = chunkIndex * 128
+            let chunkLength = byteCount / 2
+            let offset = chunkIndex * chunkLength
             var write = Data()
             write.appendLittleEndian(UInt64(offset))
-            write.appendLittleEndian(UInt32(128))
+            write.appendLittleEndian(UInt32(chunkLength))
             write.appendLittleEndian(UInt32(0))
-            write.append(pixels.subdata(in: offset..<(offset + 128)))
+            write.append(
+                pixels.subdata(in: offset..<(offset + chunkLength))
+            )
             let written = session.handle(request(
                 .writeResource,
                 id: UInt64(30 + index * 10 + chunkIndex),

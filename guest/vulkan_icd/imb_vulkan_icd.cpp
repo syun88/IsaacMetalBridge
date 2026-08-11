@@ -58,7 +58,9 @@ constexpr std::uint16_t kSceneStateEmissionVersion = 9;
 constexpr std::uint16_t kSceneStateParameterTextureVersion = 10;
 constexpr std::uint16_t kSceneStateNormalTextureVersion = 11;
 constexpr std::uint16_t kSceneStateSplitSequenceVersion = 12;
-constexpr std::uint16_t kSceneStateVersion = 13;
+constexpr std::uint16_t kSceneStateDeduplicatedTextureVersion = 13;
+constexpr std::uint16_t kSceneStateOpacityVersion = 14;
+constexpr std::uint16_t kSceneStateVersion = kSceneStateOpacityVersion;
 constexpr std::size_t kCameraStateSize = 96;
 constexpr std::size_t kSceneStatePreviousHeaderSize = 100;
 constexpr std::size_t kSceneStatePreviousFixedHeaderSize = 148;
@@ -72,6 +74,7 @@ constexpr std::size_t kSceneMeshEmissionRecordSize = 140;
 constexpr std::size_t kSceneMeshParameterTextureRecordSize = 192;
 constexpr std::size_t kSceneMeshNormalTextureRecordSize = 204;
 constexpr std::size_t kSceneMeshDeduplicatedTextureRecordSize = 224;
+constexpr std::size_t kSceneMeshOpacityRecordSize = 232;
 constexpr std::size_t kSceneTextureRecordSize = 20;
 constexpr std::uint32_t kMaxSceneMeshCount = 4096;
 constexpr std::uint32_t kMaxSceneTextureCount = 126;
@@ -79,14 +82,19 @@ constexpr std::uint32_t kMaxSceneMeshVertexCount = 16U * 1024U * 1024U;
 constexpr std::uint32_t kMaxSceneMeshIndexCount = 48U * 1024U * 1024U;
 constexpr std::size_t kMaxSceneStateBytes = 512U * 1024U * 1024U;
 
-constexpr bool sceneMaterialFlagsValid(std::uint32_t flags) {
-    // Bits 0-6 are capabilities, bit 7 is reserved, and bits 8-31 are RGB.
-    return (flags & 128u) == 0;
+constexpr bool sceneMaterialFlagsValid(
+    std::uint32_t flags,
+    bool standardOpacity = false
+) {
+    // Versions through v13 reserve bit 7. v14 uses it for standard USD
+    // opacity while bits 8-31 continue to carry packed RGB.
+    return standardOpacity || (flags & 128u) == 0;
 }
 
 static_assert(sceneMaterialFlagsValid(UINT32_C(0x2525251b)));
 static_assert(sceneMaterialFlagsValid(UINT32_C(0xffffff7f)));
 static_assert(!sceneMaterialFlagsValid(UINT32_C(0x00000080)));
+static_assert(sceneMaterialFlagsValid(UINT32_C(0x00000080), true));
 
 struct BridgeRayCamera {
     std::uint64_t sequence = 0;
@@ -136,6 +144,9 @@ struct BridgeSceneMesh {
     float metallic = 0.0f;
     std::array<float, 3> emissionColor{};
     float emissionIntensity = 0.0f;
+    float opacity = 1.0f;
+    float opacityThreshold = 0.0f;
+    bool opacityFromBaseAlpha = false;
     BridgeSceneTextureMap roughnessTexture;
     BridgeSceneTextureMap metallicTexture;
     BridgeSceneTextureMap emissionTexture;
@@ -392,7 +403,10 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
         const bool hasParameterTextures =
             version >= kSceneStateParameterTextureVersion;
         const bool hasNormalTextures = version >= kSceneStateNormalTextureVersion;
-        const bool hasDeduplicatedTextures = version >= kSceneStateVersion;
+        const bool hasDeduplicatedTextures =
+            version >= kSceneStateDeduplicatedTextureVersion;
+        const bool hasStandardOpacity =
+            version >= kSceneStateOpacityVersion;
         if (scene.meshSequence == 0 || meshCount > kMaxSceneMeshCount
             || allBytes.size() > kMaxSceneStateBytes) {
             return std::nullopt;
@@ -485,7 +499,9 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
             }
         }
         for (std::uint32_t meshIndex = 0; meshIndex < meshCount; ++meshIndex) {
-            const std::size_t recordSize = hasDeduplicatedTextures
+            const std::size_t recordSize = hasStandardOpacity
+                ? kSceneMeshOpacityRecordSize
+                : (hasDeduplicatedTextures
                 ? kSceneMeshDeduplicatedTextureRecordSize
                 : (hasNormalTextures
                 ? kSceneMeshNormalTextureRecordSize
@@ -501,7 +517,7 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                     ? kSceneMeshNormalsRecordSize
                 : (hasMeshGeometry
                     ? kSceneMeshGeometryRecordSize
-                    : kSceneMeshRecordSize)))))));
+                    : kSceneMeshRecordSize))))))));
             if (recordOffset > allBytes.size()
                 || recordSize > allBytes.size() - recordOffset) {
                 return std::nullopt;
@@ -510,11 +526,12 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
             mesh.pathHash = readAllU64(recordOffset);
             mesh.triangleCount = readAllU32(recordOffset + 8);
             mesh.materialFlags = readAllU32(recordOffset + 12);
-            // Bits 0-6 are material capability flags, bit 7 is reserved, and
-            // bits 8-31 carry the packed RGB base color.  Reject only the
-            // reserved bit; treating every value above 127 as unknown also
-            // rejects every non-black authored/display color in a real scene.
-            if (!sceneMaterialFlagsValid(mesh.materialFlags)) {
+            // Bits 0-6 are legacy material capabilities, v14 adds standard
+            // opacity in bit 7, and bits 8-31 carry packed RGB base color.
+            if (!sceneMaterialFlagsValid(
+                    mesh.materialFlags,
+                    hasStandardOpacity
+                )) {
                 return std::nullopt;
             }
             if (!hasMaterialParameters && (mesh.materialFlags & 16u) != 0) {
@@ -570,6 +587,23 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                     return std::nullopt;
                 }
             }
+            if (hasStandardOpacity) {
+                mesh.opacity = readAllFloat(recordOffset + 112);
+                mesh.opacityThreshold = readAllFloat(recordOffset + 116);
+                const bool meshHasStandardOpacity =
+                    (mesh.materialFlags & 128u) != 0;
+                const bool opacityValid = std::isfinite(mesh.opacity)
+                    && std::isfinite(mesh.opacityThreshold)
+                    && mesh.opacity >= 0.0f && mesh.opacity <= 1.0f
+                    && mesh.opacityThreshold >= 0.0f
+                    && mesh.opacityThreshold <= 1.0f;
+                if ((meshHasStandardOpacity && !opacityValid)
+                    || (!meshHasStandardOpacity
+                        && (mesh.opacity != 1.0f
+                            || mesh.opacityThreshold != 0.0f))) {
+                    return std::nullopt;
+                }
+            }
             bool boundsOrdered = true;
             for (std::size_t component = 0; component < 3; ++component) {
                 if (mesh.boundsMinimum[component] > mesh.boundsMaximum[component]) {
@@ -591,75 +625,77 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
             recordOffset += recordSize;
             if (hasMeshGeometry) {
                 const std::size_t recordStart = recordOffset - recordSize;
+                const std::size_t geometryFieldsOffset =
+                    hasStandardOpacity ? 120 : 112;
                 const std::uint32_t vertexCount = hasParameterTextures
-                    ? readAllU32(recordStart + 112)
+                    ? readAllU32(recordStart + geometryFieldsOffset)
                     : readAllU32(recordOffset - (hasFileTextures
                         ? 28 : (hasCornerNormals ? 12 : 8)));
                 const std::uint32_t indexCount = hasParameterTextures
-                    ? readAllU32(recordStart + 116)
+                    ? readAllU32(recordStart + geometryFieldsOffset + 4)
                     : readAllU32(recordOffset - (hasFileTextures
                         ? 24 : (hasCornerNormals ? 8 : 4)));
                 const std::uint32_t normalCount = hasParameterTextures
-                    ? readAllU32(recordStart + 120)
+                    ? readAllU32(recordStart + geometryFieldsOffset + 8)
                     : (hasCornerNormals
                         ? readAllU32(recordOffset - (hasFileTextures ? 20 : 4))
                         : 0);
                 const std::uint32_t uvCount = hasParameterTextures
-                    ? readAllU32(recordStart + 124)
+                    ? readAllU32(recordStart + geometryFieldsOffset + 12)
                     : (hasFileTextures ? readAllU32(recordOffset - 16) : 0);
                 const std::uint32_t textureWidth = hasParameterTextures
-                    ? readAllU32(recordStart + 128)
+                    ? readAllU32(recordStart + geometryFieldsOffset + 16)
                     : (hasFileTextures ? readAllU32(recordOffset - 12) : 0);
                 const std::uint32_t textureHeight = hasParameterTextures
-                    ? readAllU32(recordStart + 132)
+                    ? readAllU32(recordStart + geometryFieldsOffset + 20)
                     : (hasFileTextures ? readAllU32(recordOffset - 8) : 0);
                 const std::uint32_t textureByteCount = hasParameterTextures
-                    ? readAllU32(recordStart + 136)
+                    ? readAllU32(recordStart + geometryFieldsOffset + 24)
                     : (hasFileTextures ? readAllU32(recordOffset - 4) : 0);
                 const std::uint32_t textureFlags = hasParameterTextures
-                    ? readAllU32(recordStart + 140) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 28) : 0;
                 const std::uint32_t roughnessTextureWidth = hasParameterTextures
-                    ? readAllU32(recordStart + 144) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 32) : 0;
                 const std::uint32_t roughnessTextureHeight = hasParameterTextures
-                    ? readAllU32(recordStart + 148) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 36) : 0;
                 const std::uint32_t roughnessTextureByteCount = hasParameterTextures
-                    ? readAllU32(recordStart + 152) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 40) : 0;
                 const std::uint32_t roughnessTextureChannel = hasParameterTextures
-                    ? readAllU32(recordStart + 156) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 44) : 0;
                 const std::uint32_t metallicTextureWidth = hasParameterTextures
-                    ? readAllU32(recordStart + 160) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 48) : 0;
                 const std::uint32_t metallicTextureHeight = hasParameterTextures
-                    ? readAllU32(recordStart + 164) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 52) : 0;
                 const std::uint32_t metallicTextureByteCount = hasParameterTextures
-                    ? readAllU32(recordStart + 168) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 56) : 0;
                 const std::uint32_t metallicTextureChannel = hasParameterTextures
-                    ? readAllU32(recordStart + 172) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 60) : 0;
                 const std::uint32_t emissionTextureWidth = hasParameterTextures
-                    ? readAllU32(recordStart + 176) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 64) : 0;
                 const std::uint32_t emissionTextureHeight = hasParameterTextures
-                    ? readAllU32(recordStart + 180) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 68) : 0;
                 const std::uint32_t emissionTextureByteCount = hasParameterTextures
-                    ? readAllU32(recordStart + 184) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 72) : 0;
                 const std::uint32_t emissionTextureChannel = hasParameterTextures
-                    ? readAllU32(recordStart + 188) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 76) : 0;
                 const std::uint32_t normalTextureWidth = hasNormalTextures
-                    ? readAllU32(recordStart + 192) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 80) : 0;
                 const std::uint32_t normalTextureHeight = hasNormalTextures
-                    ? readAllU32(recordStart + 196) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 84) : 0;
                 const std::uint32_t normalTextureByteCount = hasNormalTextures
-                    ? readAllU32(recordStart + 200) : 0;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 88) : 0;
                 const std::uint32_t noSceneTexture =
                     std::numeric_limits<std::uint32_t>::max();
                 const std::uint32_t baseTextureIndex = hasDeduplicatedTextures
-                    ? readAllU32(recordStart + 204) : noSceneTexture;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 92) : noSceneTexture;
                 const std::uint32_t roughnessTextureIndex = hasDeduplicatedTextures
-                    ? readAllU32(recordStart + 208) : noSceneTexture;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 96) : noSceneTexture;
                 const std::uint32_t metallicTextureIndex = hasDeduplicatedTextures
-                    ? readAllU32(recordStart + 212) : noSceneTexture;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 100) : noSceneTexture;
                 const std::uint32_t emissionTextureIndex = hasDeduplicatedTextures
-                    ? readAllU32(recordStart + 216) : noSceneTexture;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 104) : noSceneTexture;
                 const std::uint32_t normalTextureIndex = hasDeduplicatedTextures
-                    ? readAllU32(recordStart + 220) : noSceneTexture;
+                    ? readAllU32(recordStart + geometryFieldsOffset + 108) : noSceneTexture;
                 const bool hasTextureUVs = uvCount != 0;
                 const bool hasBaseTexture = hasDeduplicatedTextures
                     ? baseTextureIndex != noSceneTexture
@@ -668,6 +704,7 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                 const bool hasMetallicTexture = (textureFlags & 2u) != 0;
                 const bool hasEmissionTexture = (textureFlags & 4u) != 0;
                 const bool hasNormalTexture = (textureFlags & 8u) != 0;
+                const bool hasOpacityTexture = (textureFlags & 16u) != 0;
                 if (vertexCount == 0 || vertexCount > kMaxSceneMeshVertexCount
                     || indexCount == 0 || indexCount > kMaxSceneMeshIndexCount
                     || indexCount % 3 != 0
@@ -676,8 +713,12 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                     || (hasTextureUVs && uvCount != indexCount)
                     || (!hasTextureUVs && (hasBaseTexture
                         || hasRoughnessTexture || hasMetallicTexture
-                        || hasEmissionTexture || hasNormalTexture))
-                    || (textureFlags & ~15u) != 0) {
+                        || hasEmissionTexture || hasNormalTexture
+                        || hasOpacityTexture))
+                    || (textureFlags & ~(hasStandardOpacity ? 31u : 15u)) != 0
+                    || (hasOpacityTexture
+                        && ((mesh.materialFlags & 128u) == 0
+                            || !hasBaseTexture))) {
                     return std::nullopt;
                 }
                 const std::uint64_t expectedTextureBytes =
@@ -789,6 +830,7 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                     )) {
                     return std::nullopt;
                 }
+                mesh.opacityFromBaseAlpha = hasOpacityTexture;
                 const std::size_t vertexValueCount =
                     static_cast<std::size_t>(vertexCount) * 3;
                 const std::size_t vertexBytes = vertexValueCount * sizeof(float);
@@ -3161,6 +3203,8 @@ std::uint32_t bridgeImageFormat(VkFormat format) {
         return IMB_IMAGE_FORMAT_RGBA8_UINT;
     case VK_FORMAT_R8G8B8A8_SNORM:
         return IMB_IMAGE_FORMAT_RGBA8_SNORM;
+    case VK_FORMAT_R8G8B8A8_SRGB:
+        return IMB_IMAGE_FORMAT_RGBA8_SRGB;
     default:
         return 0;
     }
@@ -9062,6 +9106,9 @@ std::uint64_t bridgeSceneMeshAccelerationStructureLocked(
     appendScalar(mesh.metallic);
     for (const float component : mesh.emissionColor) appendScalar(component);
     appendScalar(mesh.emissionIntensity);
+    appendScalar(mesh.opacity);
+    appendScalar(mesh.opacityThreshold);
+    appendScalar(mesh.opacityFromBaseAlpha);
     const auto appendTextureMap = [&appendScalar, &appendVector](
                                       const BridgeSceneTextureMap& map) {
         appendScalar(map.width);
@@ -9105,10 +9152,11 @@ std::uint64_t bridgeSceneMeshAccelerationStructureLocked(
     const bool hasEmissionTexture = hasTextureMap(mesh.emissionTexture);
     const bool hasNormalTexture = hasTextureMap(mesh.normalTexture);
     const bool hasAlphaCutout = (mesh.materialFlags & 64u) != 0;
+    const bool hasStandardOpacity = (mesh.materialFlags & 128u) != 0;
     const bool hasParameterTextures = hasRoughnessTexture
         || hasMetallicTexture || hasEmissionTexture;
-    const bool hasMaterialDescriptorTextures =
-        hasParameterTextures || hasNormalTexture || hasAlphaCutout;
+    const bool hasMaterialDescriptorTextures = hasParameterTextures
+        || hasNormalTexture || hasAlphaCutout || hasStandardOpacity;
     const bool hasMaterialTextureUVs =
         mesh.cornerUVs.size() == mesh.indices.size() * 2
         && (hasFileTexture || hasMaterialDescriptorTextures);
@@ -9436,10 +9484,12 @@ std::uint64_t bridgeSceneMeshAccelerationStructureLocked(
         if (hasMaterialDescriptorTextures) {
             constexpr std::uint32_t kMaterialDescriptorMagic =
                 UINT32_C(0x314d424d);
-            const bool usesExtendedDescriptor =
-                hasNormalTexture || hasAlphaCutout;
+            const std::uint32_t descriptorVersion = hasStandardOpacity
+                ? 3u : ((hasNormalTexture || hasAlphaCutout) ? 2u : 1u);
+            const bool usesExtendedDescriptor = descriptorVersion >= 2u;
             std::vector<std::uint8_t> descriptor;
-            descriptor.reserve(usesExtendedDescriptor ? 56 : 48);
+            descriptor.reserve(descriptorVersion == 3u
+                ? 64 : (usesExtendedDescriptor ? 56 : 48));
             std::uint32_t descriptorFlags = 0;
             if (resources.textureResourceID != 0) descriptorFlags |= 1u;
             if (resources.roughnessTextureResourceID != 0) descriptorFlags |= 2u;
@@ -9447,6 +9497,8 @@ std::uint64_t bridgeSceneMeshAccelerationStructureLocked(
             if (resources.emissionTextureResourceID != 0) descriptorFlags |= 8u;
             if (resources.normalTextureResourceID != 0) descriptorFlags |= 16u;
             if ((mesh.materialFlags & 64u) != 0) descriptorFlags |= 32u;
+            if (hasStandardOpacity) descriptorFlags |= 64u;
+            if (mesh.opacityFromBaseAlpha) descriptorFlags |= 128u;
             const std::uint32_t packedChannels =
                 mesh.roughnessTexture.channel
                 | (mesh.metallicTexture.channel << 4)
@@ -9454,7 +9506,7 @@ std::uint64_t bridgeSceneMeshAccelerationStructureLocked(
             imb::appendLittleEndian(descriptor, kMaterialDescriptorMagic);
             imb::appendLittleEndian(
                 descriptor,
-                std::uint32_t{usesExtendedDescriptor ? 2u : 1u}
+                descriptorVersion
             );
             imb::appendLittleEndian(descriptor, descriptorFlags);
             imb::appendLittleEndian(descriptor, packedChannels);
@@ -9472,6 +9524,16 @@ std::uint64_t bridgeSceneMeshAccelerationStructureLocked(
             appendResourceID(resources.emissionTextureResourceID);
             if (usesExtendedDescriptor) {
                 appendResourceID(resources.normalTextureResourceID);
+            }
+            if (descriptorVersion == 3u) {
+                imb::appendLittleEndian(
+                    descriptor,
+                    std::bit_cast<std::uint32_t>(mesh.opacity)
+                );
+                imb::appendLittleEndian(
+                    descriptor,
+                    std::bit_cast<std::uint32_t>(mesh.opacityThreshold)
+                );
             }
             resources.materialDescriptorResourceID =
                 gState.bridge->createBuffer(descriptor.size());
@@ -9746,7 +9808,7 @@ VkResult bridgeFallbackInstanceAccelerationStructureBuildLocked(
                 ++sceneGeometryMeshCount;
                 std::fprintf(
                     stderr,
-                    "imb-vulkan-icd: built USD Mesh BLAS pathHash=%#llx vertices=%zu triangles=%u host=%llu instanceTransform=usd-world source=scene-state-v13 normals=%s material=%s texture=%ux%u roughness=%.3f metallic=%.3f emission=(%.3f,%.3f,%.3f)x%.3f parameterTextures=roughness:%ux%u[c%u],metallic:%ux%u[c%u],emission:%ux%u[rgb],normal:%ux%u[rgb-tangent] alphaCutout=%d materialDescriptor=%llu\n",
+                    "imb-vulkan-icd: built USD Mesh BLAS pathHash=%#llx vertices=%zu triangles=%u host=%llu instanceTransform=usd-world source=scene-state-v14 normals=%s material=%s texture=%ux%u roughness=%.3f metallic=%.3f emission=(%.3f,%.3f,%.3f)x%.3f parameterTextures=roughness:%ux%u[c%u],metallic:%ux%u[c%u],emission:%ux%u[rgb],normal:%ux%u[rgb-tangent] alphaCutout=%d opacity=%.3f threshold=%.3f opacityTexture=%d materialDescriptor=%llu\n",
                     static_cast<unsigned long long>(mesh.pathHash),
                     mesh.vertices.size() / 3,
                     mesh.triangleCount,
@@ -9780,6 +9842,9 @@ VkResult bridgeFallbackInstanceAccelerationStructureBuildLocked(
                     mesh.normalTexture.width,
                     mesh.normalTexture.height,
                     (mesh.materialFlags & 64u) != 0 ? 1 : 0,
+                    mesh.opacity,
+                    mesh.opacityThreshold,
+                    mesh.opacityFromBaseAlpha ? 1 : 0,
                     static_cast<unsigned long long>(
                         materialDescriptorResourceID
                     )

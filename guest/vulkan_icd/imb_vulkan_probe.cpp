@@ -414,6 +414,85 @@ int main(int argc, char** argv) {
             << sparseFormatProperties.imageGranularity.height
             << " map=passed unmap=passed backend=Metal\n";
 
+        VkSparseImageFormatProperties srgbSparseProperties{};
+        std::uint32_t srgbSparsePropertyCount = 1;
+        vkGetPhysicalDeviceSparseImageFormatProperties(
+            physicalDevices[0],
+            VK_FORMAT_R8G8B8A8_SRGB,
+            VK_IMAGE_TYPE_2D,
+            VK_SAMPLE_COUNT_1_BIT,
+            VK_IMAGE_USAGE_SAMPLED_BIT,
+            VK_IMAGE_TILING_OPTIMAL,
+            &srgbSparsePropertyCount,
+            &srgbSparseProperties
+        );
+        if (srgbSparsePropertyCount != 1
+            || srgbSparseProperties.imageGranularity.width == 0
+            || srgbSparseProperties.imageGranularity.height == 0) {
+            throw std::runtime_error(
+                "IMB did not expose Metal sparse properties for RGBA8_SRGB"
+            );
+        }
+        VkImageCreateInfo srgbSparseInfo = sparseImageInfo;
+        srgbSparseInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+        srgbSparseInfo.extent = {
+            srgbSparseProperties.imageGranularity.width,
+            srgbSparseProperties.imageGranularity.height,
+            1,
+        };
+        VkImage srgbSparseImage = VK_NULL_HANDLE;
+        require(
+            vkCreateImage(
+                device, &srgbSparseInfo, nullptr, &srgbSparseImage
+            ),
+            "vkCreateImage(sparse RGBA8_SRGB Metal)"
+        );
+        VkMemoryRequirements srgbSparseMemoryRequirements{};
+        vkGetImageMemoryRequirements(
+            device, srgbSparseImage, &srgbSparseMemoryRequirements
+        );
+        if (srgbSparseMemoryRequirements.alignment
+                > sparseMemoryInfo.allocationSize
+            || (srgbSparseMemoryRequirements.memoryTypeBits
+                & (1U << memoryTypeIndex)) == 0) {
+            throw std::runtime_error(
+                "IMB returned invalid RGBA8_SRGB sparse memory requirements"
+            );
+        }
+        VkSparseImageMemoryBind srgbSparseBind{};
+        srgbSparseBind.subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        srgbSparseBind.subresource.mipLevel = 0;
+        srgbSparseBind.subresource.arrayLayer = 0;
+        srgbSparseBind.extent = srgbSparseProperties.imageGranularity;
+        srgbSparseBind.memory = sparseMemory;
+        VkSparseImageMemoryBindInfo srgbSparseBindInfo{};
+        srgbSparseBindInfo.image = srgbSparseImage;
+        srgbSparseBindInfo.bindCount = 1;
+        srgbSparseBindInfo.pBinds = &srgbSparseBind;
+        VkBindSparseInfo srgbSparseQueueBind{};
+        srgbSparseQueueBind.sType = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO;
+        srgbSparseQueueBind.imageBindCount = 1;
+        srgbSparseQueueBind.pImageBinds = &srgbSparseBindInfo;
+        require(
+            vkQueueBindSparse(
+                queue, 1, &srgbSparseQueueBind, VK_NULL_HANDLE
+            ),
+            "vkQueueBindSparse(RGBA8_SRGB map)"
+        );
+        srgbSparseBind.memory = VK_NULL_HANDLE;
+        require(
+            vkQueueBindSparse(
+                queue, 1, &srgbSparseQueueBind, VK_NULL_HANDLE
+            ),
+            "vkQueueBindSparse(RGBA8_SRGB unmap)"
+        );
+        vkDestroyImage(device, srgbSparseImage, nullptr);
+        std::cout
+            << "VULKAN_SPARSE_IMAGE format=RGBA8_SRGB tile="
+            << srgbSparseProperties.imageGranularity.width << "x"
+            << srgbSparseProperties.imageGranularity.height
+            << " map=passed unmap=passed backend=Metal\n";
+
         const std::array<std::pair<VkFormat, const char*>, 2> compressedSparseFormats{{
             {VK_FORMAT_BC3_SRGB_BLOCK, "BC3_SRGB"},
             {VK_FORMAT_BC5_UNORM_BLOCK, "BC5_UNORM"},

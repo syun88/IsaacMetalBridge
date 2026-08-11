@@ -63,7 +63,7 @@ public final class BridgeSession: @unchecked Sendable {
         let blockHeight: UInt64
         let blockBytes: UInt64
         switch resource.format {
-        case 1, 2, 8, 9:
+        case 1, 2, 8, 9, 10:
             (blockWidth, blockHeight, blockBytes) = (1, 1, 4)
         case 3, 6, 7:
             (blockWidth, blockHeight, blockBytes) = (4, 4, 16)
@@ -262,7 +262,7 @@ public final class BridgeSession: @unchecked Sendable {
                               height > 0,
                               width <= 16_384,
                               height <= 16_384,
-                              (format >= 1 && format <= 7),
+                              (format >= 1 && format <= 10),
                               mipLevels > 0,
                               mipLevels <= 32,
                               arrayLayers > 0,
