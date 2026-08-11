@@ -1054,6 +1054,9 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     let iesLightTexture = session.handle(request(
         .createResource, id: 21, payload: lightImageCreate
     )).response
+    let domeEnvironmentTexture = session.handle(request(
+        .createResource, id: 22, payload: lightImageCreate
+    )).response
 
     var accelerationCreate = Data()
     accelerationCreate.appendLittleEndian(UInt64(4096))
@@ -1190,7 +1193,12 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     )
     let expectedAdditionalDomeLight = RayDomeLight(
         color: SIMD3<Float>(0.12, 0.16, 0.22),
-        intensity: 75
+        intensity: 75,
+        axisX: SIMD3<Float>(0, 1, 0),
+        axisY: SIMD3<Float>(-1, 0, 0),
+        axisZ: SIMD3<Float>(0, 0, 1),
+        environmentTextureResourceID: domeEnvironmentTexture.header.resourceID,
+        environmentIsRGBE: true
     )
     let additionalRecords: [(UInt32, UInt32, [Float], UInt64, [Float], UInt32)] = [
         (
@@ -1275,8 +1283,16 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
                 expectedAdditionalDomeLight.color.y,
                 expectedAdditionalDomeLight.color.z,
                 expectedAdditionalDomeLight.intensity,
-                0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0,
+                expectedAdditionalDomeLight.axisX.x,
+                expectedAdditionalDomeLight.axisX.y,
+                expectedAdditionalDomeLight.axisX.z,
+                expectedAdditionalDomeLight.axisY.x,
+                expectedAdditionalDomeLight.axisY.y,
+                expectedAdditionalDomeLight.axisY.z,
+                expectedAdditionalDomeLight.axisZ.x,
+                expectedAdditionalDomeLight.axisZ.y,
+                expectedAdditionalDomeLight.axisZ.z,
+                0, 0, 0,
             ],
             0x1003,
             [0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -1302,6 +1318,12 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
             command.appendLittleEndian(Float(0.75).bitPattern)
             command.appendLittleEndian(Float(2.5).bitPattern)
             command.appendLittleEndian(UInt32(7))
+        } else if recordIndex == 3 {
+            command.appendLittleEndian(domeEnvironmentTexture.header.resourceID)
+            command.appendLittleEndian(UInt64(0))
+            command.appendLittleEndian(Float(0).bitPattern)
+            command.appendLittleEndian(Float(0).bitPattern)
+            command.appendLittleEndian(UInt32(24))
         } else {
             command.appendLittleEndian(UInt64(0))
             command.appendLittleEndian(UInt64(0))
@@ -1370,12 +1392,12 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
     )).response
     #expect(try errorCode(invalidShapingFlag) == ErrorCode.invalidPayload.rawValue)
 
-    // Bits 0-2 are the complete light-texture flag set. Reserved bits fail
+    // Bits 0-4 are the complete light-texture flag set. Reserved bits fail
     // before a resource can reach Metal.
     var reservedLightTextureFlag = command
     reservedLightTextureFlag.replaceSubrange(
         320..<324,
-        with: withUnsafeBytes(of: UInt32(8).littleEndian) { Data($0) }
+        with: withUnsafeBytes(of: UInt32(32).littleEndian) { Data($0) }
     )
     let invalidLightTextureFlag = session.handle(request(
         .submitCommand,

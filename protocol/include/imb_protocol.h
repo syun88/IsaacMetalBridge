@@ -10,7 +10,7 @@ extern "C" {
 
 #define IMB_PROTOCOL_MAGIC UINT32_C(0x31424d49) /* little-endian bytes: I M B 1 */
 #define IMB_PROTOCOL_VERSION_MAJOR UINT16_C(1)
-#define IMB_PROTOCOL_VERSION_MINOR UINT16_C(21)
+#define IMB_PROTOCOL_VERSION_MINOR UINT16_C(22)
 #define IMB_PROTOCOL_HEADER_SIZE UINT32_C(32)
 #define IMB_PROTOCOL_MAX_PAYLOAD UINT32_C(16777216)
 
@@ -183,7 +183,7 @@ enum imb_trace_rays_options {
     IMB_TRACE_RAYS_OPTION_LIVE_DOME_LIGHT = 1u << 3,
     /* Draw the renderer-owned empty-stage guide grid; AS resource ID is zero. */
     IMB_TRACE_RAYS_OPTION_EMPTY_STAGE_GRID = 1u << 4,
-    /* An 8-byte list header and bounded 120-byte light records follow. */
+    /* An 8-byte list header and bounded 152-byte light records follow. */
     IMB_TRACE_RAYS_OPTION_ADDITIONAL_LIGHTS = 1u << 5
 };
 
@@ -214,7 +214,11 @@ enum imb_trace_light_texture_flags {
     /* UsdLuxShapingAPI inputs:shaping:ies:file angular lookup. */
     IMB_TRACE_LIGHT_TEXTURE_IES_PROFILE = 1u << 1,
     /* The authored inputs:shaping:ies:normalize value was true. */
-    IMB_TRACE_LIGHT_TEXTURE_IES_NORMALIZED = 1u << 2
+    IMB_TRACE_LIGHT_TEXTURE_IES_NORMALIZED = 1u << 2,
+    /* DomeLight latlong environment stored as ordinary sRGB RGBA8. */
+    IMB_TRACE_LIGHT_TEXTURE_DOME_ENVIRONMENT = 1u << 3,
+    /* Dome environment RGB channels are Radiance RGBE, not sRGB. */
+    IMB_TRACE_LIGHT_TEXTURE_DOME_RGBE = 1u << 4
 };
 
 #define IMB_TRACE_RAYS_MAX_ADDITIONAL_LIGHTS UINT32_C(16)
@@ -463,7 +467,9 @@ typedef struct imb_trace_light_payload {
      *             DiskLight carry normalized local-X/local-Y axes after the
      *             USD world transform and their world-space half extents.
      * DISTANT: direction.xyz, intensity, color.rgb, angle degrees, then zero.
-     * DOME: color.rgb, intensity, remaining values zero.
+     * DOME: color.rgb, intensity; when a latlong environment is present,
+     * values 4..12 are normalized world-space local +X/+Y/+Z axes and
+     * values 13..15 are zero. Otherwise values 4..15 are zero.
      */
     float values[16];
     uint64_t path_hash;
@@ -480,9 +486,10 @@ typedef struct imb_trace_light_payload {
     float shaping_focus_tint[3];
     uint32_t shaping_flags;
     /*
-     * Optional ordinary RGBA8 image resources. Rect emission is interpreted
-     * as sRGB color. IES is a linear single-channel angular LUT replicated to
-     * RGB; ies_multiplier restores its authored or energy-normalized range.
+     * Optional ordinary RGBA8 image resources. The first resource is Rect
+     * emission sRGB or a Dome latlong environment (sRGB or Radiance RGBE).
+     * IES is a linear single-channel angular LUT replicated to RGB;
+     * ies_multiplier restores its authored or energy-normalized range.
      * ies_angle_scale follows UsdLuxShapingAPI exactly. All fields and flags
      * must be zero when the corresponding resource is absent.
      */

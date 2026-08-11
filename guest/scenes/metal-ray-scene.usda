@@ -347,7 +347,7 @@ def Xform "World"
         uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
     }
 
-    # Protocol 1.21 preserves this RectLight's transformed local XY axes,
+    # Protocol 1.22 preserves this RectLight's transformed local XY axes,
     # dimensions, and authored emitter texture. Metal evaluates its one-sided
     # -Z emission with four bounded area samples.
     def RectLight "WindowLight"
@@ -372,7 +372,7 @@ def Xform "World"
         uniform token[] xformOpOrder = ["xformOp:translate"]
     }
 
-    # CylinderLight is centered on its local X axis. Scene-state v19 carries
+    # CylinderLight is centered on its local X axis. Scene-state v20 carries
     # the transformed axis, half-length, and both radial extents; Metal samples
     # the outward-emitting curved surface.
     def CylinderLight "TubeLight"
@@ -391,7 +391,7 @@ def Xform "World"
     }
 
     # A real UsdLuxShapingAPI spotlight and LM-63 Type-C profile regression.
-    # Protocol 1.21 transports the applied-schema flag separately from its
+    # Protocol 1.22 transports the applied-schema flag separately from its
     # fallback values so an ordinary unshaped SphereLight remains
     # omnidirectional.
     def SphereLight "SpotLight" (
@@ -423,8 +423,14 @@ def Xform "World"
 
     def DomeLight "FillLight"
     {
-        float inputs:intensity = 400
-        color3f inputs:color = (0.28, 0.36, 0.5)
+        # OpenUSD latlong orientation and this prim transform are transported
+        # into Metal for both the visible background and environment lighting.
+        float inputs:intensity = 180
+        color3f inputs:color = (0.8, 0.9, 1.0)
+        asset inputs:texture:file = @./dome-latlong.png@
+        token inputs:texture:format = "latlong"
+        double3 xformOp:rotateXYZ = (0, 0, 20)
+        uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
     }
 
     def DomeLight "AmbientAccent"

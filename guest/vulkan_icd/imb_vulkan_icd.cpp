@@ -65,7 +65,8 @@ constexpr std::uint16_t kSceneStateAreaLightVersion = 16;
 constexpr std::uint16_t kSceneStateCylinderLightVersion = 17;
 constexpr std::uint16_t kSceneStateShapingVersion = 18;
 constexpr std::uint16_t kSceneStateLightTextureVersion = 19;
-constexpr std::uint16_t kSceneStateVersion = kSceneStateLightTextureVersion;
+constexpr std::uint16_t kSceneStateDomeTextureVersion = 20;
+constexpr std::uint16_t kSceneStateVersion = kSceneStateDomeTextureVersion;
 constexpr std::size_t kCameraStateSize = 96;
 constexpr std::size_t kSceneStatePreviousHeaderSize = 100;
 constexpr std::size_t kSceneStatePreviousFixedHeaderSize = 148;
@@ -637,14 +638,27 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                         )
                         | static_cast<std::uint32_t>(
                             IMB_TRACE_LIGHT_TEXTURE_IES_NORMALIZED
+                        )
+                        | static_cast<std::uint32_t>(
+                            IMB_TRACE_LIGHT_TEXTURE_DOME_ENVIRONMENT
+                        )
+                        | static_cast<std::uint32_t>(
+                            IMB_TRACE_LIGHT_TEXTURE_DOME_RGBE
                         ))) != 0) {
                 return std::nullopt;
             }
             const bool hasShaping =
                 (light.shapingFlags & IMB_TRACE_LIGHT_SHAPING_APPLIED) != 0;
-            const bool hasEmissionTexture =
+            const bool hasRectTexture =
                 (light.textureFlags
                     & IMB_TRACE_LIGHT_TEXTURE_RECT_EMISSION) != 0;
+            const bool hasDomeTexture =
+                (light.textureFlags
+                    & IMB_TRACE_LIGHT_TEXTURE_DOME_ENVIRONMENT) != 0;
+            const bool domeRGBE =
+                (light.textureFlags
+                    & IMB_TRACE_LIGHT_TEXTURE_DOME_RGBE) != 0;
+            const bool hasEmissionTexture = hasRectTexture || hasDomeTexture;
             const bool hasIES =
                 (light.textureFlags & IMB_TRACE_LIGHT_TEXTURE_IES_PROFILE) != 0;
             const bool normalizedIES =
@@ -664,8 +678,17 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                     || light.iesMultiplier < 0.0f
                     || light.iesMultiplier > 1000000.0f))
                 || (hasEmissionTexture
-                    && (light.kind != IMB_TRACE_LIGHT_KIND_POSITIONAL
-                        || light.schema != IMB_TRACE_LIGHT_SCHEMA_RECT))) {
+                    && !((hasRectTexture
+                            && !hasDomeTexture
+                            && light.kind == IMB_TRACE_LIGHT_KIND_POSITIONAL
+                            && light.schema == IMB_TRACE_LIGHT_SCHEMA_RECT)
+                        || (hasDomeTexture
+                            && !hasRectTexture
+                            && light.kind == IMB_TRACE_LIGHT_KIND_DOME
+                            && light.schema == IMB_TRACE_LIGHT_SCHEMA_DOME)))
+                || (domeRGBE && !hasDomeTexture)
+                || ((hasDomeTexture || domeRGBE)
+                    && version < kSceneStateDomeTextureVersion)) {
                 return std::nullopt;
             }
             if (hasShaping) {
@@ -773,14 +796,34 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                     return std::nullopt;
                 }
             } else if (light.kind == IMB_TRACE_LIGHT_KIND_DOME) {
+                const std::array<float, 3> axisX{
+                    light.values[4], light.values[5], light.values[6]
+                };
+                const std::array<float, 3> axisY{
+                    light.values[7], light.values[8], light.values[9]
+                };
+                const std::array<float, 3> axisZ{
+                    light.values[10], light.values[11], light.values[12]
+                };
+                const bool validTextureBasis = hasDomeTexture
+                    && vectorLengthSquared(axisX) > 0.000001f
+                    && vectorLengthSquared(axisY) > 0.000001f
+                    && vectorLengthSquared(axisZ) > 0.000001f
+                    && std::all_of(
+                        light.values.begin() + 13,
+                        light.values.end(),
+                        [](float value) { return value == 0.0f; }
+                    );
+                const bool emptyTextureBasis = !hasDomeTexture
+                    && std::all_of(
+                        light.values.begin() + 4,
+                        light.values.end(),
+                        [](float value) { return value == 0.0f; }
+                    );
                 if (light.schema != IMB_TRACE_LIGHT_SCHEMA_DOME
                     || !nonnegativeColor(0)
                     || light.values[3] < 0.0f
-                    || std::any_of(
-                        light.values.begin() + 4,
-                        light.values.end(),
-                        [](float value) { return value != 0.0f; }
-                    )) {
+                    || !(validTextureBasis || emptyTextureBasis)) {
                     return std::nullopt;
                 }
             } else {
@@ -848,7 +891,8 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
         lightTextureBytes = textureOffset - tableStart;
         for (auto& light : camera.additionalLights) {
             if ((light.textureFlags
-                    & IMB_TRACE_LIGHT_TEXTURE_RECT_EMISSION) != 0) {
+                    & (IMB_TRACE_LIGHT_TEXTURE_RECT_EMISSION
+                        | IMB_TRACE_LIGHT_TEXTURE_DOME_ENVIRONMENT)) != 0) {
                 if (light.emissionTextureIndex >= lightTextures.size()) {
                     return std::nullopt;
                 }
@@ -15636,7 +15680,8 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                         return resourceID;
                     };
                     if ((light.textureFlags
-                            & IMB_TRACE_LIGHT_TEXTURE_RECT_EMISSION) != 0) {
+                            & (IMB_TRACE_LIGHT_TEXTURE_RECT_EMISSION
+                                | IMB_TRACE_LIGHT_TEXTURE_DOME_ENVIRONMENT)) != 0) {
                         light.emissionTextureResourceID = acquireLightTexture(
                             light.emissionTextureWidth,
                             light.emissionTextureHeight,
@@ -15644,7 +15689,7 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                         );
                         if (light.emissionTextureResourceID == 0) {
                             throw std::runtime_error(
-                                "RectLight texture Metal resource creation failed"
+                                "light color texture Metal resource creation failed"
                             );
                         }
                     }
@@ -15779,7 +15824,7 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                             if (light.textureFlags != 0) {
                                 std::fprintf(
                                     stderr,
-                                    " lightTextures=%#x rect=%llu ies=%llu angleScale=%.3f multiplier=%.6f",
+                                    " lightTextures=%#x color=%llu ies=%llu angleScale=%.3f multiplier=%.6f",
                                     light.textureFlags,
                                     static_cast<unsigned long long>(
                                         light.emissionTextureResourceID

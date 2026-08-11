@@ -34,11 +34,13 @@ int main() {
     static_assert(sizeof(imb_write_resource_payload) == 16);
     static_assert(sizeof(imb_read_resource_payload) == 16);
 
-    require(IMB_PROTOCOL_VERSION_MAJOR == 1 && IMB_PROTOCOL_VERSION_MINOR == 21, "unexpected protocol version");
+    require(IMB_PROTOCOL_VERSION_MAJOR == 1 && IMB_PROTOCOL_VERSION_MINOR == 22, "unexpected protocol version");
     require(IMB_TRACE_LIGHT_SHAPING_APPLIED == 1, "unexpected shaping flag");
     require(IMB_TRACE_LIGHT_TEXTURE_RECT_EMISSION == 1, "unexpected RectLight texture flag");
     require(IMB_TRACE_LIGHT_TEXTURE_IES_PROFILE == 2, "unexpected IES texture flag");
     require(IMB_TRACE_LIGHT_TEXTURE_IES_NORMALIZED == 4, "unexpected IES normalize flag");
+    require(IMB_TRACE_LIGHT_TEXTURE_DOME_ENVIRONMENT == 8, "unexpected DomeLight texture flag");
+    require(IMB_TRACE_LIGHT_TEXTURE_DOME_RGBE == 16, "unexpected DomeLight RGBE flag");
     require(IMB_IMAGE_FORMAT_RGBA32_SFLOAT == 11, "unexpected RGBA32 float sparse format");
     require(IMB_IMAGE_OPTION_3D == 2, "unexpected ordinary 3D image option");
     require(IMB_IMAGE_OPTION_DEPTH_SHIFT == 16, "unexpected ordinary image depth shift");

@@ -1134,7 +1134,7 @@ public final class BridgeSession: @unchecked Sendable {
                                 frame.payload.readLittleEndian(at: lightOffset + 144),
                               let lightTextureReserved: UInt32 = try?
                                 frame.payload.readLittleEndian(at: lightOffset + 148),
-                              lightTextureFlags & ~UInt32(7) == 0,
+                              lightTextureFlags & ~UInt32(31) == 0,
                               lightTextureReserved == 0
                         else {
                             return failure(
@@ -1146,9 +1146,12 @@ public final class BridgeSession: @unchecked Sendable {
                         let iesAngleScale = Float(bitPattern: iesAngleScaleBits)
                         let iesMultiplier = Float(bitPattern: iesMultiplierBits)
                         let hasShaping = shapingFlags & 1 != 0
-                        let hasEmissionTexture = lightTextureFlags & 1 != 0
+                        let hasRectTexture = lightTextureFlags & 1 != 0
                         let hasIES = lightTextureFlags & 2 != 0
                         let iesNormalized = lightTextureFlags & 4 != 0
+                        let hasDomeTexture = lightTextureFlags & 8 != 0
+                        let domeRGBE = lightTextureFlags & 16 != 0
+                        let hasColorTexture = hasRectTexture || hasDomeTexture
                         let validLightImage: (UInt64) -> Bool = { resourceID in
                             guard let resource = self.resources[resourceID] else {
                                 return false
@@ -1163,7 +1166,7 @@ public final class BridgeSession: @unchecked Sendable {
                         }
                         guard iesAngleScale.isFinite,
                               iesMultiplier.isFinite,
-                              (hasEmissionTexture
+                              (hasColorTexture
                                   ? emissionTextureResourceID != 0
                                       && validLightImage(emissionTextureResourceID)
                                   : emissionTextureResourceID == 0),
@@ -1178,7 +1181,14 @@ public final class BridgeSession: @unchecked Sendable {
                                       && iesAngleScale == 0
                                       && iesMultiplier == 0
                                       && !iesNormalized),
-                              !hasEmissionTexture || (kind == 1 && schema == 2)
+                              ((!hasRectTexture && !hasDomeTexture)
+                                  || (hasRectTexture
+                                      && !hasDomeTexture
+                                      && kind == 1 && schema == 2)
+                                  || (hasDomeTexture
+                                      && !hasRectTexture
+                                      && kind == 3 && schema == 5)),
+                              !domeRGBE || hasDomeTexture
                         else {
                             return failure(
                                 frame,
@@ -1327,10 +1337,23 @@ public final class BridgeSession: @unchecked Sendable {
                                 angleDegrees: values[7]
                             ))
                         case 3:
+                            let axisXLengthSquared = values[4] * values[4]
+                                + values[5] * values[5] + values[6] * values[6]
+                            let axisYLengthSquared = values[7] * values[7]
+                                + values[8] * values[8] + values[9] * values[9]
+                            let axisZLengthSquared = values[10] * values[10]
+                                + values[11] * values[11] + values[12] * values[12]
+                            let validTextureBasis = hasDomeTexture
+                                && axisXLengthSquared > 0.000_001
+                                && axisYLengthSquared > 0.000_001
+                                && axisZLengthSquared > 0.000_001
+                                && values[13...15].allSatisfy({ $0 == 0 })
+                            let emptyTextureBasis = !hasDomeTexture
+                                && values[4...15].allSatisfy({ $0 == 0 })
                             guard schema == 5,
                                   values[0] >= 0, values[1] >= 0, values[2] >= 0,
                                   values[3] >= 0,
-                                  values[4...15].allSatisfy({ $0 == 0 })
+                                  validTextureBasis || emptyTextureBasis
                             else {
                                 return failure(
                                     frame,
@@ -1340,7 +1363,13 @@ public final class BridgeSession: @unchecked Sendable {
                             }
                             additionalDomeLights.append(RayDomeLight(
                                 color: SIMD3<Float>(values[0], values[1], values[2]),
-                                intensity: values[3]
+                                intensity: values[3],
+                                axisX: SIMD3<Float>(values[4], values[5], values[6]),
+                                axisY: SIMD3<Float>(values[7], values[8], values[9]),
+                                axisZ: SIMD3<Float>(values[10], values[11], values[12]),
+                                environmentTextureResourceID:
+                                    emissionTextureResourceID,
+                                environmentIsRGBE: domeRGBE
                             ))
                         default:
                             return failure(

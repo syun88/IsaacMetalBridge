@@ -309,10 +309,31 @@ public struct RayDistantLight: Sendable, Equatable {
 public struct RayDomeLight: Sendable, Equatable {
     public let color: SIMD3<Float>
     public let intensity: Float
+    /// World-space directions of the DomeLight's local +X/+Y/+Z axes.
+    public let axisX: SIMD3<Float>
+    public let axisY: SIMD3<Float>
+    public let axisZ: SIMD3<Float>
+    /// Zero for a constant dome, otherwise a transported 2:1 latlong image.
+    public let environmentTextureResourceID: UInt64
+    /// True when the RGBA8 bytes carry Radiance RGBE linear radiance.
+    public let environmentIsRGBE: Bool
 
-    public init(color: SIMD3<Float>, intensity: Float) {
+    public init(
+        color: SIMD3<Float>,
+        intensity: Float,
+        axisX: SIMD3<Float> = SIMD3<Float>(1, 0, 0),
+        axisY: SIMD3<Float> = SIMD3<Float>(0, 1, 0),
+        axisZ: SIMD3<Float> = SIMD3<Float>(0, 0, 1),
+        environmentTextureResourceID: UInt64 = 0,
+        environmentIsRGBE: Bool = false
+    ) {
         self.color = color
         self.intensity = intensity
+        self.axisX = axisX
+        self.axisY = axisY
+        self.axisZ = axisZ
+        self.environmentTextureResourceID = environmentTextureResourceID
+        self.environmentIsRGBE = environmentIsRGBE
     }
 }
 
@@ -762,6 +783,53 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         return clamp(select(high, low, linear <= 0.0031308), 0.0, 1.0);
     }
 
+    float2 imb_dome_latlong_uv(
+        float3 worldDirection,
+        float3 axisX,
+        float3 axisY,
+        float3 axisZ)
+    {
+        const float3 localDirection = normalize(float3(
+            dot(worldDirection, normalize(axisX)),
+            dot(worldDirection, normalize(axisY)),
+            dot(worldDirection, normalize(axisZ))
+        ));
+        const float longitude = atan2(localDirection.x, localDirection.z);
+        const float latitude = asin(clamp(localDirection.y, -1.0, 1.0));
+        return float2(
+            fract((M_PI_F - longitude) / (2.0 * M_PI_F)),
+            clamp((0.5 * M_PI_F - latitude) / M_PI_F, 0.0, 1.0)
+        );
+    }
+
+    float3 imb_sample_dome_environment(
+        texture2d<float, access::sample> environment,
+        sampler environmentSampler,
+        float3 worldDirection,
+        float3 axisX,
+        float3 axisY,
+        float3 axisZ,
+        bool rgbe)
+    {
+        const float2 uv = imb_dome_latlong_uv(
+            worldDirection, axisX, axisY, axisZ
+        );
+        if (!rgbe) {
+            return imb_srgb_to_linear(
+                environment.sample(environmentSampler, uv).rgb
+            );
+        }
+        const uint2 size = uint2(
+            environment.get_width(), environment.get_height()
+        );
+        const uint2 pixel = min(uint2(uv * float2(size)), size - 1u);
+        const float4 encoded = environment.read(pixel);
+        const float exponent = round(encoded.a * 255.0) - 128.0;
+        return encoded.a <= 0.0
+            ? float3(0.0)
+            : (encoded.rgb * 255.0 + 0.5) / 256.0 * exp2(exponent);
+    }
+
     kernel void imb_trace_probe(
         instance_acceleration_structure accelerationStructure [[buffer(0)]],
         constant uint2 &extent [[buffer(1)]],
@@ -944,6 +1012,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             && gridDistance >= probeRay.min_distance
             && gridDistance <= probeRay.max_distance
             && (!hasTriangleHit || gridDistance <= intersection.distance + 0.02);
+        bool hasEnvironmentMiss = false;
         if (hasGridHit) {
             const float3 worldPosition = probeRay.origin + probeRay.direction * gridDistance;
             const float2 minorCell = abs(worldPosition.xy - round(worldPosition.xy));
@@ -1786,28 +1855,69 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 for (uint domeLightIndex = 0u;
                      domeLightIndex < domeLightCount;
                      ++domeLightIndex) {
-                    const float4 activeColorAndIntensity =
-                        domeLightIndex < inlineDomeLightCount
+                    const bool inlineDome =
+                        domeLightIndex < inlineDomeLightCount;
+                    const uint additionalDomeIndex = inlineDome
+                        ? 0u : domeLightIndex - inlineDomeLightCount;
+                    const uint runtimeOffset = 1u
+                        + additionalSphereLightCount * 9u
+                        + additionalDistantLightCount * 2u
+                        + additionalDomeIndex * 4u;
+                    const float4 activeColorAndIntensity = inlineDome
                         ? domeLightColorAndIntensity
-                        : rayRuntime[
-                            1u + additionalSphereLightCount * 9u
-                                + additionalDistantLightCount * 2u
-                                + domeLightIndex - inlineDomeLightCount
-                        ];
-                    const float strength = clamp(
-                        log2(1.0 + max(activeColorAndIntensity.w, 0.0)) * 0.08,
-                        0.10,
-                        2.0
+                        : rayRuntime[runtimeOffset];
+                    float3 diffuseEnvironment = max(
+                        activeColorAndIntensity.xyz, float3(0.0)
                     );
-                    illumination += max(
-                        activeColorAndIntensity.xyz,
-                        float3(0.0)
-                    ) * strength * 0.55;
+                    float3 specularEnvironment = diffuseEnvironment;
+                    if (!inlineDome) {
+                        const float4 axisXAndTexture =
+                            rayRuntime[runtimeOffset + 1u];
+                        if (axisXAndTexture.w >= 0.0
+                            && uint(axisXAndTexture.w) < rayTextureCount) {
+                            const float4 axisYAndRGBE =
+                                rayRuntime[runtimeOffset + 2u];
+                            const float4 axisZ = rayRuntime[runtimeOffset + 3u];
+                            const uint environmentIndex = uint(
+                                axisXAndTexture.w
+                            );
+                            diffuseEnvironment *= imb_sample_dome_environment(
+                                materialTextures[environmentIndex],
+                                materialSampler,
+                                surfaceNormal,
+                                axisXAndTexture.xyz,
+                                axisYAndRGBE.xyz,
+                                axisZ.xyz,
+                                axisYAndRGBE.w > 0.5
+                            );
+                            const float3 reflectedDirection = normalize(
+                                reflect(-viewDirection, surfaceNormal)
+                            );
+                            specularEnvironment *= imb_sample_dome_environment(
+                                materialTextures[environmentIndex],
+                                materialSampler,
+                                reflectedDirection,
+                                axisXAndTexture.xyz,
+                                axisYAndRGBE.xyz,
+                                axisZ.xyz,
+                                axisYAndRGBE.w > 0.5
+                            );
+                        }
+                    }
+                    const float authoredIntensity = max(
+                        activeColorAndIntensity.w, 0.0
+                    );
+                    const float strength = authoredIntensity <= 0.0
+                        ? 0.0
+                        : clamp(
+                            log2(1.0 + authoredIntensity) * 0.08,
+                            0.10,
+                            2.0
+                        );
+                    illumination += diffuseEnvironment * strength * 0.55;
                     if (hasMaterialParameters) {
-                        specularIllumination += max(
-                            activeColorAndIntensity.xyz,
-                            float3(0.0)
-                        ) * reflectance * strength
+                        specularIllumination += specularEnvironment
+                            * reflectance * strength
                             * mix(0.45, 0.08, roughness);
                     }
                 }
@@ -1823,16 +1933,78 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 color = float4(baseColor + emissiveRadiance, 1.0);
             }
         } else {
-            const uint packed = intersection.type == intersection_type::none ? colors.x : colors.y;
-            color = float4(
-                float(packed & 0xff),
-                float((packed >> 8) & 0xff),
-                float((packed >> 16) & 0xff),
-                float((packed >> 24) & 0xff)
-            ) / 255.0;
+            const uint inlineDomeLightCount =
+                (cameraOptions & 16u) != 0 ? 1u : 0u;
+            const uint domeLightCount = inlineDomeLightCount
+                + additionalDomeLightCount;
+            if (isaacSceneView
+                && intersection.type == intersection_type::none
+                && domeLightCount > 0u) {
+                float3 environmentColor = float3(0.0);
+                for (uint domeLightIndex = 0u;
+                     domeLightIndex < domeLightCount;
+                     ++domeLightIndex) {
+                    const bool inlineDome =
+                        domeLightIndex < inlineDomeLightCount;
+                    const uint additionalDomeIndex = inlineDome
+                        ? 0u : domeLightIndex - inlineDomeLightCount;
+                    const uint runtimeOffset = 1u
+                        + additionalSphereLightCount * 9u
+                        + additionalDistantLightCount * 2u
+                        + additionalDomeIndex * 4u;
+                    const float4 activeColorAndIntensity = inlineDome
+                        ? domeLightColorAndIntensity
+                        : rayRuntime[runtimeOffset];
+                    float3 radiance = max(
+                        activeColorAndIntensity.xyz, float3(0.0)
+                    );
+                    if (!inlineDome) {
+                        const float4 axisXAndTexture =
+                            rayRuntime[runtimeOffset + 1u];
+                        if (axisXAndTexture.w >= 0.0
+                            && uint(axisXAndTexture.w) < rayTextureCount) {
+                            const float4 axisYAndRGBE =
+                                rayRuntime[runtimeOffset + 2u];
+                            const float4 axisZ = rayRuntime[runtimeOffset + 3u];
+                            radiance *= imb_sample_dome_environment(
+                                materialTextures[uint(axisXAndTexture.w)],
+                                materialSampler,
+                                probeRay.direction,
+                                axisXAndTexture.xyz,
+                                axisYAndRGBE.xyz,
+                                axisZ.xyz,
+                                axisYAndRGBE.w > 0.5
+                            );
+                        }
+                    }
+                    const float authoredIntensity = max(
+                        activeColorAndIntensity.w, 0.0
+                    );
+                    const float strength = authoredIntensity <= 0.0
+                        ? 0.0
+                        : clamp(
+                            log2(1.0 + authoredIntensity) * 0.08,
+                            0.10,
+                            2.0
+                        );
+                    environmentColor += radiance * strength;
+                }
+                color = float4(environmentColor, 1.0);
+                hasEnvironmentMiss = true;
+            } else {
+                const uint packed = intersection.type == intersection_type::none
+                    ? colors.x : colors.y;
+                color = float4(
+                    float(packed & 0xff),
+                    float((packed >> 8) & 0xff),
+                    float((packed >> 16) & 0xff),
+                    float((packed >> 24) & 0xff)
+                ) / 255.0;
+            }
         }
         const bool layerColorIsLinear =
-            hasGridHit || (isaacSceneView && hasTriangleHit);
+            hasGridHit || hasEnvironmentMiss
+                || (isaacSceneView && hasTriangleHit);
         const float3 linearLayerColor = layerColorIsLinear
             ? color.rgb : imb_srgb_to_linear(color.rgb);
         const bool fractionalOpacityHit = isaacSceneView
@@ -4210,6 +4382,23 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 }
             }
         }
+        for light in additionalDomeLights {
+            let resourceID = light.environmentTextureResourceID
+            guard resourceID == 0 || images[resourceID] != nil else {
+                throw GPUBackendError.resourceNotFound(resourceID)
+            }
+            if resourceID != 0 && rayTextureIndices[resourceID] == nil {
+                guard rayTextureResourceIDs.count < 126 else {
+                    throw GPUBackendError.unsupported(
+                        "combined material and light textures exceed 126 Metal slots"
+                    )
+                }
+                rayTextureIndices[resourceID] = UInt32(
+                    rayTextureResourceIDs.count
+                )
+                rayTextureResourceIDs.append(resourceID)
+            }
+        }
         guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder()
         else {
@@ -4400,8 +4589,27 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 ),
             ]
         }
-        let additionalDomeLightRecords = additionalDomeLights.map {
-            SIMD4<Float>($0.color.x, $0.color.y, $0.color.z, $0.intensity)
+        let additionalDomeLightRecords = additionalDomeLights.flatMap {
+            [
+                SIMD4<Float>($0.color.x, $0.color.y, $0.color.z, $0.intensity),
+                SIMD4<Float>(
+                    $0.axisX.x,
+                    $0.axisX.y,
+                    $0.axisX.z,
+                    $0.environmentTextureResourceID == 0
+                        ? -1
+                        : Float(rayTextureIndices[
+                            $0.environmentTextureResourceID
+                        ]!)
+                ),
+                SIMD4<Float>(
+                    $0.axisY.x,
+                    $0.axisY.y,
+                    $0.axisY.z,
+                    $0.environmentIsRGBE ? 1 : 0
+                ),
+                SIMD4<Float>($0.axisZ.x, $0.axisZ.y, $0.axisZ.z, 0),
+            ]
         }
         let additionalDistantLightCount = UInt32(additionalDistantLights.count)
         let additionalDomeLightCount = UInt32(additionalDomeLights.count)

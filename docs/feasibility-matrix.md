@@ -5,6 +5,8 @@ It is not affiliated with, endorsed by, sponsored by, or supported by Apple Inc.
 
 Classifications describe the current repository at the audited revisions. “Architecturally possible” is not a working implementation claim.
 
+Current lighting revision: protocol 1.22 / scene-state v20 supersedes the v19 row detail below for DomeLight. It transports transformed 2:1 latlong sRGB or Radiance RGBE images and samples them for Metal background, diffuse environment, and specular environment response. Pole/orientation, prim rotation, and high-range RGBE have dedicated Metal regressions; a real Full/ROS 2 run published the Dome image at light texture index 2, retained `lights=4/2/2`, produced a checked 1440×900 frame, exited zero, and left no container. OpenEXR, non-latlong projections, Geometry/Portal schemas, importance sampling, and general RTX light semantics remain incomplete.
+
 | Capability | Classification | Evidence / missing work |
 |---|---|---|
 | Linux ARM64 Isaac Sim 6.0.1 package/image | Verified Base and Full startup | Official ARM64 image is loaded; the real compatibility checker and official Base and Full experiences reached `app ready` under Apple `container`. |

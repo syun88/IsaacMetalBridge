@@ -26,7 +26,7 @@ _SCENE_LIGHT_RECORD = struct.Struct("<II16fQ9fIQQffII")
 _SCENE_TEXTURE_RECORD = struct.Struct("<QIII")
 _SCENE_MESH_RECORD = struct.Struct("<QII26f28I")
 _SCENE_MAGIC = 0x31434D49
-_SCENE_VERSION = 19
+_SCENE_VERSION = 20
 _CAMERA_VALID_PERSPECTIVE = 1
 _SCENE_VALID_SPHERE_LIGHT = 2
 _SCENE_HAS_MESH_MANIFEST = 4
@@ -43,6 +43,8 @@ _LIGHT_SHAPING_APPLIED = 1
 _LIGHT_TEXTURE_RECT_EMISSION = 1
 _LIGHT_TEXTURE_IES_PROFILE = 2
 _LIGHT_TEXTURE_IES_NORMALIZED = 4
+_LIGHT_TEXTURE_DOME_ENVIRONMENT = 8
+_LIGHT_TEXTURE_DOME_RGBE = 16
 _MESH_HAS_BOUND_MATERIAL = 1
 _MESH_HAS_BASE_COLOR = 2
 _MESH_HAS_CONNECTED_BASE_COLOR = 4
@@ -1238,6 +1240,138 @@ def _load_rgba_texture(path: str):
             return rgba.width, rgba.height, pixels
     except Exception:
         return None
+
+
+@functools.lru_cache(maxsize=32)
+def _load_radiance_rgbe(path: str):
+    """Decode one bounded Radiance HDR latlong image without clipping HDR.
+
+    The four transported bytes remain Radiance RGBE.  Metal expands them to
+    linear radiance at sample time, so values above one survive the RGBA8
+    scene sideband.
+    """
+
+    try:
+        with open(path, "rb") as source:
+            signature = source.readline().rstrip(b"\r\n")
+            if signature not in (b"#?RADIANCE", b"#?RGBE"):
+                return None
+            has_rgbe_format = False
+            while True:
+                line = source.readline()
+                if not line:
+                    return None
+                stripped = line.strip()
+                if stripped == b"FORMAT=32-bit_rle_rgbe":
+                    has_rgbe_format = True
+                if not stripped:
+                    break
+            if not has_rgbe_format:
+                return None
+            resolution = source.readline().decode("ascii", "strict").strip()
+            match = re.fullmatch(
+                r"([+-])Y\s+(\d+)\s+([+-])X\s+(\d+)", resolution
+            )
+            if match is None:
+                return None
+            y_sign, height_text, x_sign, width_text = match.groups()
+            width = int(width_text)
+            height = int(height_text)
+            if (
+                width <= 0
+                or height <= 0
+                or width > _MAX_SCENE_TEXTURE_DIMENSION
+                or height > _MAX_SCENE_TEXTURE_DIMENSION
+            ):
+                return None
+
+            rows = []
+            for _ in range(height):
+                prefix = source.read(4)
+                if (
+                    len(prefix) != 4
+                    or width < 8
+                    or width > 32767
+                    or prefix[0] != 2
+                    or prefix[1] != 2
+                    or ((prefix[2] << 8) | prefix[3]) != width
+                ):
+                    return None
+                channels = [bytearray() for _ in range(4)]
+                for channel in channels:
+                    while len(channel) < width:
+                        packet = source.read(2)
+                        if len(packet) != 2 or packet[0] == 0:
+                            return None
+                        if packet[0] > 128:
+                            run = packet[0] - 128
+                            if run == 0 or len(channel) + run > width:
+                                return None
+                            channel.extend(bytes((packet[1],)) * run)
+                        else:
+                            literal = packet[0]
+                            if len(channel) + literal > width:
+                                return None
+                            channel.append(packet[1])
+                            remainder = source.read(literal - 1)
+                            if len(remainder) != literal - 1:
+                                return None
+                            channel.extend(remainder)
+                row = bytearray(width * 4)
+                for x in range(width):
+                    for channel_index in range(4):
+                        row[x * 4 + channel_index] = channels[channel_index][x]
+                if x_sign == "-":
+                    row = bytearray(
+                        b"".join(
+                            row[x * 4 : x * 4 + 4]
+                            for x in range(width - 1, -1, -1)
+                        )
+                    )
+                rows.append(row)
+            if y_sign == "+":
+                rows.reverse()
+
+        target_scale = min(
+            1.0,
+            _MAX_SCENE_TEXTURE_TRANSPORT_DIMENSION / width,
+            _MAX_SCENE_TEXTURE_TRANSPORT_DIMENSION / height,
+        )
+        target_width = max(1, int(width * target_scale))
+        target_height = max(1, int(height * target_scale))
+        if target_width == width and target_height == height:
+            pixels = b"".join(rows)
+        else:
+            resized = bytearray(target_width * target_height * 4)
+            for target_y in range(target_height):
+                source_y = min(int(target_y * height / target_height), height - 1)
+                source_row = rows[source_y]
+                for target_x in range(target_width):
+                    source_x = min(int(target_x * width / target_width), width - 1)
+                    source_offset = source_x * 4
+                    target_offset = (target_y * target_width + target_x) * 4
+                    resized[target_offset : target_offset + 4] = source_row[
+                        source_offset : source_offset + 4
+                    ]
+            pixels = bytes(resized)
+        return target_width, target_height, pixels
+    except Exception:
+        return None
+
+
+def _load_dome_texture(path: str):
+    """Return a bounded latlong image and whether its bytes are linear RGBE."""
+
+    extension = os.path.splitext(path)[1].lower()
+    if extension == ".exr":
+        # Pillow availability varies across Kit builds, and an implicit
+        # float-to-RGBA8 conversion would silently clip high-range radiance.
+        return None
+    if extension in (".hdr", ".pic"):
+        decoded = _load_radiance_rgbe(path)
+        return None if decoded is None else (*decoded, True)
+    decoded = _load_rgba_texture(path)
+    return None if decoded is None else (*decoded, False)
 
 
 def _ies_axis_interval(values: tuple[float, ...], value: float):
@@ -3240,6 +3374,7 @@ class StartupStageExtension(omni.ext.IExt):
                 if not prim.IsA(UsdLux.DomeLight):
                     continue
                 light = UsdLux.DomeLight(prim)
+                world = xform_cache.GetLocalToWorldTransform(prim)
                 light_color = light.GetColorAttr().Get(sample_time)
                 intensity = light.GetIntensityAttr().Get(sample_time)
                 exposure = light.GetExposureAttr().Get(sample_time)
@@ -3254,18 +3389,90 @@ class StartupStageExtension(omni.ext.IExt):
                     max(float(light_color[2]), 0.0),
                     max(effective_intensity, 0.0),
                 )
-                if all(math.isfinite(value) for value in values):
+                world_axes = []
+                for local_axis in (
+                    Gf.Vec3d(1.0, 0.0, 0.0),
+                    Gf.Vec3d(0.0, 1.0, 0.0),
+                    Gf.Vec3d(0.0, 0.0, 1.0),
+                ):
+                    world_axis = world.TransformDir(local_axis)
+                    axis_length = math.sqrt(
+                        sum(float(value) ** 2 for value in world_axis)
+                    )
+                    if not math.isfinite(axis_length) or axis_length <= 0.000001:
+                        world_axes = []
+                        break
+                    world_axes.append(
+                        tuple(float(value) / axis_length for value in world_axis)
+                    )
+                if not world_axes:
+                    continue
+                texture_index = _NO_SCENE_LIGHT_TEXTURE
+                light_texture_flags = 0
+                try:
+                    texture_value = light.GetTextureFileAttr().Get(sample_time)
+                    texture_format = str(
+                        light.GetTextureFormatAttr().Get(sample_time) or "automatic"
+                    )
+                except Exception:
+                    texture_value = None
+                    texture_format = "automatic"
+                texture_path = _resolve_prim_asset_path(prim, texture_value)
+                if texture_path:
+                    decoded = _load_dome_texture(texture_path)
+                    valid_format = texture_format in ("automatic", "latlong")
+                    valid_aspect = (
+                        decoded is not None
+                        and decoded[0] == decoded[1] * 2
+                    )
+                    if valid_format and valid_aspect:
+                        texture_index = append_light_texture(
+                            "dome:" + texture_path,
+                            decoded,
+                        )
+                    if texture_index != _NO_SCENE_LIGHT_TEXTURE:
+                        light_texture_flags |= _LIGHT_TEXTURE_DOME_ENVIRONMENT
+                        if decoded[3]:
+                            light_texture_flags |= _LIGHT_TEXTURE_DOME_RGBE
+                    else:
+                        rejected_light_assets.append(
+                            (
+                                str(prim.GetPath()),
+                                f"DomeLight {texture_format} 2:1 texture",
+                                texture_path,
+                            )
+                        )
+                wire_values = (
+                    (
+                        *values,
+                        *world_axes[0],
+                        *world_axes[1],
+                        *world_axes[2],
+                        0.0, 0.0, 0.0,
+                    )
+                    if light_texture_flags & _LIGHT_TEXTURE_DOME_ENVIRONMENT
+                    else (*values, *((0.0,) * 12))
+                )
+                if all(math.isfinite(value) for value in wire_values):
                     dome_lights.append(
-                        (5, "DomeLight", str(prim.GetPath()), values)
+                        (
+                            5,
+                            "DomeLight",
+                            str(prim.GetPath()),
+                            values,
+                            wire_values,
+                            texture_index,
+                            light_texture_flags,
+                        )
                     )
 
             dome_light_values = dome_lights[0][3] if dome_lights else (0.0,) * 4
             dome_light_path = dome_lights[0][2] if dome_lights else ""
 
-            # Scene-state v19 publishes one complete list. The fixed first-light
+            # Scene-state v20 publishes one complete list. The fixed first-light
             # slots remain populated only so older state readers retain a stable
-            # header shape; the v19 ICD suppresses those legacy slots when it
-            # submits the rich list to Protocol 1.21.
+            # header shape; the v20 ICD suppresses those legacy slots when it
+            # submits the rich list to Protocol 1.22.
             additional_light_records = []
             additional_light_descriptions = []
             for (
@@ -3318,22 +3525,27 @@ class StartupStageExtension(omni.ext.IExt):
                     )
                 )
                 additional_light_descriptions.append(f"{schema_name}:{path}")
-            for schema_code, schema_name, path, values in dome_lights:
+            for (
+                schema_code,
+                schema_name,
+                path,
+                values,
+                wire_values,
+                texture_index,
+                light_texture_flags,
+            ) in dome_lights:
                 additional_light_records.append(
                     _SCENE_LIGHT_RECORD.pack(
                         3,
                         schema_code,
-                        values[0], values[1], values[2], values[3],
-                        0.0, 0.0, 0.0, 0.0,
-                        0.0, 0.0, 0.0, 0.0,
-                        0.0, 0.0, 0.0, 0.0,
+                        *wire_values,
                         _fnv1a_64(path),
                         0.0, 0.0, 0.0, 0.0,
                         0.0, 0.0, 0.0, 0.0, 0.0,
                         0,
+                        texture_index,
                         _NO_SCENE_LIGHT_TEXTURE,
-                        _NO_SCENE_LIGHT_TEXTURE,
-                        0.0, 0.0, 0, 0,
+                        0.0, 0.0, light_texture_flags, 0,
                     )
                 )
                 additional_light_descriptions.append(f"{schema_name}:{path}")
@@ -3549,6 +3761,22 @@ class StartupStageExtension(omni.ext.IExt):
                         f"{dome_light_values[2]:.3f}) "
                         f"intensity={dome_light_values[3]:.3f}"
                     )
+                    for (
+                        _schema_code,
+                        _schema_name,
+                        path,
+                        _values,
+                        _wire_values,
+                        texture_index,
+                        light_texture_flags,
+                    ) in dome_lights:
+                        if light_texture_flags & _LIGHT_TEXTURE_DOME_ENVIRONMENT:
+                            carb.log_warn(
+                                "isaacmetalbridge.stage: DomeLight latlong "
+                                f"environment published: path={path} "
+                                f"textureIndex={texture_index} rgbe="
+                                f"{bool(light_texture_flags & _LIGHT_TEXTURE_DOME_RGBE)}"
+                            )
                 if additional_light_descriptions:
                     carb.log_warn(
                         "isaacmetalbridge.stage: complete USD light list published: "

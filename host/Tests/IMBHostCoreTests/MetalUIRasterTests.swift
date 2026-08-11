@@ -1880,6 +1880,167 @@ private func appendUIVertex(
     #expect(partiallyShadowed[0] < fullyLit[0])
 }
 
+@Test func metalDomeLatlongTextureColorsTheBackgroundAndFollowsOrientation() throws {
+    let backend = try #require(MetalGPUBackend.makeDefault())
+    #expect(backend.supportsRayDispatch)
+
+    // A small central triangle gives the ray dispatch a real TLAS while the
+    // sampled top and bottom pixels remain environment misses.
+    try backend.createBuffer(id: 900, size: 36, options: 0)
+    var vertices = Data()
+    for point: SIMD3<Float> in [
+        SIMD3<Float>(-0.1, -0.1, 0),
+        SIMD3<Float>(0.1, -0.1, 0),
+        SIMD3<Float>(0, 0.1, 0),
+    ] {
+        appendFloat(point.x, to: &vertices)
+        appendFloat(point.y, to: &vertices)
+        appendFloat(point.z, to: &vertices)
+    }
+    try backend.writeBuffer(id: 900, offset: 0, data: vertices)
+    try backend.createAccelerationStructure(id: 901, type: 1, requestedSize: 4096)
+    try backend.buildPrimitiveAccelerationStructure(
+        id: 901,
+        buildFlags: 0x4,
+        geometries: [PrimitiveAccelerationStructureGeometry(
+            kind: .triangles,
+            flags: 1,
+            dataResourceID: 900,
+            dataOffset: 0,
+            primitiveCount: 1,
+            stride: 12,
+            vertexFormat: 1
+        )]
+    )
+    try backend.createAccelerationStructure(id: 902, type: 0, requestedSize: 4096)
+    try backend.buildInstanceAccelerationStructure(
+        id: 902,
+        buildFlags: 0x4,
+        instances: [InstanceAccelerationStructureInstance(
+            transformationMatrix: [
+                1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, 0,
+            ],
+            options: 0,
+            mask: 0xff,
+            intersectionFunctionTableOffset: 0,
+            userID: 0x00bf_ffff,
+            accelerationStructureResourceID: 901
+        )]
+    )
+
+    // OpenUSD latlong convention: the top row is local +Y and the bottom row
+    // is local -Y. Red/blue poles make both sampling and transform direction
+    // observable without relying on a screenshot.
+    try backend.createImage(id: 903, width: 4, height: 2, format: 1, options: 0)
+    try backend.writeImage(
+        id: 903,
+        data: Data([
+            255, 0, 0, 255, 255, 0, 0, 255,
+            255, 0, 0, 255, 255, 0, 0, 255,
+            0, 0, 255, 255, 0, 0, 255, 255,
+            0, 0, 255, 255, 0, 0, 255, 255,
+        ])
+    )
+    let camera = RayCamera(
+        position: SIMD3<Float>(0, 0, -2),
+        forward: SIMD3<Float>(0, 0, 1),
+        up: SIMD3<Float>(0, 1, 0),
+        verticalFOVRadians: 1.2,
+        nearDistance: 0.01,
+        farDistance: 100
+    )
+
+    func render(
+        imageID: UInt64,
+        fenceID: UInt64,
+        rotated: Bool,
+        textureID: UInt64 = 903,
+        intensity: Float = 100,
+        rgbe: Bool = false
+    ) throws -> Data {
+        try backend.createImage(
+            id: imageID, width: 64, height: 64, format: 1, options: 0
+        )
+        let dome = RayDomeLight(
+            color: SIMD3<Float>(1, 1, 1),
+            intensity: intensity,
+            axisX: rotated ? SIMD3<Float>(-1, 0, 0) : SIMD3<Float>(1, 0, 0),
+            axisY: rotated ? SIMD3<Float>(0, -1, 0) : SIMD3<Float>(0, 1, 0),
+            axisZ: SIMD3<Float>(0, 0, 1),
+            environmentTextureResourceID: textureID,
+            environmentIsRGBE: rgbe
+        )
+        try backend.submitRayTrace(
+            imageID: imageID,
+            accelerationStructureID: 902,
+            width: 64,
+            height: 64,
+            missRGBA8: 0xff00_0000,
+            hitRGBA8: 0xffe0_8c30,
+            camera: camera,
+            sphereLight: nil,
+            distantLight: nil,
+            domeLight: nil,
+            additionalSphereLights: [],
+            additionalDistantLights: [],
+            additionalDomeLights: [dome],
+            fenceID: fenceID
+        )
+        #expect(try backend.waitFence(id: fenceID))
+        return try backend.readImage(id: imageID)
+    }
+
+    let upright = try render(imageID: 904, fenceID: 904, rotated: false)
+    let rotated = try render(imageID: 905, fenceID: 905, rotated: true)
+    func pixel(_ image: Data, x: Int, y: Int) -> [UInt8] {
+        let offset = (y * 64 + x) * 4
+        return Array(image[offset..<(offset + 4)])
+    }
+    let uprightTop = pixel(upright, x: 32, y: 4)
+    let uprightBottom = pixel(upright, x: 32, y: 59)
+    let rotatedTop = pixel(rotated, x: 32, y: 4)
+    let rotatedBottom = pixel(rotated, x: 32, y: 59)
+    #expect(uprightTop[0] > uprightTop[2])
+    #expect(uprightBottom[2] > uprightBottom[0])
+    #expect(rotatedTop[2] > rotatedTop[0])
+    #expect(rotatedBottom[0] > rotatedBottom[2])
+
+    // RGBE values stay linear and can exceed one despite the RGBA8 transport.
+    // R/B=128 with exponent 131 expands to about 4.0 radiance. At intensity
+    // one the resulting sRGB byte is well above the value produced by treating
+    // byte 128 as ordinary sRGB.
+    try backend.createImage(id: 906, width: 4, height: 2, format: 1, options: 0)
+    try backend.writeImage(
+        id: 906,
+        data: Data([
+            128, 0, 0, 131, 128, 0, 0, 131,
+            128, 0, 0, 131, 128, 0, 0, 131,
+            0, 0, 128, 131, 0, 0, 128, 131,
+            0, 0, 128, 131, 0, 0, 128, 131,
+        ])
+    )
+    let hdr = try render(
+        imageID: 907,
+        fenceID: 907,
+        rotated: false,
+        textureID: 906,
+        intensity: 1,
+        rgbe: true
+    )
+    #expect(pixel(hdr, x: 32, y: 4)[0] > 120)
+    #expect(pixel(hdr, x: 32, y: 59)[2] > 120)
+
+    let disabled = try render(
+        imageID: 908,
+        fenceID: 908,
+        rotated: false,
+        intensity: 0
+    )
+    #expect(pixel(disabled, x: 32, y: 4)[0...2].allSatisfy { $0 == 0 })
+}
+
 @Test func metalDistantLightAngleUsesPartialConeVisibility() throws {
     let backend = try #require(MetalGPUBackend.makeDefault())
     #expect(backend.supportsRayDispatch)
