@@ -1105,7 +1105,9 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
         direction: SIMD3<Float>(0.2, -0.4, -0.9),
         color: SIMD3<Float>(1, 0.93, 0.82),
         intensity: 2_500,
-        angleDegrees: 1
+        // OpenUSD defines this as an angular diameter in [0, 360), not a
+        // half-angle limited to 180 degrees.
+        angleDegrees: 270
     )
     for value in [
         expectedDistantLight.direction.x,
@@ -1135,13 +1137,18 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
         position: SIMD3<Float>(-3, 2, 5),
         color: SIMD3<Float>(0.4, 0.7, 1),
         intensity: 3_200,
-        radius: 0.5
+        radius: 0.5,
+        shape: .disk,
+        axisU: SIMD3<Float>(1, 0, 0),
+        axisV: SIMD3<Float>(0, 1, 0),
+        halfExtentU: 0.75,
+        halfExtentV: 0.5
     )
     let expectedAdditionalDistantLight = RayDistantLight(
         direction: SIMD3<Float>(-0.5, 0.25, -1),
         color: SIMD3<Float>(0.8, 0.9, 1),
         intensity: 900,
-        angleDegrees: 2.5
+        angleDegrees: 359.5
     )
     let expectedAdditionalDomeLight = RayDomeLight(
         color: SIMD3<Float>(0.12, 0.16, 0.22),
@@ -1159,6 +1166,14 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
                 expectedAdditionalSphereLight.color.y,
                 expectedAdditionalSphereLight.color.z,
                 expectedAdditionalSphereLight.radius,
+                expectedAdditionalSphereLight.axisU.x,
+                expectedAdditionalSphereLight.axisU.y,
+                expectedAdditionalSphereLight.axisU.z,
+                expectedAdditionalSphereLight.halfExtentU,
+                expectedAdditionalSphereLight.axisV.x,
+                expectedAdditionalSphereLight.axisV.y,
+                expectedAdditionalSphereLight.axisV.z,
+                expectedAdditionalSphereLight.halfExtentV,
             ],
             0x1001
         ),
@@ -1173,6 +1188,7 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
                 expectedAdditionalDistantLight.color.y,
                 expectedAdditionalDistantLight.color.z,
                 expectedAdditionalDistantLight.angleDegrees,
+                0, 0, 0, 0, 0, 0, 0, 0,
             ],
             0x1002
         ),
@@ -1183,6 +1199,7 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
                 expectedAdditionalDomeLight.color.y,
                 expectedAdditionalDomeLight.color.z,
                 expectedAdditionalDomeLight.intensity,
+                0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0,
             ],
             0x1003
@@ -1198,7 +1215,7 @@ private func errorCode(_ frame: Frame) throws -> UInt32 {
         }
         command.appendLittleEndian(record.3)
     }
-    #expect(command.count == 320)
+    #expect(command.count == 416)
     let submitted = session.handle(request(
         .submitCommand,
         id: 4,

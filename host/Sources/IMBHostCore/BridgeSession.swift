@@ -1021,7 +1021,7 @@ public final class BridgeSession: @unchecked Sendable {
                           values[5] >= 0,
                           values[6] >= 0,
                           values[7] >= 0,
-                          values[7] <= 180
+                          values[7] < 360
                     else {
                         return failure(frame, .invalidPayload, "TRACE_RAYS live DistantLight is invalid")
                     }
@@ -1060,9 +1060,9 @@ public final class BridgeSession: @unchecked Sendable {
                     guard let lightCount: UInt32 = try? frame.payload.readLittleEndian(at: 168),
                           let lightReserved: UInt32 = try? frame.payload.readLittleEndian(at: 172),
                           lightCount > 0,
-                          lightCount <= 13,
+                          lightCount <= 16,
                           lightReserved == 0,
-                          frame.payload.count == 176 + Int(lightCount) * 48
+                          frame.payload.count == 176 + Int(lightCount) * 80
                     else {
                         return failure(
                             frame,
@@ -1071,10 +1071,10 @@ public final class BridgeSession: @unchecked Sendable {
                         )
                     }
                     for lightIndex in 0..<Int(lightCount) {
-                        let lightOffset = 176 + lightIndex * 48
+                        let lightOffset = 176 + lightIndex * 80
                         guard let kind: UInt32 = try? frame.payload.readLittleEndian(at: lightOffset),
                               let schema: UInt32 = try? frame.payload.readLittleEndian(at: lightOffset + 4),
-                              let pathHash: UInt64 = try? frame.payload.readLittleEndian(at: lightOffset + 40),
+                              let pathHash: UInt64 = try? frame.payload.readLittleEndian(at: lightOffset + 72),
                               pathHash != 0
                         else {
                             return failure(
@@ -1083,7 +1083,7 @@ public final class BridgeSession: @unchecked Sendable {
                                 "TRACE_RAYS additional light \(lightIndex) header is invalid"
                             )
                         }
-                        let values: [Float] = (0..<8).compactMap { valueIndex in
+                        let values: [Float] = (0..<16).compactMap { valueIndex in
                             guard let bits: UInt32 = try? frame.payload.readLittleEndian(
                                 at: lightOffset + 8 + valueIndex * 4
                             ) else {
@@ -1091,7 +1091,7 @@ public final class BridgeSession: @unchecked Sendable {
                             }
                             return Float(bitPattern: bits)
                         }
-                        guard values.count == 8, values.allSatisfy(\.isFinite) else {
+                        guard values.count == 16, values.allSatisfy(\.isFinite) else {
                             return failure(
                                 frame,
                                 .invalidPayload,
@@ -1111,11 +1111,41 @@ public final class BridgeSession: @unchecked Sendable {
                                     "TRACE_RAYS additional positional light \(lightIndex) is invalid"
                                 )
                             }
+                            let axisULengthSquared = values[8] * values[8]
+                                + values[9] * values[9] + values[10] * values[10]
+                            let axisVLengthSquared = values[12] * values[12]
+                                + values[13] * values[13] + values[14] * values[14]
+                            if schema == 1 {
+                                guard values[8...15].allSatisfy({ $0 == 0 }) else {
+                                    return failure(
+                                        frame,
+                                        .invalidPayload,
+                                        "TRACE_RAYS SphereLight shape values are invalid"
+                                    )
+                                }
+                            } else {
+                                guard axisULengthSquared > 0.000_001,
+                                      axisVLengthSquared > 0.000_001,
+                                      values[11] > 0,
+                                      values[15] > 0
+                                else {
+                                    return failure(
+                                        frame,
+                                        .invalidPayload,
+                                        "TRACE_RAYS area-light basis is invalid"
+                                    )
+                                }
+                            }
                             additionalSphereLights.append(RaySphereLight(
                                 position: SIMD3<Float>(values[0], values[1], values[2]),
                                 color: SIMD3<Float>(values[4], values[5], values[6]),
                                 intensity: values[3],
-                                radius: values[7]
+                                radius: values[7],
+                                shape: RayPositionalLightShape(rawValue: schema)!,
+                                axisU: SIMD3<Float>(values[8], values[9], values[10]),
+                                axisV: SIMD3<Float>(values[12], values[13], values[14]),
+                                halfExtentU: values[11],
+                                halfExtentV: values[15]
                             ))
                         case 2:
                             guard schema == 4,
@@ -1123,7 +1153,8 @@ public final class BridgeSession: @unchecked Sendable {
                                     + values[2] * values[2] > 0.000_001,
                                   values[3] >= 0,
                                   values[4] >= 0, values[5] >= 0, values[6] >= 0,
-                                  values[7] >= 0, values[7] <= 180
+                                  values[7] >= 0, values[7] < 360,
+                                  values[8...15].allSatisfy({ $0 == 0 })
                             else {
                                 return failure(
                                     frame,
@@ -1141,7 +1172,7 @@ public final class BridgeSession: @unchecked Sendable {
                             guard schema == 5,
                                   values[0] >= 0, values[1] >= 0, values[2] >= 0,
                                   values[3] >= 0,
-                                  values[4...7].allSatisfy({ $0 == 0 })
+                                  values[4...15].allSatisfy({ $0 == 0 })
                             else {
                                 return failure(
                                     frame,

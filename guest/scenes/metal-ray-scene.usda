@@ -347,9 +347,9 @@ def Xform "World"
         uniform token[] xformOpOrder = ["xformOp:rotateXYZ"]
     }
 
-    # Protocol 1.x maps this real USD RectLight into its bounded positional
-    # light slot using a hard point-light approximation at the authored center
-    # and an equal-area circular radius.
+    # Protocol 1.18 preserves this RectLight's transformed local XY axes and
+    # dimensions; Metal evaluates its one-sided -Z emission with four bounded
+    # area samples.
     def RectLight "WindowLight"
     {
         float inputs:intensity = 650
@@ -361,8 +361,7 @@ def Xform "World"
     }
 
     # Additional positional-light transport regression. DiskLight keeps its
-    # authored schema on the wire and is shaded as a bounded equal-radius
-    # positional emitter by Metal.
+    # authored schema, transformed axes, and elliptical world-space extents.
     def DiskLight "AccentLight"
     {
         float inputs:intensity = 320

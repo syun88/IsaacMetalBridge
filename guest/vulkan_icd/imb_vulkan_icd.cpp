@@ -61,13 +61,16 @@ constexpr std::uint16_t kSceneStateSplitSequenceVersion = 12;
 constexpr std::uint16_t kSceneStateDeduplicatedTextureVersion = 13;
 constexpr std::uint16_t kSceneStateOpacityVersion = 14;
 constexpr std::uint16_t kSceneStateLightArrayVersion = 15;
-constexpr std::uint16_t kSceneStateVersion = kSceneStateLightArrayVersion;
+constexpr std::uint16_t kSceneStateAreaLightVersion = 16;
+constexpr std::uint16_t kSceneStateCylinderLightVersion = 17;
+constexpr std::uint16_t kSceneStateVersion = kSceneStateCylinderLightVersion;
 constexpr std::size_t kCameraStateSize = 96;
 constexpr std::size_t kSceneStatePreviousHeaderSize = 100;
 constexpr std::size_t kSceneStatePreviousFixedHeaderSize = 148;
 constexpr std::size_t kSceneStateSplitSequenceHeaderSize = 156;
 constexpr std::size_t kSceneStateHeaderSize = 160;
-constexpr std::size_t kSceneLightRecordSize = 48;
+constexpr std::size_t kSceneLegacyLightRecordSize = 48;
+constexpr std::size_t kSceneLightRecordSize = 80;
 constexpr std::size_t kSceneMeshRecordSize = 88;
 constexpr std::size_t kSceneMeshGeometryRecordSize = 96;
 constexpr std::size_t kSceneMeshNormalsRecordSize = 100;
@@ -81,7 +84,8 @@ constexpr std::size_t kSceneMeshOpacityRecordSize = 232;
 constexpr std::size_t kSceneTextureRecordSize = 20;
 constexpr std::uint32_t kMaxSceneMeshCount = 4096;
 constexpr std::uint32_t kMaxSceneTextureCount = 126;
-constexpr std::uint32_t kMaxSceneAdditionalLightCount = 13;
+constexpr std::uint32_t kMaxSceneLegacyAdditionalLightCount = 13;
+constexpr std::uint32_t kMaxSceneLightCount = 16;
 constexpr std::uint32_t kMaxSceneMeshVertexCount = 16U * 1024U * 1024U;
 constexpr std::uint32_t kMaxSceneMeshIndexCount = 48U * 1024U * 1024U;
 constexpr std::size_t kMaxSceneStateBytes = 512U * 1024U * 1024U;
@@ -103,7 +107,7 @@ static_assert(sceneMaterialFlagsValid(UINT32_C(0x00000080), true));
 struct BridgeAdditionalLight {
     std::uint32_t kind = 0;
     std::uint32_t schema = 0;
-    std::array<float, 8> values{};
+    std::array<float, 16> values{};
     std::uint64_t pathHash = 0;
 };
 
@@ -128,6 +132,7 @@ struct BridgeRayCamera {
     bool hasDomeLight = false;
     std::array<float, 3> domeLightColor{};
     float domeLightIntensity = 0.0f;
+    bool completeLightList = false;
     std::vector<BridgeAdditionalLight> additionalLights;
 };
 
@@ -260,12 +265,20 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                         static_cast<std::uint32_t>(allBytes[156 + index])
                         << (index * 8);
                 }
-                if (additionalLightCount > kMaxSceneAdditionalLightCount) {
+                const std::uint32_t maximumLightCount =
+                    headerVersion >= kSceneStateAreaLightVersion
+                    ? kMaxSceneLightCount
+                    : kMaxSceneLegacyAdditionalLightCount;
+                if (additionalLightCount > maximumLightCount) {
                     return std::nullopt;
                 }
+                const std::size_t lightRecordSize =
+                    headerVersion >= kSceneStateAreaLightVersion
+                    ? kSceneLightRecordSize
+                    : kSceneLegacyLightRecordSize;
                 const std::size_t additionalBytes =
                     static_cast<std::size_t>(additionalLightCount)
-                    * kSceneLightRecordSize;
+                    * lightRecordSize;
                 const std::size_t originalSize = allBytes.size();
                 allBytes.resize(originalSize + additionalBytes);
                 input.read(
@@ -422,13 +435,20 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
     std::uint32_t additionalLightCount = 0;
     std::size_t additionalLightBytes = 0;
     if (version >= kSceneStateLightArrayVersion) {
+        camera.completeLightList = version >= kSceneStateAreaLightVersion;
         additionalLightCount = readAllU32(156);
-        if (additionalLightCount > kMaxSceneAdditionalLightCount) {
+        const std::uint32_t maximumLightCount = camera.completeLightList
+            ? kMaxSceneLightCount
+            : kMaxSceneLegacyAdditionalLightCount;
+        if (additionalLightCount > maximumLightCount) {
             return std::nullopt;
         }
+        const std::size_t lightRecordSize = camera.completeLightList
+            ? kSceneLightRecordSize
+            : kSceneLegacyLightRecordSize;
         additionalLightBytes =
             static_cast<std::size_t>(additionalLightCount)
-            * kSceneLightRecordSize;
+            * lightRecordSize;
         if (kSceneStateHeaderSize > allBytes.size()
             || additionalLightBytes
                 > allBytes.size() - kSceneStateHeaderSize) {
@@ -443,16 +463,19 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
              lightIndex < additionalLightCount; ++lightIndex) {
             const std::size_t lightOffset = kSceneStateHeaderSize
                 + static_cast<std::size_t>(lightIndex)
-                    * kSceneLightRecordSize;
+                    * lightRecordSize;
             BridgeAdditionalLight light{};
             light.kind = readAllU32(lightOffset);
             light.schema = readAllU32(lightOffset + 4);
-            for (std::size_t valueIndex = 0; valueIndex < 8; ++valueIndex) {
+            const std::size_t valueCount = camera.completeLightList ? 16 : 8;
+            for (std::size_t valueIndex = 0; valueIndex < valueCount; ++valueIndex) {
                 light.values[valueIndex] = readAllFloat(
                     lightOffset + 8 + valueIndex * 4
                 );
             }
-            light.pathHash = readAllU64(lightOffset + 40);
+            light.pathHash = readAllU64(
+                lightOffset + (camera.completeLightList ? 72 : 40)
+            );
             if (light.pathHash == 0
                 || !std::all_of(
                     light.values.begin(),
@@ -468,11 +491,44 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
             };
             if (light.kind == IMB_TRACE_LIGHT_KIND_POSITIONAL) {
                 if (light.schema < IMB_TRACE_LIGHT_SCHEMA_SPHERE
-                    || light.schema > IMB_TRACE_LIGHT_SCHEMA_DISK
+                    || (light.schema > IMB_TRACE_LIGHT_SCHEMA_DISK
+                        && light.schema != IMB_TRACE_LIGHT_SCHEMA_CYLINDER)
+                    || (light.schema == IMB_TRACE_LIGHT_SCHEMA_CYLINDER
+                        && version < kSceneStateCylinderLightVersion)
                     || light.values[3] < 0.0f
                     || !nonnegativeColor(4)
-                    || light.values[7] <= 0.0f) {
+                    || (light.schema == IMB_TRACE_LIGHT_SCHEMA_CYLINDER
+                        ? light.values[7] < 0.0f
+                        : light.values[7] <= 0.0f)) {
                     return std::nullopt;
+                }
+                if (camera.completeLightList) {
+                    const std::array<float, 3> axisU{
+                        light.values[8], light.values[9], light.values[10]
+                    };
+                    const std::array<float, 3> axisV{
+                        light.values[12], light.values[13], light.values[14]
+                    };
+                    if (light.schema == IMB_TRACE_LIGHT_SCHEMA_SPHERE) {
+                        if (std::any_of(
+                                light.values.begin() + 8,
+                                light.values.end(),
+                                [](float value) { return value != 0.0f; }
+                            )) {
+                            return std::nullopt;
+                        }
+                    } else {
+                        const bool cylinder =
+                            light.schema == IMB_TRACE_LIGHT_SCHEMA_CYLINDER;
+                        if (vectorLengthSquared(axisU) <= 0.000001f
+                            || vectorLengthSquared(axisV) <= 0.000001f
+                            || light.values[11] <= 0.0f
+                            || (cylinder
+                                ? light.values[15] < 0.0f
+                                : light.values[15] <= 0.0f)) {
+                            return std::nullopt;
+                        }
+                    }
                 }
             } else if (light.kind == IMB_TRACE_LIGHT_KIND_DISTANT) {
                 const std::array<float, 3> direction{
@@ -483,7 +539,13 @@ std::optional<BridgeSceneState> readLiveSceneState(bool includeMeshes = true) {
                     || light.values[3] < 0.0f
                     || !nonnegativeColor(4)
                     || light.values[7] < 0.0f
-                    || light.values[7] > 180.0f) {
+                    || light.values[7] >= 360.0f
+                    || (camera.completeLightList
+                        && std::any_of(
+                            light.values.begin() + 8,
+                            light.values.end(),
+                            [](float value) { return value != 0.0f; }
+                        ))) {
                     return std::nullopt;
                 }
             } else if (light.kind == IMB_TRACE_LIGHT_KIND_DOME) {
@@ -2330,17 +2392,20 @@ public:
         std::uint32_t rayOptions = IMB_TRACE_RAYS_OPTION_NONE;
         if (camera != nullptr) {
             rayOptions |= static_cast<std::uint32_t>(IMB_TRACE_RAYS_OPTION_LIVE_CAMERA);
-            if (!emptyStageGrid && camera->hasSphereLight) {
+            if (!emptyStageGrid && !camera->completeLightList
+                && camera->hasSphereLight) {
                 rayOptions |= static_cast<std::uint32_t>(
                     IMB_TRACE_RAYS_OPTION_LIVE_SPHERE_LIGHT
                 );
             }
-            if (!emptyStageGrid && camera->hasDistantLight) {
+            if (!emptyStageGrid && !camera->completeLightList
+                && camera->hasDistantLight) {
                 rayOptions |= static_cast<std::uint32_t>(
                     IMB_TRACE_RAYS_OPTION_LIVE_DISTANT_LIGHT
                 );
             }
-            if (!emptyStageGrid && camera->hasDomeLight) {
+            if (!emptyStageGrid && !camera->completeLightList
+                && camera->hasDomeLight) {
                 rayOptions |= static_cast<std::uint32_t>(
                     IMB_TRACE_RAYS_OPTION_LIVE_DOME_LIGHT
                 );
@@ -9969,7 +10034,7 @@ VkResult bridgeFallbackInstanceAccelerationStructureBuildLocked(
                 ++sceneGeometryMeshCount;
                 std::fprintf(
                     stderr,
-                    "imb-vulkan-icd: built USD Mesh BLAS pathHash=%#llx vertices=%zu triangles=%u host=%llu instanceTransform=usd-world source=scene-state-v15 normals=%s material=%s texture=%ux%u roughness=%.3f metallic=%.3f emission=(%.3f,%.3f,%.3f)x%.3f parameterTextures=roughness:%ux%u[c%u],metallic:%ux%u[c%u],emission:%ux%u[rgb],normal:%ux%u[rgb-tangent] alphaCutout=%d opacity=%.3f threshold=%.3f opacityTexture=%d materialDescriptor=%llu\n",
+                    "imb-vulkan-icd: built USD Mesh BLAS pathHash=%#llx vertices=%zu triangles=%u host=%llu instanceTransform=usd-world source=scene-state normals=%s material=%s texture=%ux%u roughness=%.3f metallic=%.3f emission=(%.3f,%.3f,%.3f)x%.3f parameterTextures=roughness:%ux%u[c%u],metallic:%ux%u[c%u],emission:%ux%u[rgb],normal:%ux%u[rgb-tangent] alphaCutout=%d opacity=%.3f threshold=%.3f opacityTexture=%d materialDescriptor=%llu\n",
                     static_cast<unsigned long long>(mesh.pathHash),
                     mesh.vertices.size() / 3,
                     mesh.triangleCount,
@@ -15270,7 +15335,8 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                     if (!liveCamera->additionalLights.empty()) {
                         std::fprintf(
                             stderr,
-                            "imb-vulkan-icd: live additional USD lights count=%zu",
+                            "imb-vulkan-icd: live %s USD light list count=%zu",
+                            liveCamera->completeLightList ? "complete" : "additional",
                             liveCamera->additionalLights.size()
                         );
                         for (const auto& light : liveCamera->additionalLights) {
@@ -15281,6 +15347,32 @@ VKAPI_ATTR VkResult VKAPI_CALL imb_vkQueueSubmit(
                                 light.schema,
                                 static_cast<unsigned long long>(light.pathHash)
                             );
+                            if (light.kind == IMB_TRACE_LIGHT_KIND_POSITIONAL
+                                && (light.schema == IMB_TRACE_LIGHT_SCHEMA_RECT
+                                    || light.schema == IMB_TRACE_LIGHT_SCHEMA_DISK
+                                    || light.schema
+                                        == IMB_TRACE_LIGHT_SCHEMA_CYLINDER)) {
+                                std::fprintf(
+                                    stderr,
+                                    " axisU=(%.3f,%.3f,%.3f)x%.3f axisV=(%.3f,%.3f,%.3f)x%.3f",
+                                    light.values[8],
+                                    light.values[9],
+                                    light.values[10],
+                                    light.values[11],
+                                    light.values[12],
+                                    light.values[13],
+                                    light.values[14],
+                                    light.values[15]
+                                );
+                                if (light.schema
+                                    == IMB_TRACE_LIGHT_SCHEMA_CYLINDER) {
+                                    std::fprintf(
+                                        stderr,
+                                        " radialW=%.3f",
+                                        light.values[7]
+                                    );
+                                }
+                            }
                         }
                         std::fputc('\n', stderr);
                     }

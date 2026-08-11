@@ -555,7 +555,7 @@ private func appendUIVertex(
     #expect(right[0] > 0)
     #expect(left[0] < right[0])
 
-    // The same authored light sent through the protocol 1.17 light-list tail
+    // The same authored light sent through the protocol 1.18 light-list tail
     // must shade identically to the legacy inline slot.
     try backend.createImage(id: 35, width: 64, height: 64, format: 1, options: 0)
     try backend.submitRayTrace(
@@ -1741,5 +1741,260 @@ private func appendUIVertex(
     #expect(distantShadowed[0] < distantTranslucent[0])
     #expect(distantTranslucent[0] < distantLit[0])
     #expect(abs(Int(distantCutout[0]) - Int(distantLit[0])) <= 1)
+}
+
+@Test func metalRectLightUsesOrientationAndPartialAreaVisibility() throws {
+    let backend = try #require(MetalGPUBackend.makeDefault())
+    #expect(backend.supportsRayDispatch)
+
+    // The receiver is at z=0. A small blocker at z=-0.5 covers only the
+    // +X/+Y RectLight sample; the other three samples remain visible.
+    try backend.createBuffer(id: 300, size: 72, options: 0)
+    var vertices = Data()
+    for point: SIMD3<Float> in [
+        SIMD3<Float>(-1, -1, 0),
+        SIMD3<Float>(1, -1, 0),
+        SIMD3<Float>(0, 1, 0),
+        SIMD3<Float>(0.10, 0.10, -0.5),
+        SIMD3<Float>(0.42, 0.10, -0.5),
+        SIMD3<Float>(0.26, 0.44, -0.5),
+    ] {
+        appendFloat(point.x, to: &vertices)
+        appendFloat(point.y, to: &vertices)
+        appendFloat(point.z, to: &vertices)
+    }
+    try backend.writeBuffer(id: 300, offset: 0, data: vertices)
+
+    func buildTriangle(id: UInt64, offset: UInt64) throws {
+        try backend.createAccelerationStructure(id: id, type: 1, requestedSize: 4096)
+        try backend.buildPrimitiveAccelerationStructure(
+            id: id,
+            buildFlags: 0x4,
+            geometries: [PrimitiveAccelerationStructureGeometry(
+                kind: .triangles,
+                flags: 1,
+                dataResourceID: 300,
+                dataOffset: offset,
+                primitiveCount: 1,
+                stride: 12,
+                vertexFormat: 1
+            )]
+        )
+    }
+    try buildTriangle(id: 301, offset: 0)
+    try buildTriangle(id: 302, offset: 36)
+
+    let identity: [Float] = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+    ]
+    func instance(_ accelerationID: UInt64) -> InstanceAccelerationStructureInstance {
+        InstanceAccelerationStructureInstance(
+            transformationMatrix: identity,
+            options: 0,
+            mask: 0xff,
+            intersectionFunctionTableOffset: 0,
+            userID: 0x0080_00ff,
+            accelerationStructureResourceID: accelerationID
+        )
+    }
+    try backend.createAccelerationStructure(id: 303, type: 0, requestedSize: 4096)
+    try backend.buildInstanceAccelerationStructure(
+        id: 303, buildFlags: 0x4, instances: [instance(301)]
+    )
+    try backend.createAccelerationStructure(id: 304, type: 0, requestedSize: 4096)
+    try backend.buildInstanceAccelerationStructure(
+        id: 304, buildFlags: 0x4, instances: [instance(301), instance(302)]
+    )
+
+    let camera = RayCamera(
+        position: SIMD3<Float>(0, 0, -2),
+        forward: SIMD3<Float>(0, 0, 1),
+        up: SIMD3<Float>(0, 1, 0),
+        verticalFOVRadians: 0.9,
+        nearDistance: 0.01,
+        farDistance: 100
+    )
+    let facing = RaySphereLight(
+        position: SIMD3<Float>(0, 0, -1),
+        color: SIMD3<Float>(1, 1, 1),
+        intensity: 1_000,
+        radius: 0.8,
+        shape: .rectangle,
+        axisU: SIMD3<Float>(1, 0, 0),
+        axisV: SIMD3<Float>(0, -1, 0),
+        halfExtentU: 0.8,
+        halfExtentV: 0.8
+    )
+    let backFacing = RaySphereLight(
+        position: facing.position,
+        color: facing.color,
+        intensity: facing.intensity,
+        radius: facing.radius,
+        shape: .rectangle,
+        axisU: SIMD3<Float>(1, 0, 0),
+        axisV: SIMD3<Float>(0, 1, 0),
+        halfExtentU: facing.halfExtentU,
+        halfExtentV: facing.halfExtentV
+    )
+
+    func render(
+        imageID: UInt64,
+        accelerationID: UInt64,
+        light: RaySphereLight,
+        fenceID: UInt64
+    ) throws -> [UInt8] {
+        try backend.createImage(id: imageID, width: 64, height: 64, format: 1, options: 0)
+        try backend.submitRayTrace(
+            imageID: imageID,
+            accelerationStructureID: accelerationID,
+            width: 64,
+            height: 64,
+            missRGBA8: 0xff00_0000,
+            hitRGBA8: 0xffe0_8c30,
+            camera: camera,
+            sphereLight: nil,
+            distantLight: nil,
+            domeLight: nil,
+            additionalSphereLights: [light],
+            additionalDistantLights: [],
+            additionalDomeLights: [],
+            fenceID: fenceID
+        )
+        #expect(try backend.waitFence(id: fenceID))
+        let center = (32 * 64 + 32) * 4
+        return Array(try backend.readImage(id: imageID)[center..<(center + 4)])
+    }
+
+    let fullyLit = try render(
+        imageID: 305, accelerationID: 303, light: facing, fenceID: 401
+    )
+    let partiallyShadowed = try render(
+        imageID: 306, accelerationID: 304, light: facing, fenceID: 402
+    )
+    let backUnlit = try render(
+        imageID: 307, accelerationID: 303, light: backFacing, fenceID: 403
+    )
+    #expect(backUnlit[0] < partiallyShadowed[0])
+    #expect(partiallyShadowed[0] < fullyLit[0])
+}
+
+@Test func metalDistantLightAngleUsesPartialConeVisibility() throws {
+    let backend = try #require(MetalGPUBackend.makeDefault())
+    #expect(backend.supportsRayDispatch)
+
+    // The receiver is at z=0. For a 30-degree DistantLight the four sampled
+    // directions cross z=-0.5 near (+/-0.061, +/-0.061). This small blocker
+    // covers only the +X/+Y direction. The perfectly parallel center ray and
+    // the primary camera ray both miss it.
+    try backend.createBuffer(id: 500, size: 72, options: 0)
+    var vertices = Data()
+    for point: SIMD3<Float> in [
+        SIMD3<Float>(-1, -1, 0),
+        SIMD3<Float>(1, -1, 0),
+        SIMD3<Float>(0, 1, 0),
+        SIMD3<Float>(0.035, 0.035, -0.5),
+        SIMD3<Float>(0.090, 0.035, -0.5),
+        SIMD3<Float>(0.0625, 0.090, -0.5),
+    ] {
+        appendFloat(point.x, to: &vertices)
+        appendFloat(point.y, to: &vertices)
+        appendFloat(point.z, to: &vertices)
+    }
+    try backend.writeBuffer(id: 500, offset: 0, data: vertices)
+
+    func buildTriangle(id: UInt64, offset: UInt64) throws {
+        try backend.createAccelerationStructure(id: id, type: 1, requestedSize: 4096)
+        try backend.buildPrimitiveAccelerationStructure(
+            id: id,
+            buildFlags: 0x4,
+            geometries: [PrimitiveAccelerationStructureGeometry(
+                kind: .triangles,
+                flags: 1,
+                dataResourceID: 500,
+                dataOffset: offset,
+                primitiveCount: 1,
+                stride: 12,
+                vertexFormat: 1
+            )]
+        )
+    }
+    try buildTriangle(id: 501, offset: 0)
+    try buildTriangle(id: 502, offset: 36)
+
+    let identity: [Float] = [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+    ]
+    func instance(_ accelerationID: UInt64) -> InstanceAccelerationStructureInstance {
+        InstanceAccelerationStructureInstance(
+            transformationMatrix: identity,
+            options: 0,
+            mask: 0xff,
+            intersectionFunctionTableOffset: 0,
+            userID: 0x0080_00ff,
+            accelerationStructureResourceID: accelerationID
+        )
+    }
+    try backend.createAccelerationStructure(id: 503, type: 0, requestedSize: 4096)
+    try backend.buildInstanceAccelerationStructure(
+        id: 503, buildFlags: 0x4, instances: [instance(501)]
+    )
+    try backend.createAccelerationStructure(id: 504, type: 0, requestedSize: 4096)
+    try backend.buildInstanceAccelerationStructure(
+        id: 504, buildFlags: 0x4, instances: [instance(501), instance(502)]
+    )
+
+    let camera = RayCamera(
+        position: SIMD3<Float>(0, 0, -2),
+        forward: SIMD3<Float>(0, 0, 1),
+        up: SIMD3<Float>(0, 1, 0),
+        verticalFOVRadians: 0.9,
+        nearDistance: 0.01,
+        farDistance: 100
+    )
+    func render(
+        imageID: UInt64,
+        accelerationID: UInt64,
+        angleDegrees: Float,
+        fenceID: UInt64
+    ) throws -> [UInt8] {
+        try backend.createImage(id: imageID, width: 64, height: 64, format: 1, options: 0)
+        try backend.submitRayTrace(
+            imageID: imageID,
+            accelerationStructureID: accelerationID,
+            width: 64,
+            height: 64,
+            missRGBA8: 0xff00_0000,
+            hitRGBA8: 0xffe0_8c30,
+            camera: camera,
+            sphereLight: nil,
+            distantLight: RayDistantLight(
+                direction: SIMD3<Float>(0, 0, 1),
+                color: SIMD3<Float>(1, 1, 1),
+                intensity: 100,
+                angleDegrees: angleDegrees
+            ),
+            domeLight: nil,
+            fenceID: fenceID
+        )
+        #expect(try backend.waitFence(id: fenceID))
+        let center = (32 * 64 + 32) * 4
+        return Array(try backend.readImage(id: imageID)[center..<(center + 4)])
+    }
+
+    let parallelUnblocked = try render(
+        imageID: 505, accelerationID: 504, angleDegrees: 0, fenceID: 501
+    )
+    let coneFullyVisible = try render(
+        imageID: 506, accelerationID: 503, angleDegrees: 30, fenceID: 502
+    )
+    let conePartiallyVisible = try render(
+        imageID: 507, accelerationID: 504, angleDegrees: 30, fenceID: 503
+    )
+    #expect(conePartiallyVisible[0] < coneFullyVisible[0])
+    #expect(conePartiallyVisible[0] < parallelUnblocked[0])
 }
 #endif

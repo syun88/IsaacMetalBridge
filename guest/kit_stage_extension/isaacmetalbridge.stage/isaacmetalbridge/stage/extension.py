@@ -20,11 +20,11 @@ from pxr import Gf, Tf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 
 _SCENE_HEADER = struct.Struct("<IHHQ32fQII")
-_SCENE_LIGHT_RECORD = struct.Struct("<II8fQ")
+_SCENE_LIGHT_RECORD = struct.Struct("<II16fQ")
 _SCENE_TEXTURE_RECORD = struct.Struct("<QIII")
 _SCENE_MESH_RECORD = struct.Struct("<QII26f28I")
 _SCENE_MAGIC = 0x31434D49
-_SCENE_VERSION = 15
+_SCENE_VERSION = 17
 _CAMERA_VALID_PERSPECTIVE = 1
 _SCENE_VALID_SPHERE_LIGHT = 2
 _SCENE_HAS_MESH_MANIFEST = 4
@@ -2641,20 +2641,35 @@ class StartupStageExtension(omni.ext.IExt):
             for prim in _stage_prims(stage):
                 if len(positional_lights) >= _MAX_SCENE_POSITIONAL_LIGHTS:
                     break
+                world = xform_cache.GetLocalToWorldTransform(prim)
                 if prim.IsA(UsdLux.SphereLight):
                     light = UsdLux.SphereLight(prim)
                     radius = light.GetRadiusAttr().Get(sample_time)
                     schema_name = "SphereLight"
                     schema_code = 1
+                    axis_u = (0.0, 0.0, 0.0)
+                    axis_v = (0.0, 0.0, 0.0)
+                    half_extent_u = 0.0
+                    half_extent_v = 0.0
                 elif prim.IsA(UsdLux.RectLight):
                     light = UsdLux.RectLight(prim)
                     width = light.GetWidthAttr().Get(sample_time)
                     height = light.GetHeightAttr().Get(sample_time)
                     if width is None or height is None:
                         continue
+                    world_u = world.TransformDir(Gf.Vec3d(1.0, 0.0, 0.0))
+                    world_v = world.TransformDir(Gf.Vec3d(0.0, 1.0, 0.0))
+                    scale_u = math.sqrt(sum(float(value) ** 2 for value in world_u))
+                    scale_v = math.sqrt(sum(float(value) ** 2 for value in world_v))
+                    if scale_u <= 0.000001 or scale_v <= 0.000001:
+                        continue
+                    axis_u = tuple(float(value) / scale_u for value in world_u)
+                    axis_v = tuple(float(value) / scale_v for value in world_v)
+                    half_extent_u = max(float(width), 0.0) * scale_u * 0.5
+                    half_extent_v = max(float(height), 0.0) * scale_v * 0.5
                     radius = math.sqrt(
-                        max(float(width), 0.0)
-                        * max(float(height), 0.0)
+                        max(float(width) * scale_u, 0.0)
+                        * max(float(height) * scale_v, 0.0)
                         / math.pi
                     )
                     schema_name = "RectLight"
@@ -2662,13 +2677,60 @@ class StartupStageExtension(omni.ext.IExt):
                 elif prim.IsA(UsdLux.DiskLight):
                     light = UsdLux.DiskLight(prim)
                     radius = light.GetRadiusAttr().Get(sample_time)
+                    world_u = world.TransformDir(Gf.Vec3d(1.0, 0.0, 0.0))
+                    world_v = world.TransformDir(Gf.Vec3d(0.0, 1.0, 0.0))
+                    scale_u = math.sqrt(sum(float(value) ** 2 for value in world_u))
+                    scale_v = math.sqrt(sum(float(value) ** 2 for value in world_v))
+                    if scale_u <= 0.000001 or scale_v <= 0.000001:
+                        continue
+                    axis_u = tuple(float(value) / scale_u for value in world_u)
+                    axis_v = tuple(float(value) / scale_v for value in world_v)
+                    half_extent_u = max(float(radius or 0.0), 0.0) * scale_u
+                    half_extent_v = max(float(radius or 0.0), 0.0) * scale_v
+                    radius = math.sqrt(max(half_extent_u * half_extent_v, 0.0))
                     schema_name = "DiskLight"
                     schema_code = 3
+                elif prim.IsA(UsdLux.CylinderLight):
+                    light = UsdLux.CylinderLight(prim)
+                    authored_radius = light.GetRadiusAttr().Get(sample_time)
+                    length = light.GetLengthAttr().Get(sample_time)
+                    treat_as_line = light.GetTreatAsLineAttr().Get(sample_time)
+                    if authored_radius is None or length is None:
+                        continue
+                    world_u = world.TransformDir(Gf.Vec3d(1.0, 0.0, 0.0))
+                    world_v = world.TransformDir(Gf.Vec3d(0.0, 1.0, 0.0))
+                    world_w = world.TransformDir(Gf.Vec3d(0.0, 0.0, 1.0))
+                    scale_u = math.sqrt(sum(float(value) ** 2 for value in world_u))
+                    scale_v = math.sqrt(sum(float(value) ** 2 for value in world_v))
+                    scale_w = math.sqrt(sum(float(value) ** 2 for value in world_w))
+                    if (
+                        scale_u <= 0.000001
+                        or scale_v <= 0.000001
+                        or scale_w <= 0.000001
+                    ):
+                        continue
+                    axis_u = tuple(float(value) / scale_u for value in world_u)
+                    axis_v = tuple(float(value) / scale_v for value in world_v)
+                    half_extent_u = max(float(length), 0.0) * scale_u * 0.5
+                    if bool(treat_as_line):
+                        half_extent_v = 0.0
+                        radius = 0.0
+                    else:
+                        half_extent_v = (
+                            max(float(authored_radius), 0.0) * scale_v
+                        )
+                        # The existing radius word carries the transformed
+                        # local-Z radial extent for CylinderLight. Together
+                        # with axisV/halfExtentV this preserves an ellipse
+                        # under ordinary non-uniform scale.
+                        radius = max(float(authored_radius), 0.0) * scale_w
+                    if half_extent_u <= 0.0:
+                        continue
+                    schema_name = "CylinderLight"
+                    schema_code = 6
                 else:
                     continue
-                light_position = xform_cache.GetLocalToWorldTransform(
-                    prim
-                ).ExtractTranslation()
+                light_position = world.ExtractTranslation()
                 light_color = light.GetColorAttr().Get(sample_time)
                 intensity = light.GetIntensityAttr().Get(sample_time)
                 exposure = light.GetExposureAttr().Get(sample_time)
@@ -2685,11 +2747,26 @@ class StartupStageExtension(omni.ext.IExt):
                     max(float(light_color[1]), 0.0),
                     max(float(light_color[2]), 0.0),
                     max(effective_intensity, 0.0),
-                    max(float(radius or 0.0), 0.0001),
+                    max(
+                        float(radius or 0.0),
+                        0.0 if schema_code == 6 else 0.0001,
+                    ),
                 )
-                if all(math.isfinite(value) for value in values):
+                wire_values = (
+                    values[0], values[1], values[2], values[6],
+                    values[3], values[4], values[5], values[7],
+                    axis_u[0], axis_u[1], axis_u[2], half_extent_u,
+                    axis_v[0], axis_v[1], axis_v[2], half_extent_v,
+                )
+                if all(math.isfinite(value) for value in wire_values):
                     positional_lights.append(
-                        (schema_code, schema_name, str(prim.GetPath()), values)
+                        (
+                            schema_code,
+                            schema_name,
+                            str(prim.GetPath()),
+                            values,
+                            wire_values,
+                        )
                     )
 
             sphere_light_values = (
@@ -2729,7 +2806,7 @@ class StartupStageExtension(omni.ext.IExt):
                     max(float(light_color[1]), 0.0),
                     max(float(light_color[2]), 0.0),
                     max(effective_intensity, 0.0),
-                    max(float(angle or 0.0), 0.0),
+                    min(max(float(angle or 0.0), 0.0), 359.999),
                 )
                 if (
                     all(math.isfinite(value) for value in values)
@@ -2774,36 +2851,43 @@ class StartupStageExtension(omni.ext.IExt):
             dome_light_values = dome_lights[0][3] if dome_lights else (0.0,) * 4
             dome_light_path = dome_lights[0][2] if dome_lights else ""
 
+            # Scene-state v17 publishes one complete list. The fixed first-light
+            # slots remain populated only so older state readers retain a stable
+            # header shape; the v16 ICD suppresses those legacy slots when it
+            # submits the rich list to Protocol 1.19.
             additional_light_records = []
             additional_light_descriptions = []
-            for schema_code, schema_name, path, values in positional_lights[1:]:
+            for schema_code, schema_name, path, _, wire_values in positional_lights:
                 additional_light_records.append(
                     _SCENE_LIGHT_RECORD.pack(
                         1,
                         schema_code,
-                        values[0], values[1], values[2], values[6],
-                        values[3], values[4], values[5], values[7],
+                        *wire_values,
                         _fnv1a_64(path),
                     )
                 )
                 additional_light_descriptions.append(f"{schema_name}:{path}")
-            for schema_code, schema_name, path, values in distant_lights[1:]:
+            for schema_code, schema_name, path, values in distant_lights:
                 additional_light_records.append(
                     _SCENE_LIGHT_RECORD.pack(
                         2,
                         schema_code,
                         values[0], values[1], values[2], values[6],
                         values[3], values[4], values[5], values[7],
+                        0.0, 0.0, 0.0, 0.0,
+                        0.0, 0.0, 0.0, 0.0,
                         _fnv1a_64(path),
                     )
                 )
                 additional_light_descriptions.append(f"{schema_name}:{path}")
-            for schema_code, schema_name, path, values in dome_lights[1:]:
+            for schema_code, schema_name, path, values in dome_lights:
                 additional_light_records.append(
                     _SCENE_LIGHT_RECORD.pack(
                         3,
                         schema_code,
                         values[0], values[1], values[2], values[3],
+                        0.0, 0.0, 0.0, 0.0,
+                        0.0, 0.0, 0.0, 0.0,
                         0.0, 0.0, 0.0, 0.0,
                         _fnv1a_64(path),
                     )
@@ -2922,6 +3006,23 @@ class StartupStageExtension(omni.ext.IExt):
                         f"intensity={sphere_light_values[6]:.3f} "
                         f"radius={sphere_light_values[7]:.3f}"
                     )
+                for schema_code, schema_name, path, _, wire_values in positional_lights:
+                    if schema_code == 1:
+                        continue
+                    cylinder_details = (
+                        f" radialW={wire_values[7]:.3f}"
+                        if schema_code == 6
+                        else ""
+                    )
+                    carb.log_warn(
+                        "isaacmetalbridge.stage: oriented USD area/line light published: "
+                        f"schema={schema_name} path={path} "
+                        f"axisU=({wire_values[8]:.3f},{wire_values[9]:.3f},"
+                        f"{wire_values[10]:.3f}) halfExtentU={wire_values[11]:.3f} "
+                        f"axisV=({wire_values[12]:.3f},{wire_values[13]:.3f},"
+                        f"{wire_values[14]:.3f}) halfExtentV={wire_values[15]:.3f}"
+                        f"{cylinder_details}"
+                    )
                 if distant_light_path:
                     carb.log_warn(
                         "isaacmetalbridge.stage: active USD DistantLight "
@@ -2946,7 +3047,7 @@ class StartupStageExtension(omni.ext.IExt):
                     )
                 if additional_light_descriptions:
                     carb.log_warn(
-                        "isaacmetalbridge.stage: additional USD lights published: "
+                        "isaacmetalbridge.stage: complete USD light list published: "
                         f"count={len(additional_light_descriptions)} "
                         f"lights={additional_light_descriptions}"
                     )

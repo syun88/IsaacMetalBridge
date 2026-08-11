@@ -10,7 +10,7 @@ extern "C" {
 
 #define IMB_PROTOCOL_MAGIC UINT32_C(0x31424d49) /* little-endian bytes: I M B 1 */
 #define IMB_PROTOCOL_VERSION_MAJOR UINT16_C(1)
-#define IMB_PROTOCOL_VERSION_MINOR UINT16_C(17)
+#define IMB_PROTOCOL_VERSION_MINOR UINT16_C(19)
 #define IMB_PROTOCOL_HEADER_SIZE UINT32_C(32)
 #define IMB_PROTOCOL_MAX_PAYLOAD UINT32_C(16777216)
 
@@ -182,7 +182,7 @@ enum imb_trace_rays_options {
     IMB_TRACE_RAYS_OPTION_LIVE_DOME_LIGHT = 1u << 3,
     /* Draw the renderer-owned empty-stage guide grid; AS resource ID is zero. */
     IMB_TRACE_RAYS_OPTION_EMPTY_STAGE_GRID = 1u << 4,
-    /* An 8-byte list header and bounded 48-byte light records follow. */
+    /* An 8-byte list header and bounded 80-byte light records follow. */
     IMB_TRACE_RAYS_OPTION_ADDITIONAL_LIGHTS = 1u << 5
 };
 
@@ -197,10 +197,11 @@ enum imb_trace_light_schema {
     IMB_TRACE_LIGHT_SCHEMA_RECT = 2,
     IMB_TRACE_LIGHT_SCHEMA_DISK = 3,
     IMB_TRACE_LIGHT_SCHEMA_DISTANT = 4,
-    IMB_TRACE_LIGHT_SCHEMA_DOME = 5
+    IMB_TRACE_LIGHT_SCHEMA_DOME = 5,
+    IMB_TRACE_LIGHT_SCHEMA_CYLINDER = 6
 };
 
-#define IMB_TRACE_RAYS_MAX_ADDITIONAL_LIGHTS UINT32_C(13)
+#define IMB_TRACE_RAYS_MAX_ADDITIONAL_LIGHTS UINT32_C(16)
 
 enum imb_acceleration_structure_vertex_format {
     IMB_ACCELERATION_STRUCTURE_VERTEX_FORMAT_FLOAT3_POSITION = 1,
@@ -439,11 +440,16 @@ typedef struct imb_trace_light_payload {
     uint32_t kind;
     uint32_t schema;
     /*
-     * POSITIONAL: position.xyz, intensity, color.rgb, radius.
-     * DISTANT: direction.xyz, intensity, color.rgb, angle degrees.
+     * POSITIONAL: position.xyz, intensity, color.rgb, radius,
+     *             world axis U.xyz, half extent U,
+     *             world axis V.xyz, half extent V.
+     *             SphereLight leaves values 8-15 zero. RectLight and
+     *             DiskLight carry normalized local-X/local-Y axes after the
+     *             USD world transform and their world-space half extents.
+     * DISTANT: direction.xyz, intensity, color.rgb, angle degrees, then zero.
      * DOME: color.rgb, intensity, remaining values zero.
      */
-    float values[8];
+    float values[16];
     uint64_t path_hash;
 } imb_trace_light_payload;
 
@@ -533,7 +539,7 @@ static_assert(sizeof(imb_draw_triangle_command_payload) == 16, "IMB DRAW_TRIANGL
 static_assert(sizeof(imb_draw_indexed_ui_command_payload) == 56, "IMB DRAW_INDEXED_UI ABI changed");
 static_assert(sizeof(imb_trace_rays_command_payload) == 168, "IMB TRACE_RAYS ABI changed");
 static_assert(sizeof(imb_trace_rays_light_list_header) == 8, "IMB TRACE_RAYS light-list ABI changed");
-static_assert(sizeof(imb_trace_light_payload) == 48, "IMB TRACE light ABI changed");
+static_assert(sizeof(imb_trace_light_payload) == 80, "IMB TRACE light ABI changed");
 static_assert(sizeof(imb_dispatch_compute_command_payload) == 32, "IMB DISPATCH_COMPUTE ABI changed");
 static_assert(sizeof(imb_compute_binding_payload) == 48, "IMB compute binding ABI changed");
 static_assert(sizeof(imb_ui_draw_payload) == 40, "IMB UI draw ABI changed");

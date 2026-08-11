@@ -207,22 +207,46 @@ public struct RayCamera: Sendable, Equatable {
     }
 }
 
+public enum RayPositionalLightShape: UInt32, Sendable, Equatable {
+    case sphere = 1
+    case rectangle = 2
+    case disk = 3
+    case cylinder = 6
+}
+
 public struct RaySphereLight: Sendable, Equatable {
     public let position: SIMD3<Float>
     public let color: SIMD3<Float>
     public let intensity: Float
     public let radius: Float
+    public let shape: RayPositionalLightShape
+    /// Normalized transformed local X axis for Rect/Disk/Cylinder lights.
+    public let axisU: SIMD3<Float>
+    /// Normalized transformed local Y axis for Rect/Disk/Cylinder lights.
+    public let axisV: SIMD3<Float>
+    public let halfExtentU: Float
+    public let halfExtentV: Float
 
     public init(
         position: SIMD3<Float>,
         color: SIMD3<Float>,
         intensity: Float,
-        radius: Float
+        radius: Float,
+        shape: RayPositionalLightShape = .sphere,
+        axisU: SIMD3<Float> = .zero,
+        axisV: SIMD3<Float> = .zero,
+        halfExtentU: Float = 0,
+        halfExtentV: Float = 0
     ) {
         self.position = position
         self.color = color
         self.intensity = intensity
         self.radius = radius
+        self.shape = shape
+        self.axisU = axisU
+        self.axisV = axisV
+        self.halfExtentU = halfExtentU
+        self.halfExtentV = halfExtentV
     }
 }
 
@@ -1137,19 +1161,63 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         sphereLightIndex < inlineSphereLightCount
                         ? sphereLightPositionAndIntensity
                         : rayRuntime[
-                            1u + additionalIndex * 2u
+                            1u + additionalIndex * 5u
                         ];
                     const float4 activeColorAndRadius =
                         sphereLightIndex < inlineSphereLightCount
                         ? sphereLightColorAndRadius
                         : rayRuntime[
-                            1u + additionalIndex * 2u + 1u
+                            1u + additionalIndex * 5u + 1u
                         ];
+                    const float4 activeAxisUAndHalfExtent =
+                        sphereLightIndex < inlineSphereLightCount
+                        ? float4(0.0)
+                        : rayRuntime[
+                            1u + additionalIndex * 5u + 2u
+                        ];
+                    const float4 activeAxisVAndHalfExtent =
+                        sphereLightIndex < inlineSphereLightCount
+                        ? float4(0.0)
+                        : rayRuntime[
+                            1u + additionalIndex * 5u + 3u
+                        ];
+                    const uint activeShape = sphereLightIndex < inlineSphereLightCount
+                        ? 1u
+                        : uint(rayRuntime[
+                            1u + additionalIndex * 5u + 4u
+                        ].x);
+                    const bool isAreaLight = activeShape == 2u || activeShape == 3u;
+                    const uint areaSampleCount = isAreaLight ? 4u : 1u;
+                    for (uint areaSampleIndex = 0u;
+                         areaSampleIndex < areaSampleCount;
+                         ++areaSampleIndex) {
+                    float3 sampledLightPosition = activePositionAndIntensity.xyz;
+                    float3 emitterNormal = float3(0.0, 0.0, 1.0);
+                    if (isAreaLight) {
+                        const float3 axisU = normalize(activeAxisUAndHalfExtent.xyz);
+                        const float3 axisV = normalize(activeAxisVAndHalfExtent.xyz);
+                        emitterNormal = normalize(cross(axisU, axisV));
+                        const float signU = (areaSampleIndex & 1u) == 0u ? -1.0 : 1.0;
+                        const float signV = (areaSampleIndex & 2u) == 0u ? -1.0 : 1.0;
+                        const float sampleScale = activeShape == 3u ? 0.45 : 0.65;
+                        sampledLightPosition +=
+                            axisU * activeAxisUAndHalfExtent.w * signU * sampleScale
+                            + axisV * activeAxisVAndHalfExtent.w * signV * sampleScale;
+                    }
                     const float3 toLight =
-                        activePositionAndIntensity.xyz - hitPosition;
+                        sampledLightPosition - hitPosition;
                     const float lightDistanceSquared = max(dot(toLight, toLight), 0.0001);
                     const float3 lightDirection = toLight * rsqrt(lightDistanceSquared);
-                    const float diffuse = max(dot(surfaceNormal, lightDirection), 0.0);
+                    // USD RectLight/DiskLight lie in local XY and emit along
+                    // local -Z. With lightDirection pointing from the surface
+                    // to the emitter, +Z dot lightDirection is the one-sided
+                    // emission factor.
+                    const float emitterFacing = isAreaLight
+                        ? max(dot(emitterNormal, lightDirection), 0.0)
+                        : 1.0;
+                    const float diffuse = max(
+                        dot(surfaceNormal, lightDirection), 0.0
+                    ) * emitterFacing;
                     float visibility = 1.0;
                     if (diffuse > 0.0 && (cameraOptions & 32u) != 0) {
                         ray shadowRay;
@@ -1263,8 +1331,12 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         activeColorAndRadius.xyz,
                         float3(0.0)
                     );
-                    illumination += lightColor * (0.25 + 0.75 * diffuse * visibility)
-                        * strength * attenuation;
+                    const float sampleWeight = 1.0 / float(areaSampleCount);
+                    const float diffuseResponse = isAreaLight
+                        ? diffuse * visibility
+                        : 0.25 + 0.75 * diffuse * visibility;
+                    illumination += lightColor * diffuseResponse
+                        * strength * attenuation * sampleWeight;
                     if (hasMaterialParameters && diffuse > 0.0 && visibility > 0.0) {
                         const float3 halfUnnormalized =
                             lightDirection + viewDirection;
@@ -1276,7 +1348,9 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                             specularExponent
                         ) * specularEnergy;
                         specularIllumination += lightColor * reflectance
-                            * specular * strength * attenuation * visibility;
+                            * specular * strength * attenuation * visibility
+                            * emitterFacing * sampleWeight;
+                    }
                     }
                 }
                 const uint inlineDistantLightCount =
@@ -1292,30 +1366,61 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         distantLightIndex < inlineDistantLightCount
                         ? distantLightDirectionAndIntensity
                         : rayRuntime[
-                            1u + additionalSphereLightCount * 2u
+                            1u + additionalSphereLightCount * 5u
                                 + additionalIndex * 2u
                         ];
                     const float4 activeColorAndAngle =
                         distantLightIndex < inlineDistantLightCount
                         ? distantLightColorAndAngle
                         : rayRuntime[
-                            1u + additionalSphereLightCount * 2u
+                            1u + additionalSphereLightCount * 5u
                                 + additionalIndex * 2u + 1u
                         ];
-                    // USD DistantLight emits along its transformed local -Z;
-                    // negate that vector for the surface-to-light direction.
-                    const float3 lightDirection = normalize(
+                    // USD DistantLight angle is the full angular diameter.
+                    // A zero angle remains one perfectly parallel direction;
+                    // nonzero angles use four deterministic directions inside
+                    // the corresponding spherical cap. Each direction gets
+                    // its own opacity-aware shadow traversal below.
+                    const float3 centralLightDirection = normalize(
                         -activeDirectionAndIntensity.xyz
                     );
-                    const float angularWrap = clamp(
-                        activeColorAndAngle.w / 180.0,
-                        0.0,
-                        1.0
-                    ) * 0.12;
-                    const float diffuse = clamp(
-                        dot(surfaceNormal, lightDirection) + angularWrap,
-                        0.0,
-                        1.0
+                    const float angularDiameterDegrees = clamp(
+                        activeColorAndAngle.w, 0.0, 359.999
+                    );
+                    const uint directionSampleCount =
+                        angularDiameterDegrees > 0.0001 ? 4u : 1u;
+                    const float sampleRingAngle =
+                        angularDiameterDegrees * 0.5 * 0.65
+                            * 0.017453292519943295;
+                    const float3 basisSeed =
+                        abs(centralLightDirection.z) < 0.999
+                        ? float3(0.0, 0.0, 1.0)
+                        : float3(0.0, 1.0, 0.0);
+                    const float3 lightTangent = normalize(
+                        cross(basisSeed, centralLightDirection)
+                    );
+                    const float3 lightBitangent = normalize(
+                        cross(centralLightDirection, lightTangent)
+                    );
+                    for (uint directionSampleIndex = 0u;
+                         directionSampleIndex < directionSampleCount;
+                         ++directionSampleIndex) {
+                    const float signU =
+                        (directionSampleIndex & 1u) == 0u ? -1.0 : 1.0;
+                    const float signV =
+                        (directionSampleIndex & 2u) == 0u ? -1.0 : 1.0;
+                    const float3 ringDirection = normalize(
+                        lightTangent * signU + lightBitangent * signV
+                    );
+                    const float3 lightDirection =
+                        directionSampleCount == 1u
+                        ? centralLightDirection
+                        : normalize(
+                            centralLightDirection * cos(sampleRingAngle)
+                                + ringDirection * sin(sampleRingAngle)
+                        );
+                    const float diffuse = max(
+                        dot(surfaceNormal, lightDirection), 0.0
                     );
                     float visibility = 1.0;
                     if (diffuse > 0.0 && (cameraOptions & 32u) != 0) {
@@ -1421,8 +1526,11 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         activeColorAndAngle.xyz,
                         float3(0.0)
                     );
+                    const float sampleWeight =
+                        1.0 / float(directionSampleCount);
                     illumination += lightColor
-                        * (0.18 + 0.82 * diffuse * visibility) * strength;
+                        * (0.18 + 0.82 * diffuse * visibility)
+                        * strength * sampleWeight;
                     if (hasMaterialParameters && diffuse > 0.0 && visibility > 0.0) {
                         const float3 halfUnnormalized =
                             lightDirection + viewDirection;
@@ -1434,7 +1542,8 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                             specularExponent
                         ) * specularEnergy;
                         specularIllumination += lightColor * reflectance
-                            * specular * strength * visibility;
+                            * specular * strength * visibility * sampleWeight;
+                    }
                     }
                 }
                 const uint inlineDomeLightCount =
@@ -1448,8 +1557,8 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                         domeLightIndex < inlineDomeLightCount
                         ? domeLightColorAndIntensity
                         : rayRuntime[
-                            1u + (additionalSphereLightCount
-                                + additionalDistantLightCount) * 2u
+                            1u + additionalSphereLightCount * 5u
+                                + additionalDistantLightCount * 2u
                                 + domeLightIndex - inlineDomeLightCount
                         ];
                     const float strength = clamp(
@@ -3808,11 +3917,14 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
         additionalDomeLights: [RayDomeLight],
         fenceID: UInt64
     ) throws {
-        guard additionalSphereLights.count + additionalDistantLights.count
-                + additionalDomeLights.count <= 13
+        guard additionalSphereLights.count <= 8,
+              additionalDistantLights.count <= 4,
+              additionalDomeLights.count <= 4,
+              additionalSphereLights.count + additionalDistantLights.count
+                + additionalDomeLights.count <= 16
         else {
             throw GPUBackendError.unsupported(
-                "ray dispatch supports at most 13 additional lights"
+                "ray dispatch supports at most 8 positional, 4 distant, and 4 dome lights"
             )
         }
         guard let pipeline = rayTracePipeline, device.supportsRaytracing else {
@@ -3972,6 +4084,13 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 SIMD4<Float>(
                     $0.color.x, $0.color.y, $0.color.z, $0.radius
                 ),
+                SIMD4<Float>(
+                    $0.axisU.x, $0.axisU.y, $0.axisU.z, $0.halfExtentU
+                ),
+                SIMD4<Float>(
+                    $0.axisV.x, $0.axisV.y, $0.axisV.z, $0.halfExtentV
+                ),
+                SIMD4<Float>(Float($0.shape.rawValue), 0, 0, 0),
             ]
         }
         let additionalDistantLightRecords = additionalDistantLights.flatMap {
@@ -4192,7 +4311,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
             materialOpacityInstanceCount = 0
         }
         var rayRuntime = Data()
-        rayRuntime.reserveCapacity(16 + 26 * MemoryLayout<SIMD4<Float>>.size)
+        rayRuntime.reserveCapacity(16 + 52 * MemoryLayout<SIMD4<Float>>.size)
         var runtimeCounts = SIMD4<Float>(
             Float(materialOpacityInstanceCount),
             Float(additionalSphereLightCount),
@@ -4209,7 +4328,7 @@ public final class MetalGPUBackend: BridgeGPUBackend, @unchecked Sendable {
                 rayRuntime.append(contentsOf: bytes)
             }
         }
-        let rayRuntimeSize = 16 + 26 * MemoryLayout<SIMD4<Float>>.size
+        let rayRuntimeSize = 16 + 52 * MemoryLayout<SIMD4<Float>>.size
         if rayRuntime.count < rayRuntimeSize {
             rayRuntime.append(Data(
                 repeating: 0,
